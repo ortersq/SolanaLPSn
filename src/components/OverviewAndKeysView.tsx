@@ -16,6 +16,9 @@ import {
   Target,
   Sparkles,
   Clock,
+  Wrench,
+  HelpCircle,
+  Check,
 } from 'lucide-react';
 import {
   ActiveLpPosition,
@@ -55,6 +58,34 @@ export interface WorkerHeartbeatStatus {
   latestRound?: PoolSelectionRound | null;
 }
 
+export interface StrategyDiagnostic {
+  keyConfigured: boolean;
+  dryRun: boolean;
+  walletAddress: string;
+  recipientAddress: string;
+  activePositionsCount: number;
+  bestCandidatePool: {
+    name: string;
+    dex: string;
+    apr: number;
+    tvl: number;
+    eligible: boolean;
+    reason: string;
+  } | null;
+  conditionDiagnosis: {
+    minApr: number;
+    minTvlUsd: number;
+    rangeWidthPct: number;
+    stopLossPct: number;
+    totalCandidates: number;
+    eligibleCount: number;
+    whyEliminatedSamples: string[];
+  };
+  conclusion: string;
+  actionTaken: string;
+  lastTickTime: string;
+}
+
 export interface BackendStatus {
   heliusConnected: boolean;
   heliusLatencyMs: number | null;
@@ -74,6 +105,7 @@ export interface BackendStatus {
   logs: LogItem[];
   activePositions?: ActiveLpPosition[];
   selectionRounds?: PoolSelectionRound[];
+  strategyDiagnostic?: StrategyDiagnostic;
 }
 
 interface OverviewProps {
@@ -198,6 +230,52 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
   const [alertFilter, setAlertFilter] = useState<'all' | 'alerts-only'>('all');
   const [roundFilter, setRoundFilter] = useState<'all' | 'winner-only' | 'rejected-only'>('all');
   const [refreshingPositions, setRefreshingPositions] = useState(false);
+  const [optimizingPreset, setOptimizingPreset] = useState(false);
+  const [triggeringAutoTick, setTriggeringAutoTick] = useState(false);
+  const [optimizeMessage, setOptimizeMessage] = useState('');
+
+  const handleOptimizePreset = async () => {
+    setOptimizingPreset(true);
+    setOptimizeMessage('');
+    try {
+      const res = await fetch('/api/strategy/preset-optimize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target: 'bluechip-optimized' }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        if (data.backendStatus) {
+          onUpdateBackendStatus(data.backendStatus);
+        }
+        setOptimizeMessage(
+          '已一键放宽并适配为【蓝筹稳健参数】(MIN_APR=35% · TVL≥$1.0M · 区间±8%)！'
+        );
+        if (onRefreshPositions) await onRefreshPositions();
+      }
+    } catch (e: any) {
+      setOptimizeMessage(`优化失败: ${e.message}`);
+    } finally {
+      setOptimizingPreset(false);
+    }
+  };
+
+  const handleTriggerAutoTick = async () => {
+    setTriggeringAutoTick(true);
+    try {
+      const res = await fetch('/api/strategy/auto-tick', { method: 'POST' });
+      const data = await res.json();
+      if (data.backendStatus) {
+        onUpdateBackendStatus(data.backendStatus);
+      }
+      if (onRefreshPositions) await onRefreshPositions();
+    } catch (e: any) {
+      console.error('触发自动决策异常:', e);
+    } finally {
+      setTriggeringAutoTick(false);
+    }
+  };
+
   const [quoteAmount, setQuoteAmount] = useState('0.1');
   const [quoteBusy, setQuoteBusy] = useState(false);
   const [quoteResult, setQuoteResult] = useState<{
@@ -482,6 +560,102 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
               ? `一键真实全流程实测 (${testAsset === 'SOL' ? '0.01 SOL' : `0.1 ${testAsset}`})`
               : '一键全流程只读仿真检查'}
           </button>
+        </div>
+
+        {/* Strategy Auto-Execution Diagnostic & Settings Card */}
+        <div className="p-4 rounded-lg bg-[#0d131f] border border-slate-800/90 space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <HelpCircle className="w-4 h-4 text-sky-400" />
+              <span className="text-xs font-semibold text-white">
+                自动加池执行状态与风控门槛深度诊断
+              </span>
+              <span className="px-2 py-0.5 text-[11px] font-mono rounded bg-slate-800 text-slate-300 border border-slate-700">
+                每 30 秒自动决策
+              </span>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={triggeringAutoTick}
+                onClick={handleTriggerAutoTick}
+                className="px-3 py-1 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md transition-colors cursor-pointer flex items-center gap-1.5"
+              >
+                <RefreshCw className={`w-3 h-3 ${triggeringAutoTick ? 'animate-spin text-emerald-400' : ''}`} />
+                <span>立即执行一次自动决策与巡检</span>
+              </button>
+
+              <button
+                type="button"
+                disabled={optimizingPreset}
+                onClick={handleOptimizePreset}
+                className="px-3 py-1 text-xs font-semibold text-slate-950 bg-emerald-400 hover:bg-emerald-300 rounded-md transition-colors cursor-pointer flex items-center gap-1.5"
+              >
+                {optimizingPreset ? (
+                  <RefreshCw className="w-3 h-3 animate-spin" />
+                ) : (
+                  <Wrench className="w-3 h-3" />
+                )}
+                <span>一键优化为蓝筹稳健做市（放宽至 35% APR / $1.0M 深度）</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Diagnostic Details Banner */}
+          <div className="p-3 rounded-lg bg-[#090d16] border border-slate-800/80 space-y-2 text-xs">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800/60 pb-2">
+              <div className="text-slate-300 font-medium">
+                最新自动策略结论：
+                <span className="text-slate-100 font-normal ml-1">
+                  {backendStatus.strategyDiagnostic?.conclusion ||
+                    backendStatus.workerStatus?.latestRound?.strategyAction ||
+                    ((backendStatus.workerStatus?.dryRun ?? backendStatus.dryRunMode)
+                      ? '当前为 DRY_RUN=true 演练模式：系统持续进行选币巡检与滑点试算，但安全拦截了实际资金扣款。'
+                      : '系统已就绪，正在持续监控全网矿池并等待满足开仓门槛。')}
+                </span>
+              </div>
+              <span className="text-slate-500 font-mono shrink-0">
+                时间: {backendStatus.strategyDiagnostic?.lastTickTime || '--'}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 text-[11px] font-mono pt-1 text-slate-400">
+              <div className="p-2 rounded bg-slate-900/60 border border-slate-800/50">
+                <span className="text-slate-500 block">选池门槛:</span>
+                <span className="text-slate-200">
+                  MIN_APR ≥ {strategyConfig.minAPR}% · TVL ≥ ${(strategyConfig.minTVL / 1e6).toFixed(1)}M
+                </span>
+              </div>
+              <div className="p-2 rounded bg-slate-900/60 border border-slate-800/50">
+                <span className="text-slate-500 block">做市区间与止损:</span>
+                <span className="text-slate-200">
+                  区间 ±{strategyConfig.rangeWidthPct}% · 止损 -{strategyConfig.stopLossPercentage}%
+                </span>
+              </div>
+              <div className="p-2 rounded bg-slate-900/60 border border-slate-800/50">
+                <span className="text-slate-500 block">当前运行环境:</span>
+                <span className={((backendStatus.workerStatus?.dryRun ?? backendStatus.dryRunMode)) ? 'text-amber-400' : 'text-emerald-400'}>
+                  {((backendStatus.workerStatus?.dryRun ?? backendStatus.dryRunMode)) ? 'DRY_RUN=true 演练中' : '实盘自动运行中'}
+                </span>
+              </div>
+              <div className="p-2 rounded bg-slate-900/60 border border-slate-800/50">
+                <span className="text-slate-500 block">活跃仓位检测:</span>
+                <span className="text-slate-200">
+                  {(backendStatus.activePositions && backendStatus.activePositions.length > 0)
+                    ? `${backendStatus.activePositions.length} 个活跃 CLMM 仓位`
+                    : '0 活跃仓位（空仓待入）'}
+                </span>
+              </div>
+            </div>
+
+            {optimizeMessage && (
+              <div className="p-2 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 flex items-center gap-2">
+                <Check className="w-3.5 h-3.5 shrink-0" />
+                <span>{optimizeMessage}</span>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* One-Click Individual Step Tests */}

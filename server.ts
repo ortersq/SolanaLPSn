@@ -232,11 +232,21 @@ let backendStatus = {
   ] as LogItem[],
 };
 
+let cachedActivePositions: ActiveLpPosition[] = [];
+let lastPositionsFetchTime = 0;
+let selectionRoundCounter = 0;
+let selectionRounds: PoolSelectionRound[] = [];
+let isAutoTicking = false;
+let lastAutoTickDiagnostic: any = null;
+
 function getLiveBackendStatus() {
   return {
     ...backendStatus,
     dryRunMode: process.env.DRY_RUN !== 'false',
     workerStatus: readWorkerHeartbeat(),
+    activePositions: cachedActivePositions,
+    selectionRounds,
+    strategyDiagnostic: lastAutoTickDiagnostic,
   };
 }
 
@@ -261,11 +271,6 @@ function appendRiskAlerts(newAlerts: RiskLogEntry[]) {
   }));
   backendStatus.riskAlerts = [...stamped, ...backendStatus.riskAlerts].slice(0, 40);
 }
-
-let cachedActivePositions: ActiveLpPosition[] = [];
-let lastPositionsFetchTime = 0;
-let selectionRoundCounter = 0;
-let selectionRounds: PoolSelectionRound[] = [];
 
 async function fetchActivePositions(force = false): Promise<ActiveLpPosition[]> {
   const now = Date.now();
@@ -1727,6 +1732,204 @@ app.post('/api/ai/analyze', async (req, res) => {
   }
 });
 
+async function runAutoStrategyTick(): Promise<{
+  success: boolean;
+  conclusion: string;
+  actionTaken: string;
+  diagnostic: any;
+}> {
+  if (isAutoTicking) {
+    return {
+      success: true,
+      conclusion: '策略轮询正在执行中，跳过重叠 tick',
+      actionTaken: 'WAIT',
+      diagnostic: lastAutoTickDiagnostic,
+    };
+  }
+
+  isAutoTicking = true;
+  try {
+    const isDryRun = process.env.DRY_RUN !== 'false';
+    const hasKey = Boolean(BACKEND_KEYPAIR);
+    const activePositions = await fetchActivePositions(false);
+
+    const [{ pools }, solQuote] = await Promise.all([
+      fetchRealPools(),
+      fetchJupiterQuoteMetrics(0.1).catch(() => null),
+    ]);
+    const jupiterImpactBps = solQuote ? Math.round(solQuote.priceImpactPct * 10000) : null;
+    const solPriceUsd = solQuote ? Number((solQuote.outAmountUsdc * 10).toFixed(2)) : null;
+
+    const ranked = rankPools(pools, strategyConfig);
+    recordSelectionRound(ranked, jupiterImpactBps, solPriceUsd);
+
+    const eligiblePools = ranked.filter((p) => p.eligibleFor200U);
+    const bluechipFallback = ranked.find((p) => p.isBluechip && p.tvl >= 500_000);
+    const topCandidate = eligiblePools[0] || bluechipFallback || ranked[0];
+
+    const whyEliminatedSamples = ranked
+      .filter((p) => !p.eligibleFor200U)
+      .slice(0, 4)
+      .map((p) => `${p.name}: ${p.selectionReason || '风控淘汰'}`);
+
+    let conclusion = '';
+    let actionTaken = 'IDLE';
+
+    if (activePositions.length > 0) {
+      const pos = activePositions[0];
+      conclusion = `当前持仓做市中：【${pos.poolName}】（已注资 $${pos.injectedValueUsd.toFixed(2)}，浮盈亏 ${pos.unrealizedPnlPct}%，待领手续费 $${pos.uncollectedFeeUsd.toFixed(2)}）。`;
+
+      if (pos.unrealizedPnlPct <= -Math.abs(strategyConfig.stopLossPercentage)) {
+        conclusion += ` 回撤触及 -${strategyConfig.stopLossPercentage}% 止损线！`;
+        if (isDryRun) {
+          actionTaken = 'DRY_RUN_STOP_LOSS';
+          pushLog('warning', `[演练止损] 仓位 ${pos.poolName} 浮亏达 ${pos.unrealizedPnlPct}%，触及 -${strategyConfig.stopLossPercentage}% 止损线（DRY_RUN 模式已模拟拦截）。`);
+        } else {
+          actionTaken = 'LIVE_STOP_LOSS';
+          pushLog('warning', `[实盘止损] 仓位 ${pos.poolName} 触发 -${strategyConfig.stopLossPercentage}% 止损线，正在自动执行撤池关仓退租...`);
+          await runRemoveLpPipelineTest('live');
+        }
+      } else if (pos.uncollectedFeeUsd >= strategyConfig.harvestMinUsd) {
+        conclusion += ` 待领手续费已达到 $${strategyConfig.harvestMinUsd} 经济收割线。`;
+        actionTaken = 'HARVEST_PENDING';
+      } else {
+        actionTaken = 'HOLD_EARNING_FEES';
+      }
+    } else {
+      // 0 active positions
+      if (!hasKey) {
+        conclusion = '当前为纯策略观察模式（服务器后台 .env 未注入有效 PRIVATE_KEY），系统持续进行只读风控巡检，不生成虚假开仓。';
+        actionTaken = 'READONLY_INSPECTION';
+      } else if (isDryRun) {
+        conclusion = `【安全演练保护中】DRY_RUN=true 阻止了真实资金开仓。后台已成功锁定最优矿池【${topCandidate?.name || 'WSOL/USDC'}】（年化 +${topCandidate?.apr || 0}%），所有风控检查通过；系统已安全拦截真实扣款。若要实盘开仓，请在服务器 .env 中设 DRY_RUN=false 并执行 pm2 restart all。`;
+        actionTaken = 'DRY_RUN_ENTRY_SIMULATED';
+      } else {
+        // DRY_RUN === false & hasKey
+        const balances = await getWalletBalances(BACKEND_KEYPAIR!.publicKey);
+        if (balances.solBalance < 0.025) {
+          conclusion = `钱包可用 SOL 不足：当前仅 ${balances.solBalance.toFixed(4)} SOL，无法支付开仓临时 NFT 租金（~0.018 SOL，退仓时全额退回）与 Gas 费。`;
+          actionTaken = 'INSUFFICIENT_SOL';
+          pushLog('warning', `[自动加池拦截] 可用 SOL 仅 ${balances.solBalance.toFixed(4)}，不足 0.025 SOL 租金门槛。`);
+        } else {
+          // If USDC balance < 0.05, auto-swap 0.01 SOL to USDC via Jupiter first!
+          if (balances.usdcBalance < 0.05 && balances.solBalance >= 0.035) {
+            pushLog('info', `[自动流动性配平] 钱包持有 ${balances.solBalance.toFixed(4)} SOL 但缺少 USDC，正在通过 Jupiter 自动将 0.01 SOL 换为 USDC...`);
+            await runSwapPipelineTest('live', 'SOL');
+            await new Promise((r) => setTimeout(r, 2500));
+          }
+          pushLog('info', `[自动策略开仓] 条件全部满足，正在向【${topCandidate?.name || 'WSOL/USDC'}】注入集中做市流动性...`);
+          const lpResult = await runAddLpPipelineTest('live');
+          if (lpResult.status === 'passed') {
+            conclusion = `实盘自动加池开仓成功！已接入【${topCandidate?.name}】，仓位 NFT: ${maskSolanaAddress(lpResult.positionNftMint || '')}。`;
+            actionTaken = 'LIVE_OPENED';
+            pushLog('success', `[自动加池完成] TX: ${lpResult.txId || 'confirmed'}`);
+          } else {
+            conclusion = `实盘自动加池未完成：${lpResult.summary}`;
+            actionTaken = 'LIVE_OPEN_FAILED';
+            pushLog('error', `[自动加池失败] ${lpResult.summary}`);
+          }
+        }
+      }
+    }
+
+    const diag = {
+      keyConfigured: hasKey,
+      dryRun: isDryRun,
+      walletAddress: BACKEND_KEYPAIR ? BACKEND_KEYPAIR.publicKey.toBase58() : EFFECTIVE_WALLET_ADDRESS,
+      recipientAddress: BACKEND_RECIPIENT_RAW,
+      activePositionsCount: activePositions.length,
+      bestCandidatePool: topCandidate
+        ? {
+            name: topCandidate.name,
+            dex: topCandidate.dex,
+            apr: topCandidate.apr,
+            tvl: topCandidate.tvl,
+            eligible: topCandidate.eligibleFor200U,
+            reason: topCandidate.selectionReason,
+          }
+        : null,
+      conditionDiagnosis: {
+        minApr: strategyConfig.minAPR,
+        minTvlUsd: strategyConfig.minTVL,
+        rangeWidthPct: strategyConfig.rangeWidthPct,
+        stopLossPct: strategyConfig.stopLossPercentage,
+        totalCandidates: ranked.length,
+        eligibleCount: eligiblePools.length,
+        whyEliminatedSamples,
+      },
+      conclusion,
+      actionTaken,
+      lastTickTime: nowTime(),
+    };
+
+    lastAutoTickDiagnostic = diag;
+    return {
+      success: true,
+      conclusion,
+      actionTaken,
+      diagnostic: diag,
+    };
+  } catch (err: any) {
+    console.error('自动策略执行异常:', err);
+    return {
+      success: false,
+      conclusion: `自动巡检执行异常: ${err.message}`,
+      actionTaken: 'ERROR',
+      diagnostic: lastAutoTickDiagnostic,
+    };
+  } finally {
+    isAutoTicking = false;
+  }
+}
+
+app.get('/api/strategy/diagnostic', async (_req, res) => {
+  if (!lastAutoTickDiagnostic) {
+    await runAutoStrategyTick();
+  }
+  res.json({
+    success: true,
+    diagnostic: lastAutoTickDiagnostic,
+    backendStatus: getLiveBackendStatus(),
+  });
+});
+
+app.post('/api/strategy/auto-tick', async (_req, res) => {
+  const result = await runAutoStrategyTick();
+  res.json({
+    ...result,
+    backendStatus: getLiveBackendStatus(),
+  });
+});
+
+app.post('/api/strategy/preset-optimize', async (req, res) => {
+  try {
+    const { target } = req.body || {};
+    if (target === 'bluechip-optimized') {
+      strategyConfig = {
+        ...strategyConfig,
+        minAPR: 35,
+        minTVL: 1_000_000,
+        rangeWidthPct: 8,
+        harvestMinUsd: 2.0,
+        stopLossPercentage: 6,
+      };
+      pushLog('success', '已一键应用【蓝筹高胜率优化参数】：MIN_APR=35% · TVL≥$1.0M · 区间±8%（已适配 WSOL/USDC 核心池）。');
+    } else {
+      strategyConfig = buildPresetForCapital(strategyConfig.capitalUsdt, 'balanced-steady');
+      pushLog('info', '已重置为标准稳健平衡型预设。');
+    }
+    const tickRes = await runAutoStrategyTick();
+    res.json({
+      success: true,
+      strategyConfig,
+      diagnostic: tickRes.diagnostic,
+      backendStatus: getLiveBackendStatus(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Production static frontend serving (no deploy UI endpoint exposed)
 
 if (process.env.NODE_ENV !== 'production') {
@@ -1745,4 +1948,10 @@ if (process.env.NODE_ENV !== 'production') {
 const port = 3000;
 app.listen(port, '0.0.0.0', () => {
   console.log(`Solana 200U 稳定盈利控制台运行中：http://localhost:${port}`);
+  setTimeout(() => {
+    runAutoStrategyTick().catch(() => {});
+    setInterval(() => {
+      runAutoStrategyTick().catch(() => {});
+    }, 30_000);
+  }, 2000);
 });

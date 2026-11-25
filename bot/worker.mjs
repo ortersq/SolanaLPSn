@@ -132,12 +132,35 @@ async function scanLivePools() {
       alerts.push(`浅池高滑点预警: ${symA}/${symB} 深度仅 $${Math.round(tvl / 1000)}K`);
       continue;
     }
-    if (apr >= (isLowIl ? 30 : MIN_APR)) {
+    const minRequiredApr = isLowIl ? Math.min(25, MIN_APR) : MIN_APR;
+    if (apr >= minRequiredApr) {
       core.push({ pair: `${symA}/${symB}`, tvl, apr, isLowIl });
     }
   }
 
-  return { best: core[0] || null, alerts };
+  let best = core[0] || null;
+  if (!best) {
+    const bluechipCandidate = rows.find((p) => {
+      const symA = p.mintA?.symbol || '';
+      const symB = p.mintB?.symbol || '';
+      const isLowIl =
+        (STABLES.has(symA) && BLUECHIPS.has(symB)) ||
+        (STABLES.has(symB) && BLUECHIPS.has(symA));
+      return isLowIl && Number(p.tvl || 0) >= 500_000;
+    });
+    if (bluechipCandidate) {
+      const symA = bluechipCandidate.mintA?.symbol || '';
+      const symB = bluechipCandidate.mintB?.symbol || '';
+      best = {
+        pair: `${symA}/${symB}`,
+        tvl: Number(bluechipCandidate.tvl || 0),
+        apr: Number(bluechipCandidate.day?.apr || 0),
+        isLowIl: true,
+      };
+    }
+  }
+
+  return { best, alerts };
 }
 
 export async function sweepProfitSol(amountSol) {
@@ -187,6 +210,19 @@ async function tick() {
       checkExitSlippageGuard(),
     ]);
 
+    // Connect with server auto-execution daemon
+    let autoDecision = null;
+    try {
+      const autoRes = await fetch('http://127.0.0.1:3000/api/strategy/auto-tick', {
+        method: 'POST',
+      });
+      if (autoRes.ok) {
+        autoDecision = await autoRes.json();
+      }
+    } catch {
+      // web server still warming up
+    }
+
     const roundRecord = {
       round: tickCount,
       time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
@@ -213,9 +249,9 @@ async function tick() {
           tvlUsd: 0,
         };
       }),
-      strategyAction: best
+      strategyAction: autoDecision?.conclusion || (best
         ? `自动引擎选定【${best.pair}】为当前做市主池`
-        : '全网暂无符合门槛的安全矿池，保持空仓防守',
+        : '全网暂无符合门槛的安全矿池，保持空仓防守'),
       jupiterSlippageBps: Number(impactBps.toFixed(2)),
       solPriceUsd: Number((outUsdc * 10).toFixed(2)),
     };
@@ -227,6 +263,7 @@ async function tick() {
       impactBps: Number(impactBps.toFixed(2)),
       lastError: null,
       latestRound: roundRecord,
+      diagnostic: autoDecision?.diagnostic || null,
     });
 
     console.log(
@@ -236,6 +273,9 @@ async function tick() {
       console.log(
         `  优选主池: ${best.pair} (TVL $${(best.tvl / 1e6).toFixed(2)}M, 24h APR +${best.apr.toFixed(1)}%)`
       );
+    }
+    if (autoDecision?.conclusion) {
+      console.log(`  [自动策略执行] ${autoDecision.conclusion} (动作: ${autoDecision.actionTaken})`);
     }
     for (const msg of alerts.slice(0, 3)) {
       console.warn(`  [风控拦截] ${msg}`);
