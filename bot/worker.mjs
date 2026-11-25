@@ -1,4 +1,6 @@
-import 'dotenv/config';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
 import {
   Connection,
   Keypair,
@@ -10,6 +12,10 @@ import {
   sendAndConfirmTransaction,
 } from '@solana/web3.js';
 import bs58 from 'bs58';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
+dotenv.config();
 
 const RPC_URL =
   process.env.HELIUS_RPC_URL ||
