@@ -1,0 +1,30 @@
+services:
+  web:
+    build: .
+    container_name: solana-lp-dashboard
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  bot:
+    image: node:20-alpine
+    container_name: solana-lp-worker
+    restart: unless-stopped
+    working_dir: /app
+    env_file:
+      - .env
+    volumes:
+      - ./bot:/app
+    command: sh -c "npm install --omit=dev && npm start"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

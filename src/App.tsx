@@ -9,14 +9,12 @@ import { Header, TabKey } from './components/Header';
 import { BackendStatus, OverviewAndKeysView } from './components/OverviewAndKeysView';
 import { PoolMatrixView } from './components/PoolMatrixView';
 import { StrategyRiskView } from './components/StrategyRiskView';
-import { SingaporeDeployView } from './components/SingaporeDeployView';
 import {
   ApiKeyRequirement,
   RiskProfileKey,
   ScoredPool,
   StrategyConfig,
 } from './utils/strategyEngine';
-import { DeployBundleOutput } from './utils/deployGenerator';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>('overview');
@@ -28,6 +26,7 @@ export default function App() {
   const [poolSource, setPoolSource] = useState('');
   const [lastScanTime, setLastScanTime] = useState('');
   const [loadingPools, setLoadingPools] = useState(false);
+  const [scanningRisk, setScanningRisk] = useState(false);
 
   const loadInitialStatus = useCallback(async () => {
     try {
@@ -63,7 +62,14 @@ export default function App() {
         setPools(data.pools || []);
         setPoolSource(data.source || '');
         if (data.timestamp) {
-          setLastScanTime(new Date(data.timestamp).toLocaleTimeString('zh-CN', { hour12: false }));
+          setLastScanTime(
+            new Date(data.timestamp).toLocaleTimeString('zh-CN', { hour12: false })
+          );
+        }
+        if (data.riskAlerts) {
+          setBackendStatus((prev) =>
+            prev ? { ...prev, riskAlerts: data.riskAlerts } : prev
+          );
         }
       }
     } catch (err) {
@@ -73,10 +79,33 @@ export default function App() {
     }
   }, []);
 
+  const handleRunRiskScan = useCallback(async () => {
+    setScanningRisk(true);
+    try {
+      const res = await fetch('/api/risk/scan', { method: 'POST' });
+      const data = await res.json();
+      if (data.success && data.backendStatus) {
+        setBackendStatus(data.backendStatus);
+      }
+    } catch (err) {
+      console.error('风控巡检失败', err);
+    } finally {
+      setScanningRisk(false);
+    }
+  }, []);
+
   useEffect(() => {
-    loadInitialStatus();
+    loadInitialStatus().then(() => handleRunRiskScan());
     loadPools();
-  }, [loadInitialStatus, loadPools]);
+  }, [loadInitialStatus, loadPools, handleRunRiskScan]);
+
+  // Real-time 30-second background risk monitor polling
+  useEffect(() => {
+    const timer = setInterval(() => {
+      handleRunRiskScan();
+    }, 30_000);
+    return () => clearInterval(timer);
+  }, [handleRunRiskScan]);
 
   const handleCheckHelius = async () => {
     try {
@@ -107,6 +136,7 @@ export default function App() {
           prev ? { ...prev, logs: data.logs || prev.logs } : prev
         );
         await loadPools();
+        await handleRunRiskScan();
         return true;
       }
       return false;
@@ -115,33 +145,12 @@ export default function App() {
     }
   };
 
-  const handleGenerateBundle = async (): Promise<{
-    ok: boolean;
-    bundle?: DeployBundleOutput;
-    error?: string;
-  }> => {
-    try {
-      const res = await fetch('/api/deploy/package', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
-      });
-      const data = await res.json();
-      if (data.success) {
-        return { ok: true, bundle: data.bundle };
-      }
-      return { ok: false, error: data.error || '生成失败' };
-    } catch (err: any) {
-      return { ok: false, error: err.message || '网络异常' };
-    }
-  };
-
   if (loading || !backendStatus || !strategyConfig) {
     return (
       <div className="min-h-screen bg-[#090d16] text-slate-200 flex items-center justify-center">
         <div className="flex items-center gap-3 text-sm">
           <RefreshCw className="w-5 h-5 animate-spin text-emerald-400" />
-          <span>正在连接 Helius 主网节点与加载 200U 稳定盈利方案...</span>
+          <span>正在连接 Helius 主网节点与加载实时策略监控台...</span>
         </div>
       </div>
     );
@@ -152,7 +161,8 @@ export default function App() {
       <Header
         activeTab={activeTab}
         onChangeTab={setActiveTab}
-        onNavigateDeploy={() => setActiveTab('deploy')}
+        onRunRiskScan={handleRunRiskScan}
+        scanningRisk={scanningRisk}
       />
 
       <main className="max-w-[1360px] mx-auto px-6 py-8">
@@ -161,9 +171,11 @@ export default function App() {
             backendStatus={backendStatus}
             strategyConfig={strategyConfig}
             apiKeyRequirements={apiKeyRequirements}
+            scanningRisk={scanningRisk}
             onCheckHelius={handleCheckHelius}
+            onRunRiskScan={handleRunRiskScan}
             onGoToStrategy={() => setActiveTab('strategy')}
-            onGoToDeploy={() => setActiveTab('deploy')}
+            onGoToPools={() => setActiveTab('pools')}
           />
         )}
 
@@ -185,13 +197,6 @@ export default function App() {
             strategyConfig={strategyConfig}
             topPool={pools[0]}
             onApplyPreset={handleApplyPreset}
-          />
-        )}
-
-        {activeTab === 'deploy' && (
-          <SingaporeDeployView
-            strategyConfig={strategyConfig}
-            onGenerateBundle={handleGenerateBundle}
           />
         )}
       </main>

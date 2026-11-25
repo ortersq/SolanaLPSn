@@ -1,24 +1,25 @@
 import React from 'react';
 
-export type TabKey = 'overview' | 'pools' | 'strategy' | 'deploy';
+export type TabKey = 'overview' | 'pools' | 'strategy';
 
 interface HeaderProps {
   activeTab: TabKey;
   onChangeTab: (tab: TabKey) => void;
-  onNavigateDeploy: () => void;
+  onRunRiskScan: () => void;
+  scanningRisk: boolean;
 }
 
 const NAV_ITEMS: { key: TabKey; label: string }[] = [
-  { key: 'overview', label: '接口与链上实测' },
+  { key: 'overview', label: '策略与风控概览' },
   { key: 'pools', label: '自动选池矩阵' },
   { key: 'strategy', label: '200U 稳健方案' },
-  { key: 'deploy', label: '新加坡安全部署' },
 ];
 
 export const Header: React.FC<HeaderProps> = ({
   activeTab,
   onChangeTab,
-  onNavigateDeploy,
+  onRunRiskScan,
+  scanningRisk,
 }) => {
   return (
     <header className="border-b border-slate-800/80 bg-[#090d16]/95 backdrop-blur-md sticky top-0 z-40">
@@ -60,10 +61,11 @@ export const Header: React.FC<HeaderProps> = ({
         <div className="shrink-0">
           <button
             type="button"
-            onClick={onNavigateDeploy}
-            className="px-4 py-2 text-xs font-semibold text-slate-950 bg-emerald-400 rounded-lg hover:bg-emerald-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            disabled={scanningRisk}
+            onClick={onRunRiskScan}
+            className="px-4 py-2 text-xs font-semibold text-slate-950 bg-emerald-400 rounded-lg hover:bg-emerald-300 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            获取安全部署包
+            {scanningRisk ? '主网巡检中...' : '立即风控巡检'}
           </button>
         </div>
       </div>

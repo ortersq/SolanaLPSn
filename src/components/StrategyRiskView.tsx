@@ -81,7 +81,7 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
         {savedNotice && (
           <span className="inline-flex items-center gap-1.5 text-xs text-emerald-400 font-medium shrink-0">
             <CheckCircle2 className="w-4 h-4" />
-            已切换方案并同步到选池与部署脚本
+            已切换方案并同步更新选池与风控规则
           </span>
         )}
       </div>
@@ -297,7 +297,7 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
         <div className="flex items-center gap-2 text-xs text-slate-400 pt-1">
           <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
           <span>
-            注意：所有真实交易必须等您把脚本部署到新加坡 VPS、在后台 <code className="font-mono text-slate-200">.env</code> 填入私钥并关闭 <code className="font-mono text-slate-200">DRY_RUN</code> 后才会真正动用钱包资金。
+            注意：前台仅负责策略方案与主网风险监测展示，所有真实链上签名与资金划转严格在服务器后台安全执行。
           </span>
         </div>
       </section>

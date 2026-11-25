@@ -8,14 +8,15 @@ import {
   API_KEY_REQUIREMENTS,
   DEFAULT_200U_STRATEGY,
   PoolMetrics,
+  RiskLogEntry,
   RiskProfileKey,
   StrategyConfig,
   buildPresetForCapital,
+  evaluateLiveRiskAlerts,
   isValidSolanaAddress,
   maskSolanaAddress,
   rankPools,
 } from './src/utils/strategyEngine.ts';
-import { generateDeployBundle } from './src/utils/deployGenerator.ts';
 
 dotenv.config();
 
@@ -67,20 +68,22 @@ let backendStatus = {
     : '待后台 .env 配置',
   watchBalanceSOL: null as number | null,
   splTokenAccountsCount: 0,
+  lastJupiterImpactBps: null as number | null,
+  riskAlerts: [] as RiskLogEntry[],
   logs: [
     {
       id: 1,
       time: nowTime(),
       type: 'info',
       message:
-        '安全隔离已就绪：交易私钥与盈利接收地址仅由后台 .env 管理，前台不提供任何填写或篡改入口。',
+        '策略与风控展示台已就绪：交易私钥与收款地址仅由后台 .env 管理，前台只展示实时策略与风险日志。',
     },
     {
       id: 2,
       time: nowTime(),
       type: 'success',
       message:
-        '已自动为您装载【200U 稳定盈利方案】：185U 主流蓝筹宽区间做市 + 15U Gas 保留金 + 省 Gas 收割阈值。',
+        '已自动为您装载【200U 稳定盈利方案】：185U 做市 + 15U Gas 保留金 + 全网异常波动与滑点实时巡检。',
     },
   ] as LogItem[],
 };
@@ -95,6 +98,16 @@ function pushLog(type: LogItem['type'], message: string) {
   if (backendStatus.logs.length > 40) {
     backendStatus.logs.pop();
   }
+}
+
+function appendRiskAlerts(newAlerts: RiskLogEntry[]) {
+  if (!newAlerts.length) return;
+  const stamp = Date.now();
+  const stamped = newAlerts.map((a, idx) => ({
+    ...a,
+    id: `${a.id}-${stamp}-${idx}`,
+  }));
+  backendStatus.riskAlerts = [...stamped, ...backendStatus.riskAlerts].slice(0, 40);
 }
 
 async function callHeliusRpc(method: string, params: unknown[] = []) {
@@ -266,15 +279,100 @@ app.get('/api/status', (_req, res) => {
   });
 });
 
+async function fetchJupiterQuoteMetrics(amountSol: number) {
+  const lamports = Math.round(amountSol * 1e9);
+  const SOL_MINT = 'So11111111111111111111111111111111111111112';
+  const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 6000);
+  const url = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${SOL_MINT}&outputMint=${USDC_MINT}&amount=${lamports}&slippageBps=${strategyConfig.slippageBps}`;
+  const apiRes = await fetch(url, { signal: controller.signal });
+  clearTimeout(timer);
+  if (!apiRes.ok) {
+    throw new Error(`HTTP ${apiRes.status}`);
+  }
+  const quote = await apiRes.json();
+  const outUsdc = Number(quote.outAmount || 0) / 1e6;
+  const priceImpactPct = Number(quote.priceImpactPct || 0);
+  const impactBps = Number((Math.abs(priceImpactPct) * 10000).toFixed(2));
+  backendStatus.lastJupiterImpactBps = impactBps;
+  const routeLabels = (quote.routePlan || [])
+    .map((r: any) => r.swapInfo?.label)
+    .filter(Boolean)
+    .join(' → ');
+
+  return {
+    inAmountSol: amountSol,
+    outAmountUsdc: Number(outUsdc.toFixed(4)),
+    priceImpactPct,
+    impactBps,
+    route: routeLabels || 'Jupiter Smart Route',
+  };
+}
+
 app.get('/api/pools/scan', async (_req, res) => {
   const { pools, source } = await fetchRealPools();
   const ranked = rankPools(pools, strategyConfig);
+  if (backendStatus.riskAlerts.length === 0) {
+    const initialAlerts = evaluateLiveRiskAlerts({
+      pools: ranked,
+      jupiterImpactBps: backendStatus.lastJupiterImpactBps,
+      heliusLatencyMs: backendStatus.heliusLatencyMs,
+      privateKeyConfigured: backendStatus.privateKeyConfigured,
+      config: strategyConfig,
+      nowTime: nowTime(),
+    });
+    appendRiskAlerts(initialAlerts);
+  }
   res.json({
     success: true,
     source,
     pools: ranked,
+    riskAlerts: backendStatus.riskAlerts,
     timestamp: new Date().toISOString(),
   });
+});
+
+app.post('/api/risk/scan', async (_req, res) => {
+  try {
+    const [heliusRes, poolsRes, jupiterRes] = await Promise.allSettled([
+      callHeliusRpc('getSlot', []),
+      fetchRealPools(),
+      fetchJupiterQuoteMetrics(0.1),
+    ]);
+
+    if (heliusRes.status === 'fulfilled') {
+      backendStatus.lastSlot = heliusRes.value.result;
+      backendStatus.heliusLatencyMs = heliusRes.value.latency;
+      backendStatus.heliusConnected = true;
+    }
+
+    const ranked =
+      poolsRes.status === 'fulfilled'
+        ? rankPools(poolsRes.value.pools, strategyConfig)
+        : [];
+    const jupiterImpactBps =
+      jupiterRes.status === 'fulfilled' ? jupiterRes.value.impactBps : null;
+
+    const alerts = evaluateLiveRiskAlerts({
+      pools: ranked,
+      jupiterImpactBps,
+      heliusLatencyMs: backendStatus.heliusLatencyMs,
+      privateKeyConfigured: backendStatus.privateKeyConfigured,
+      config: strategyConfig,
+      nowTime: nowTime(),
+    });
+    appendRiskAlerts(alerts);
+
+    res.json({
+      success: true,
+      backendStatus,
+      riskAlerts: backendStatus.riskAlerts,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: `实时风控巡检失败: ${err.message}` });
+  }
 });
 
 app.post('/api/jupiter/quote', async (req, res) => {
@@ -282,37 +380,30 @@ app.post('/api/jupiter/quote', async (req, res) => {
   if (!Number.isFinite(amountSol) || amountSol <= 0 || amountSol > 1000) {
     return res.status(400).json({ success: false, error: '请输入有效的测试兑换数量 (0 ~ 1000 SOL)' });
   }
-  const lamports = Math.round(amountSol * 1e9);
-  const SOL_MINT = 'So11111111111111111111111111111111111111112';
-  const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6000);
-    const url = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${SOL_MINT}&outputMint=${USDC_MINT}&amount=${lamports}&slippageBps=${strategyConfig.slippageBps}`;
-    const apiRes = await fetch(url, { signal: controller.signal });
-    clearTimeout(timer);
-    if (!apiRes.ok) {
-      throw new Error(`HTTP ${apiRes.status}`);
-    }
-    const quote = await apiRes.json();
-    const outUsdc = Number(quote.outAmount || 0) / 1e6;
-    const routeLabels = (quote.routePlan || [])
-      .map((r: any) => r.swapInfo?.label)
-      .filter(Boolean)
-      .join(' → ');
-
+    const result = await fetchJupiterQuoteMetrics(amountSol);
     pushLog(
       'info',
-      `Jupiter Swap v1 真实免密询价成功：${amountSol} SOL ≈ ${outUsdc.toFixed(4)} USDC（路由：${routeLabels || 'Direct'}）`
+      `Jupiter Swap v1 真实免密询价成功：${amountSol} SOL ≈ ${result.outAmountUsdc} USDC（冲击 ${result.impactBps} bps，路由：${result.route}）`
     );
+    if (result.impactBps > strategyConfig.slippageBps) {
+      appendRiskAlerts([
+        {
+          id: `quote-slip`,
+          time: nowTime(),
+          severity: 'critical',
+          category: '撤池换币滑点超限预警',
+          target: `${amountSol} SOL → USDC`,
+          detail: `当前试算冲击 ${result.impactBps} bps 已超过设定滑点上限 ${strategyConfig.slippageBps} bps，建议拆分换币或开启 Jito 防夹保护。`,
+        },
+      ]);
+    }
 
     res.json({
       success: true,
-      inAmountSol: amountSol,
-      outAmountUsdc: Number(outUsdc.toFixed(4)),
-      priceImpactPct: Number(quote.priceImpactPct || 0),
-      route: routeLabels || 'Jupiter Smart Route',
+      ...result,
+      riskAlerts: backendStatus.riskAlerts,
     });
   } catch (err: any) {
     res.status(502).json({
@@ -384,19 +475,7 @@ app.post('/api/ai/analyze', async (req, res) => {
   }
 });
 
-// Zero-sensitive-input deployment bundle generator
-app.post('/api/deploy/package', (_req, res) => {
-  const bundle = generateDeployBundle({
-    heliusRpcUrl: HELIUS_RPC_URL,
-    strategyConfig,
-  });
-
-  pushLog(
-    'success',
-    '已生成零前端敏感配置的部署脚本（私钥与收款地址均在新加坡服务器 SSH 内配置）。'
-  );
-  res.json({ success: true, bundle });
-});
+// Production static frontend serving (no deploy UI endpoint exposed)
 
 if (process.env.NODE_ENV !== 'production') {
   const vite = await createViteServer({

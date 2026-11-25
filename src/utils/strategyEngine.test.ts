@@ -5,6 +5,7 @@ import {
   buildPresetForCapital,
   calculateImpermanentLossPct,
   estimateNetYieldForCapital,
+  evaluateLiveRiskAlerts,
   evaluateRiskAction,
   isValidSolanaAddress,
   maskSolanaAddress,
@@ -108,3 +109,51 @@ test('estimateNetYieldForCapital and helpers compute realistic figures', () => {
   assert.equal(isValidSolanaAddress('So11111111111111111111111111111111111111112'), true);
   assert.equal(maskSolanaAddress('So11111111111111111111111111111111111111112'), 'So11...1112');
 });
+
+test('evaluateLiveRiskAlerts detects volatility traps, shallow pools, and exit slippage breach', () => {
+  const ranked = rankPools(
+    [
+      {
+        id: 'trap-1',
+        name: 'VOLA / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: '11111111111111111111111111111111',
+        tvl: 800_000,
+        volume24h: 3_000_000,
+        apr: 260,
+        feeTier: '0.25%',
+        priceUsd: '0.5',
+        safetyScore: 84,
+        ilRisk: '高',
+      },
+      {
+        id: 'shallow-1',
+        name: 'TINY / SOL',
+        dex: 'RAYDIUM CLMM',
+        address: '22222222222222222222222222222222',
+        tvl: 90_000,
+        volume24h: 400_000,
+        apr: 90,
+        feeTier: '0.01%',
+        priceUsd: '1.0',
+        safetyScore: 70,
+        ilRisk: '中',
+      },
+    ],
+    DEFAULT_200U_STRATEGY
+  );
+
+  const alerts = evaluateLiveRiskAlerts({
+    pools: ranked,
+    jupiterImpactBps: 85,
+    heliusLatencyMs: 120,
+    privateKeyConfigured: false,
+    config: DEFAULT_200U_STRATEGY,
+    nowTime: '12:00:00',
+  });
+
+  assert.ok(alerts.some((a) => a.category === '撤池滑点过高预警'));
+  assert.ok(alerts.some((a) => a.category === 'Token 价格异常波动预警' && a.target === 'VOLA / USDC'));
+  assert.ok(alerts.some((a) => a.category === '浅池撤池高滑点预警' && a.target === 'TINY / SOL'));
+});
+

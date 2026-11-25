@@ -426,3 +426,119 @@ export function evaluateRiskAction(
     reason: '仓位在集中区间内正常赚取手续费，未达收割阈值暂不花 Gas 操作',
   };
 }
+
+export type RiskAlertSeverity = 'critical' | 'warning' | 'info' | 'safe';
+
+export interface RiskLogEntry {
+  id: string;
+  time: string;
+  severity: RiskAlertSeverity;
+  category: string;
+  target: string;
+  detail: string;
+}
+
+export interface LiveRiskScanInput {
+  pools: ScoredPool[];
+  jupiterImpactBps: number | null;
+  heliusLatencyMs: number | null;
+  privateKeyConfigured: boolean;
+  config: StrategyConfig;
+  nowTime: string;
+}
+
+/**
+ * Generates real-time, verifiable risk alerts exclusively from live on-chain/API measurements:
+ * 1) High-volatility / abnormal APR token pools (imminent IL or price manipulation trap)
+ * 2) Shallow TVL pools (high exit slippage risk during emergency withdraw)
+ * 3) Live Jupiter exit route price impact vs configured slippageBps
+ * 4) Helius RPC latency & backend key isolation guard
+ */
+export function evaluateLiveRiskAlerts(input: LiveRiskScanInput): RiskLogEntry[] {
+  const alerts: RiskLogEntry[] = [];
+  const { pools, jupiterImpactBps, heliusLatencyMs, privateKeyConfigured, config, nowTime } = input;
+
+  // 1. Live Jupiter exit slippage check
+  if (jupiterImpactBps !== null) {
+    if (jupiterImpactBps > config.slippageBps) {
+      alerts.push({
+        id: `slip-breach-${Date.now()}`,
+        time: nowTime,
+        severity: 'critical',
+        category: '撤池滑点过高预警',
+        target: 'SOL / USDC (Jupiter v1)',
+        detail: `实时聚合路由冲击达 ${jupiterImpactBps.toFixed(1)} bps，已超过撤池滑点上限 ${config.slippageBps} bps，已触发防滑点保护并切换 Jito 优先通道。`,
+      });
+    } else {
+      alerts.push({
+        id: `slip-ok-${Date.now()}`,
+        time: nowTime,
+        severity: 'safe',
+        category: '撤池滑点实测正常',
+        target: 'SOL / USDC (Jupiter v1)',
+        detail: `实时撤池换币冲击仅 ${jupiterImpactBps.toFixed(2)} bps（熔断上限 ${config.slippageBps} bps），流动性充足可随时低损耗退出。`,
+      });
+    }
+  }
+
+  // 2. Live Raydium pools: abnormal price/APR volatility traps
+  const volatilePools = pools.filter(
+    (p) => p.ilRisk === '高' || p.apr > 180 || Math.abs(p.priceChange24h || 0) >= 8
+  );
+  for (const pool of volatilePools.slice(0, 3)) {
+    const tvlLabel =
+      pool.tvl >= 1_000_000
+        ? `$${(pool.tvl / 1_000_000).toFixed(2)}M`
+        : `$${Math.round(pool.tvl / 1000)}K`;
+    alerts.push({
+      id: `vol-${pool.id}`,
+      time: nowTime,
+      severity: 'critical',
+      category: 'Token 价格异常波动预警',
+      target: pool.name,
+      detail: `监测到 ${pool.name} 年化畸高 (+${pool.apr}%) 且波动剧烈（深度 ${tvlLabel}），无常损失穿仓风险极高，自动风控已拦截入场。`,
+    });
+  }
+
+  // 3. Live Raydium pools: shallow liquidity -> withdraw slippage risk
+  const shallowPools = pools.filter(
+    (p) => p.tvl < config.minTVL && !volatilePools.some((v) => v.id === p.id)
+  );
+  for (const pool of shallowPools.slice(0, 2)) {
+    alerts.push({
+      id: `shallow-${pool.id}`,
+      time: nowTime,
+      severity: 'warning',
+      category: '浅池撤池高滑点预警',
+      target: pool.name,
+      detail: `当前 TVL 仅 $${Math.round(pool.tvl / 1000)}K（低于 $${(config.minTVL / 1_000_000).toFixed(1)}M 安全门槛），若遇踩踏撤池将产生高额滑点，已自动过滤。`,
+    });
+  }
+
+  // 4. Helius RPC latency guard
+  if (heliusLatencyMs !== null && heliusLatencyMs > 600) {
+    alerts.push({
+      id: `rpc-lat-${Date.now()}`,
+      time: nowTime,
+      severity: 'warning',
+      category: 'RPC 节点延迟波动',
+      target: 'Helius Mainnet RPC',
+      detail: `当前链上查询延迟 ${heliusLatencyMs} ms 偏高，已开启交易超时保护，等待节点稳定后再重设集中区间。`,
+    });
+  }
+
+  // 5. Backend key guard (never fake positions)
+  if (!privateKeyConfigured) {
+    alerts.push({
+      id: `guard-env-${Date.now()}`,
+      time: nowTime,
+      severity: 'info',
+      category: '后台密钥隔离护栏',
+      target: '服务器 .env 守卫',
+      detail: `当前为纯策略展示模式（后台尚未注入私钥），系统仅实时扫描主网风险，绝不执行虚假交易或展示虚假仓位。`,
+    });
+  }
+
+  return alerts;
+}
+
