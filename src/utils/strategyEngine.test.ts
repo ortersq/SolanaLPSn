@@ -6,9 +6,11 @@ import {
   buildPresetForCapital,
   calculateImpermanentLossPct,
   calculateLpDepositAmounts,
+  computeSafeClmmOtherAmountMax,
   estimateNetYieldForCapital,
   evaluateLiveRiskAlerts,
   evaluateRiskAction,
+  formatChainError,
   isValidSolanaAddress,
   maskSolanaAddress,
   rankPools,
@@ -214,4 +216,21 @@ test('assessLiveTestWalletReadiness validates private key, recipient, and balanc
   assert.equal(ready.ok, true);
 });
 
+test('formatChainError never returns undefined on plain Solana objects or Raydium errors', () => {
+  const solanaObj = { InstructionError: [0, { Custom: 6021 }], txId: 'abc123' };
+  const msg1 = formatChainError(solanaObj);
+  assert.ok(!msg1.includes('undefined'));
+  assert.ok(msg1.includes('6021'));
 
+  assert.ok(!formatChainError(undefined).includes('undefined'));
+  assert.ok(!formatChainError({}).includes('undefined'));
+  assert.ok(formatChainError('cannot found target token accounts').includes('ATA'));
+});
+
+test('computeSafeClmmOtherAmountMax enforces an upper-bound ceiling above SDK slippage output', () => {
+  // SDK returns amountA=1367343 and amountSlippageA=1230608 (lower than expected!).
+  const safeMax = BigInt(computeSafeClmmOtherAmountMax('1367343', '1230608', 25));
+  assert.ok(safeMax > 1367343n);
+  assert.equal(safeMax, 1709179n);
+  assert.equal(computeSafeClmmOtherAmountMax('0', '0', 25), '0');
+});

@@ -663,4 +663,79 @@ export function calculateLpDepositAmounts(
   return { usdcAmount, solAmount, lowerPriceUsd, upperPriceUsd };
 }
 
+/**
+ * Safely converts unknown Solana / Raydium / RPC rejections (including plain objects like
+ * `{ InstructionError: [0, { Custom: 6021 }], txId }` where `.message` is undefined) into
+ * clear, actionable Chinese + raw diagnostics without ever returning "undefined".
+ */
+export function formatChainError(err: unknown): string {
+  if (err === null || err === undefined) {
+    return '链上节点未返回具体错误信息（请查看 TX 日志或重试）';
+  }
+  let raw = '';
+  if (typeof err === 'string') {
+    const clean = err.trim();
+    raw = clean && clean !== 'undefined' ? clean : '';
+  } else if (err instanceof Error) {
+    raw = err.message || err.name || '';
+    const extra = err as Error & { logs?: string[]; err?: unknown };
+    if (Array.isArray(extra.logs) && extra.logs.length > 0) {
+      const relevant = extra.logs.slice(-4).join(' | ');
+      raw = raw ? `${raw} [${relevant}]` : relevant;
+    } else if (!raw && extra.err) {
+      raw = JSON.stringify(extra.err);
+    }
+  } else if (typeof err === 'object') {
+    try {
+      const ownProps: Record<string, unknown> = {};
+      for (const k of Object.getOwnPropertyNames(err)) {
+        ownProps[k] = (err as Record<string, unknown>)[k];
+      }
+      raw = JSON.stringify(Object.keys(ownProps).length > 0 ? ownProps : err);
+    } catch {
+      raw = String(err);
+    }
+  } else {
+    raw = String(err);
+  }
+
+  if (!raw || raw === '{}' || raw === 'undefined') {
+    raw = '节点返回空错误对象（可能为 RPC 超时或交易被丢弃）';
+  }
+
+  if (raw.includes('6021') || raw.toLowerCase().includes('priceslippagecheck')) {
+    return `价格滑点保护触发 (6021): 开仓瞬间池价波动超出 upper bound，已提高上界缓冲（原始: ${raw}）`;
+  }
+  if (raw.includes('cannot found target token accounts')) {
+    return `缺少目标代币关联账户 (ATA): 集中做市需同时持有 WSOL 与 USDC 账户余额（原始: ${raw}）`;
+  }
+  if (raw.includes('InsufficientFunds') || raw.includes('"Custom":1') || raw.includes('insufficient lamports')) {
+    return `钱包可用 SOL 或代币余额不足（请预留 >=0.025 SOL 用于仓位租金与手续费）(${raw})`;
+  }
+  if (raw.toLowerCase().includes('block height exceeded') || raw.toLowerCase().includes('blockhash not found')) {
+    return `交易在区块有效期内未被打包确认 (Blockhash 过期)，系统已支持高频重广播与高优 Fee（原始: ${raw}）`;
+  }
+
+  return raw.length > 260 ? `${raw.slice(0, 260)}...` : raw;
+}
+
+/**
+ * Raydium SDK v2 `PoolUtils.getLiquidityAmountOutFromAmountIn` sets `amountSlippageA/B` to
+ * `expectedAmount * (1 - slippage)`, which is smaller than `expectedAmount` when adding liquidity
+ * and causes `PriceSlippageCheck (6021)` on `openPositionFromBase`.
+ * This helper enforces an upper-bound ceiling `ceil(max(expected, sdkSlippage) * (1 + bufferPct/100))`.
+ */
+export function computeSafeClmmOtherAmountMax(
+  expectedAmountAtomic: string | number | bigint,
+  sdkSlippageAmountAtomic: string | number | bigint = 0,
+  bufferPct = 25
+): string {
+  const expected = BigInt(String(expectedAmountAtomic || '0'));
+  const sdkVal = BigInt(String(sdkSlippageAmountAtomic || '0'));
+  const base = expected > sdkVal ? expected : sdkVal;
+  if (base <= 0n) return '0';
+  const safeBuffer = BigInt(Math.max(5, Math.round(bufferPct)));
+  const ceiling = (base * (100n + safeBuffer) + 99n) / 100n;
+  return ceiling.toString();
+}
 

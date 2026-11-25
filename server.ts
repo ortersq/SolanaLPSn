@@ -38,7 +38,9 @@ import {
   assessLiveTestWalletReadiness,
   buildPresetForCapital,
   calculateLpDepositAmounts,
+  computeSafeClmmOtherAmountMax,
   evaluateLiveRiskAlerts,
+  formatChainError,
   isValidSolanaAddress,
   maskSolanaAddress,
   rankPools,
@@ -632,6 +634,86 @@ async function resolveTopSolUsdcClmmPoolId(): Promise<string> {
   return '3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv';
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForUsdcVisibility(pubkey: PublicKey, maxWaitMs = 4500) {
+  const deadline = Date.now() + maxWaitMs;
+  let balances = await getWalletBalances(pubkey);
+  while (balances.usdcBalance < 0.05 && Date.now() < deadline) {
+    await sleep(600);
+    balances = await getWalletBalances(pubkey);
+  }
+  return balances;
+}
+
+/**
+ * Simulates a signed VersionedTransaction to fail fast on balance/slippage errors (no 30s hang),
+ * then broadcasts and actively rebroadcasts every 1.5s with skipPreflight=true while polling
+ * getSignatureStatuses + blockHeight until confirmed or genuinely expired.
+ */
+async function sendAndConfirmRawWithRebroadcast(
+  tx: VersionedTransaction,
+  signature: string,
+  lastValidBlockHeight: number
+): Promise<string> {
+  const sim = await solanaConnection.simulateTransaction(tx, {
+    sigVerify: false,
+    commitment: 'confirmed',
+  });
+  if (sim.value.err) {
+    const tailLogs = Array.isArray(sim.value.logs) ? sim.value.logs.slice(-4).join(' | ') : '';
+    throw new Error(
+      `链上仿真未通过: ${formatChainError(sim.value.err)}${tailLogs ? ` [日志: ${tailLogs}]` : ''}`
+    );
+  }
+
+  const rawTx = tx.serialize();
+  const startedAt = Date.now();
+  let lastSendAt = 0;
+
+  while (true) {
+    const now = Date.now();
+    if (now - lastSendAt >= 1500) {
+      lastSendAt = now;
+      await solanaConnection
+        .sendRawTransaction(rawTx, { skipPreflight: true, maxRetries: 0 })
+        .catch(() => undefined);
+    }
+
+    await sleep(900);
+
+    const statusResp = await solanaConnection
+      .getSignatureStatuses([signature], { searchTransactionHistory: false })
+      .catch(() => null);
+    const status = statusResp?.value?.[0];
+    if (status) {
+      if (status.err) {
+        throw new Error(`链上确认返回指令错误: ${formatChainError(status.err)}`);
+      }
+      if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
+        return signature;
+      }
+    }
+
+    const elapsed = Date.now() - startedAt;
+    if (elapsed > 10_000) {
+      const currentBlockHeight = await solanaConnection
+        .getBlockHeight('confirmed')
+        .catch(() => 0);
+      if (
+        (lastValidBlockHeight > 0 && currentBlockHeight > lastValidBlockHeight + 4) ||
+        elapsed > 45_000
+      ) {
+        throw new Error(
+          `Signature ${signature} has expired: block height exceeded (${currentBlockHeight} > ${lastValidBlockHeight}).`
+        );
+      }
+    }
+  }
+}
+
 async function runSwapPipelineTest(
   mode: PipelineRunMode,
   asset: PipelineTestAsset
@@ -646,10 +728,10 @@ async function runSwapPipelineTest(
   const outDivisor = isSolInput ? 1e6 : 1e9;
   const outSymbol = isSolInput ? 'USDC' : 'SOL';
 
-  try {
+  const fetchQuoteAndSwapTx = async () => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 8000);
-    const slippageBps = Math.max(strategyConfig.slippageBps, 60);
+    const slippageBps = Math.max(strategyConfig.slippageBps, 80);
     const quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountAtomic}&slippageBps=${slippageBps}`;
     const quoteRes = await fetch(quoteUrl, { signal: controller.signal });
     clearTimeout(timer);
@@ -667,16 +749,11 @@ async function runSwapPipelineTest(
 
     if (!BACKEND_KEYPAIR) {
       return {
-        step: 'swap',
-        title: '1. 代币兑换 (Jupiter Swap v1)',
-        status: mode === 'live' ? 'failed' : 'readonly_only',
-        mode,
-        summary:
-          mode === 'live'
-            ? '真实交易被拒绝：后台 .env 尚未配置有效 PRIVATE_KEY'
-            : `免密路由正常（${amountLabel} ≈ ${outReadable} ${outSymbol}），未配私钥仅做报价检查`,
-        details: `路由: ${route} · 滑点冲击 ${impactBps} bps。请在服务器 .env 配置 PRIVATE_KEY 后即可发送真实主网兑换交易。`,
-        durationMs: Date.now() - started,
+        quote,
+        outReadable,
+        impactBps,
+        route,
+        swapData: null as any,
       };
     }
 
@@ -689,40 +766,78 @@ async function runSwapPipelineTest(
         quoteResponse: quote,
         userPublicKey: BACKEND_KEYPAIR.publicKey.toBase58(),
         wrapAndUnwrapSol: true,
-        prioritizationFeeLamports: 'auto',
+        dynamicComputeUnitLimit: true,
+        prioritizationFeeLamports: {
+          priorityLevelWithMaxLamports: {
+            maxLamports: 350_000,
+            priorityLevel: 'high',
+          },
+        },
       }),
       signal: swapCtrl.signal,
     });
     clearTimeout(swapTimer);
     if (!swapRes.ok) {
-      throw new Error(`Jupiter swap 序列化接口 HTTP ${swapRes.status}`);
+      const errBody = await swapRes.text().catch(() => '');
+      throw new Error(`Jupiter swap HTTP ${swapRes.status}${errBody ? `: ${errBody.slice(0, 120)}` : ''}`);
     }
     const swapData = await swapRes.json();
     if (!swapData?.swapTransaction) {
       throw new Error('Jupiter swapTransaction 返回为空');
     }
+    return { quote, outReadable, impactBps, route, swapData };
+  };
 
-    const tx = VersionedTransaction.deserialize(Buffer.from(swapData.swapTransaction, 'base64'));
-    tx.sign([BACKEND_KEYPAIR]);
+  try {
+    let prepared = await fetchQuoteAndSwapTx();
+
+    if (!BACKEND_KEYPAIR) {
+      return {
+        step: 'swap',
+        title: '1. 代币兑换 (Jupiter Swap v1)',
+        status: mode === 'live' ? 'failed' : 'readonly_only',
+        mode,
+        summary:
+          mode === 'live'
+            ? '真实交易被拒绝：后台 .env 尚未配置有效 PRIVATE_KEY'
+            : `免密路由正常（${amountLabel} ≈ ${prepared.outReadable} ${outSymbol}），未配私钥仅做报价检查`,
+        details: `路由: ${prepared.route} · 滑点冲击 ${prepared.impactBps} bps。请在服务器 .env 配置 PRIVATE_KEY 后即可发送真实主网兑换交易。`,
+        durationMs: Date.now() - started,
+      };
+    }
 
     if (mode === 'live') {
-      const latest = await solanaConnection.getLatestBlockhash('confirmed');
-      const txId = await solanaConnection.sendRawTransaction(tx.serialize(), {
-        skipPreflight: false,
-        maxRetries: 3,
-      });
-      const conf = await solanaConnection.confirmTransaction(
-        {
-          signature: txId,
-          blockhash: latest.blockhash,
-          lastValidBlockHeight: latest.lastValidBlockHeight,
-        },
-        'confirmed'
-      );
-      if (conf.value.err) {
-        throw new Error(`主网交易确认失败: ${JSON.stringify(conf.value.err)}`);
+      let txId = '';
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const tx = VersionedTransaction.deserialize(
+          Buffer.from(prepared.swapData.swapTransaction, 'base64')
+        );
+        tx.sign([BACKEND_KEYPAIR]);
+        const sig = bs58.encode(tx.signatures[0]);
+        const lastValidBlockHeight =
+          Number(prepared.swapData.lastValidBlockHeight || 0) ||
+          (await solanaConnection.getBlockHeight('confirmed')) + 140;
+        try {
+          txId = await sendAndConfirmRawWithRebroadcast(tx, sig, lastValidBlockHeight);
+          break;
+        } catch (attemptErr: any) {
+          const msg = formatChainError(attemptErr);
+          const canRetry =
+            attempt === 1 &&
+            (msg.toLowerCase().includes('expired') || msg.toLowerCase().includes('blockhash'));
+          if (!canRetry) {
+            throw attemptErr;
+          }
+          prepared = await fetchQuoteAndSwapTx();
+        }
       }
-      await getWalletBalances(BACKEND_KEYPAIR.publicKey);
+
+      if (isSolInput) {
+        await waitForUsdcVisibility(BACKEND_KEYPAIR.publicKey);
+      } else {
+        await getWalletBalances(BACKEND_KEYPAIR.publicKey);
+      }
+
       return {
         step: 'swap',
         title: '1. 代币兑换 (Jupiter Swap v1)',
@@ -730,12 +845,16 @@ async function runSwapPipelineTest(
         mode: 'live',
         txId,
         explorerUrl: `https://solscan.io/tx/${txId}`,
-        summary: `真实兑换上链成功！已完成 ${amountLabel}（实收约 ${outReadable} ${outSymbol}）`,
-        details: `真实路由 ${route} · 滑点 ${impactBps} bps · TX: ${txId}`,
+        summary: `真实兑换上链成功！已完成 ${amountLabel}（实收约 ${prepared.outReadable} ${outSymbol}）`,
+        details: `真实路由 ${prepared.route} · 滑点 ${prepared.impactBps} bps · 高优 Fee + 重广播已确认 · TX: ${txId}`,
         durationMs: Date.now() - started,
       };
     }
 
+    const tx = VersionedTransaction.deserialize(
+      Buffer.from(prepared.swapData.swapTransaction, 'base64')
+    );
+    tx.sign([BACKEND_KEYPAIR]);
     const sim = await solanaConnection.simulateTransaction(tx, { sigVerify: true });
     if (sim.value.err) {
       return {
@@ -743,8 +862,8 @@ async function runSwapPipelineTest(
         title: '1. 代币兑换 (Jupiter Swap v1)',
         status: 'warning',
         mode: 'simulate',
-        summary: `仿真检查提示钱包余额不足或需租金: ${JSON.stringify(sim.value.err)}`,
-        details: `已签名交易 (${amountLabel} ≈ ${outReadable} ${outSymbol})，路由 ${route}。`,
+        summary: `仿真检查提示钱包余额不足或需租金: ${formatChainError(sim.value.err)}`,
+        details: `已签名交易 (${amountLabel} ≈ ${prepared.outReadable} ${outSymbol})，路由 ${prepared.route}。`,
         durationMs: Date.now() - started,
       };
     }
@@ -754,19 +873,19 @@ async function runSwapPipelineTest(
       title: '1. 代币兑换 (Jupiter Swap v1)',
       status: 'passed',
       mode: 'simulate',
-      summary: `仿真检查通过！${amountLabel} ≈ ${outReadable} ${outSymbol}（消耗 ${
+      summary: `仿真检查通过！${amountLabel} ≈ ${prepared.outReadable} ${outSymbol}（消耗 ${
         sim.value.unitsConsumed ?? 'N/A'
       } CU）`,
-      details: `真实路由 ${route} · 滑点 ${impactBps} bps（未真实广播）。`,
+      details: `真实路由 ${prepared.route} · 滑点 ${prepared.impactBps} bps（未真实广播）。`,
       durationMs: Date.now() - started,
     };
-  } catch (err: any) {
+  } catch (err: unknown) {
     return {
       step: 'swap',
       title: '1. 代币兑换 (Jupiter Swap v1)',
       status: 'failed',
       mode,
-      summary: `真实兑换执行失败: ${err.message}`,
+      summary: `真实兑换执行失败: ${formatChainError(err)}`,
       details: '请确认钱包持有足够的 SOL/USDC/USDT 余额及 Gas 费，且服务器可正常访问 Jupiter v1。',
       durationMs: Date.now() - started,
     };
@@ -775,6 +894,7 @@ async function runSwapPipelineTest(
 
 async function runAddLpPipelineTest(mode: PipelineRunMode): Promise<PipelineStepResult> {
   const started = Date.now();
+  let raydium: Raydium | null = null;
   try {
     if (mode === 'simulate') {
       const [{ pools, source }, solQuote] = await Promise.all([
@@ -795,7 +915,7 @@ async function runAddLpPipelineTest(mode: PipelineRunMode): Promise<PipelineStep
         };
       }
       const accountInfo = await solanaConnection.getAccountInfo(new PublicKey(targetPool.address));
-      const solPriceUsd = solQuote ? solQuote.outAmountUsdc * 10 : 180;
+      const solPriceUsd = solQuote ? solQuote.outAmountUsdc * 10 : 140;
       const split = calculateLpDepositAmounts(
         strategyConfig.lpActiveUsdt,
         solPriceUsd,
@@ -826,18 +946,35 @@ async function runAddLpPipelineTest(mode: PipelineRunMode): Promise<PipelineStep
       };
     }
 
-    const balances = await getWalletBalances(BACKEND_KEYPAIR.publicKey);
+    const balances = await waitForUsdcVisibility(BACKEND_KEYPAIR.publicKey, 2500);
+    const rangePct = Math.max(strategyConfig.rangeWidthPct, 6);
+
+    if (balances.usdcBalance < 0.05) {
+      return {
+        step: 'addLp',
+        title: '2. 加池子 (Raydium CLMM)',
+        status: 'failed',
+        mode: 'live',
+        summary: `钱包 USDC 不足：当前仅 ${balances.usdcBalance.toFixed(4)} USDC，集中流动性加池需双边代币`,
+        details: `在 SOL/USDC ±${rangePct}% 区间内做市需至少 0.05 USDC 与约 0.022 SOL（含 0.018 SOL 可退仓位 NFT 租金）。请先点击“1. 实测兑换”或“一键真实全流程实测”自动将 SOL 换出 USDC。`,
+        durationMs: Date.now() - started,
+      };
+    }
+
     const poolId = await resolveTopSolUsdcClmmPoolId();
-    const raydium = await Raydium.load({
+    raydium = await Raydium.load({
       owner: BACKEND_KEYPAIR,
       connection: solanaConnection,
       cluster: 'mainnet',
       disableFeatureCheck: true,
       disableLoadToken: true,
     });
+    await raydium.account.fetchWalletTokenAccounts({
+      forceUpdate: true,
+      commitment: 'confirmed',
+    });
 
     const { poolInfo, poolKeys } = await raydium.clmm.getPoolInfoFromRpc(poolId);
-    const rangePct = Math.max(strategyConfig.rangeWidthPct, 6);
     const currentPrice = new Decimal(poolInfo.price);
     const lowerPrice = currentPrice.mul(1 - rangePct / 100);
     const upperPrice = currentPrice.mul(1 + rangePct / 100);
@@ -866,16 +1003,20 @@ async function runAddLpPipelineTest(mode: PipelineRunMode): Promise<PipelineStep
     const isMintAUsdc = poolInfo.mintA.address === USDC_MINT_ADDR;
     const isMintBUsdc = poolInfo.mintB.address === USDC_MINT_ADDR;
     const isMintASol = poolInfo.mintA.address === SOL_MINT_ADDR;
+    const isMintBSol = poolInfo.mintB.address === SOL_MINT_ADDR;
 
-    let base: 'MintA' | 'MintB' = isMintASol ? 'MintA' : 'MintB';
-    let baseAmount = new BN(2_000_000); // 0.002 SOL fallback
-    let depositLabel = '0.002 SOL';
-
-    if (balances.usdcBalance >= 0.1 && (isMintAUsdc || isMintBUsdc)) {
-      base = isMintAUsdc ? 'MintA' : 'MintB';
-      baseAmount = new BN(100_000); // 0.1 USDC
-      depositLabel = '0.1 USDC';
+    if (!isMintAUsdc && !isMintBUsdc) {
+      throw new Error(`池子 ${poolId} 不包含 USDC 交易对`);
     }
+
+    const base: 'MintA' | 'MintB' = isMintAUsdc ? 'MintA' : 'MintB';
+    // Use up to 0.1 USDC (keeping a small safety buffer inside wallet USDC balance)
+    const usdcDepositUi = Math.max(
+      0.05,
+      Math.min(0.1, Number((balances.usdcBalance * 0.85).toFixed(4)))
+    );
+    const baseAmount = new BN(Math.round(usdcDepositUi * 1e6));
+    const depositLabel = `${usdcDepositUi.toFixed(2)} USDC`;
 
     const epochInfo = await solanaConnection.getEpochInfo('confirmed');
     const liqRes = await PoolUtils.getLiquidityAmountOutFromAmountIn({
@@ -889,10 +1030,32 @@ async function runAddLpPipelineTest(mode: PipelineRunMode): Promise<PipelineStep
       epochInfo,
       amountHasFee: true,
     });
-    const otherAmountMax =
-      base === 'MintA' ? liqRes.amountSlippageB.amount : liqRes.amountSlippageA.amount;
 
-    const { execute, extInfo } = await raydium.clmm.openPositionFromBase({
+    const expectedOther = base === 'MintA' ? liqRes.amountB.amount : liqRes.amountA.amount;
+    const sdkSlippageOther =
+      base === 'MintA' ? liqRes.amountSlippageB.amount : liqRes.amountSlippageA.amount;
+    const otherAmountMaxStr = computeSafeClmmOtherAmountMax(
+      expectedOther.toString(),
+      sdkSlippageOther.toString(),
+      25
+    );
+    const otherAmountMax = new BN(otherAmountMaxStr);
+
+    const requiredSolForLp = Number(otherAmountMax.toString()) / 1e9;
+    const minNeededSol = requiredSolForLp + 0.02; // NFT rent (~0.018 SOL) + fee reserve
+    if (balances.solBalance < minNeededSol) {
+      return {
+        step: 'addLp',
+        title: '2. 加池子 (Raydium CLMM)',
+        status: 'failed',
+        mode: 'live',
+        summary: `可用 SOL 不足：当前 ${balances.solBalance.toFixed(4)} SOL，开仓配比及 NFT 租金需约 ${minNeededSol.toFixed(4)} SOL`,
+        details: `其中 ${requiredSolForLp.toFixed(4)} SOL 将配对注入池子，约 0.018 SOL 为临时仓位 NFT 租金（撤池关仓后自动退回）。`,
+        durationMs: Date.now() - started,
+      };
+    }
+
+    const { transaction, extInfo } = await raydium.clmm.openPositionFromBase({
       poolInfo,
       poolKeys,
       tickLower,
@@ -904,13 +1067,19 @@ async function runAddLpPipelineTest(mode: PipelineRunMode): Promise<PipelineStep
       nft2022: true,
       withMetadata: 'no-create',
       txVersion: TxVersion.V0,
-      computeBudgetConfig: { units: 600000, microLamports: 50000 },
+      computeBudgetConfig: { units: 600_000, microLamports: 150_000 },
     });
 
-    const { txId } = await execute({ sendAndConfirm: true });
+    const sig = bs58.encode(transaction.signatures[0]);
+    const currentHeight = await solanaConnection.getBlockHeight('confirmed');
+    const txId = await sendAndConfirmRawWithRebroadcast(transaction, sig, currentHeight + 145);
+
     const nftMint = extInfo.nftMint.toBase58();
     lastLiveTestPosition = { poolId, nftMint };
     await getWalletBalances(BACKEND_KEYPAIR.publicKey);
+
+    const symA = poolInfo.mintA.symbol || (isMintASol ? 'WSOL' : 'USDC');
+    const symB = poolInfo.mintB.symbol || (isMintBSol ? 'WSOL' : 'USDC');
 
     return {
       step: 'addLp',
@@ -920,26 +1089,31 @@ async function runAddLpPipelineTest(mode: PipelineRunMode): Promise<PipelineStep
       txId,
       explorerUrl: `https://solscan.io/tx/${txId}`,
       positionNftMint: nftMint,
-      summary: `真实加池开仓成功！已向 ${poolInfo.mintA.symbol}/${poolInfo.mintB.symbol} 注入 ${depositLabel}（±${rangePct}%）`,
+      summary: `真实加池开仓成功！已向 ${symA}/${symB} 注入 ${depositLabel} + 约 ${(
+        Number(expectedOther.toString()) / 1e9
+      ).toFixed(4)} SOL（±${rangePct}%）`,
       details: `Position NFT: ${maskSolanaAddress(nftMint)} · Tick [${tickLower}, ${tickUpper}] · TX: ${txId}`,
       durationMs: Date.now() - started,
     };
-  } catch (err: any) {
+  } catch (err: unknown) {
     return {
       step: 'addLp',
       title: '2. 加池子 (Raydium CLMM)',
       status: 'failed',
       mode,
-      summary: `真实加池执行失败: ${err.message}`,
+      summary: `真实加池执行失败: ${formatChainError(err)}`,
       details:
-        '开仓需约 0.018 SOL 临时仓位 NFT 租金（撤池时全额退回）及对应 SOL/USDC 流动资金，请确认余额充足。',
+        '开仓需约 0.018 SOL 临时仓位 NFT 租金（撤池时全额退回）及对应 SOL/USDC 双边流动资金。',
       durationMs: Date.now() - started,
     };
+  } finally {
+    raydium?.account.clearAccountChangeCkb();
   }
 }
 
 async function runRemoveLpPipelineTest(mode: PipelineRunMode): Promise<PipelineStepResult> {
   const started = Date.now();
+  let raydium: Raydium | null = null;
   try {
     if (mode === 'simulate') {
       const controller = new AbortController();
@@ -978,17 +1152,35 @@ async function runRemoveLpPipelineTest(mode: PipelineRunMode): Promise<PipelineS
       };
     }
 
-    const raydium = await Raydium.load({
+    raydium = await Raydium.load({
       owner: BACKEND_KEYPAIR,
       connection: solanaConnection,
       cluster: 'mainnet',
       disableFeatureCheck: true,
       disableLoadToken: true,
     });
+    await raydium.account.fetchWalletTokenAccounts({
+      forceUpdate: true,
+      commitment: 'confirmed',
+    });
 
-    const positions = await raydium.clmm.getOwnerPositionInfo({
+    let positions = await raydium.clmm.getOwnerPositionInfo({
       programId: CLMM_PROGRAM_ID,
     });
+
+    if (!positions.length && lastLiveTestPosition) {
+      for (let i = 0; i < 4; i += 1) {
+        await sleep(700);
+        await raydium.account.fetchWalletTokenAccounts({
+          forceUpdate: true,
+          commitment: 'confirmed',
+        });
+        positions = await raydium.clmm.getOwnerPositionInfo({
+          programId: CLMM_PROGRAM_ID,
+        });
+        if (positions.length > 0) break;
+      }
+    }
 
     if (!positions.length) {
       return {
@@ -1013,7 +1205,7 @@ async function runRemoveLpPipelineTest(mode: PipelineRunMode): Promise<PipelineS
 
     let txId = '';
     if (!targetPos.liquidity.isZero()) {
-      const { execute } = await raydium.clmm.decreaseLiquidity({
+      const { transaction } = await raydium.clmm.decreaseLiquidity({
         poolInfo,
         poolKeys,
         ownerPosition: targetPos,
@@ -1025,20 +1217,22 @@ async function runRemoveLpPipelineTest(mode: PipelineRunMode): Promise<PipelineS
         amountMinA: new BN(0),
         amountMinB: new BN(0),
         txVersion: TxVersion.V0,
-        computeBudgetConfig: { units: 500000, microLamports: 50000 },
+        computeBudgetConfig: { units: 500_000, microLamports: 150_000 },
       });
-      const res = await execute({ sendAndConfirm: true });
-      txId = res.txId;
+      const sig = bs58.encode(transaction.signatures[0]);
+      const currentHeight = await solanaConnection.getBlockHeight('confirmed');
+      txId = await sendAndConfirmRawWithRebroadcast(transaction, sig, currentHeight + 145);
     } else {
-      const { execute } = await raydium.clmm.closePosition({
+      const { transaction } = await raydium.clmm.closePosition({
         poolInfo,
         poolKeys,
         ownerPosition: targetPos,
         txVersion: TxVersion.V0,
-        computeBudgetConfig: { units: 300000, microLamports: 50000 },
+        computeBudgetConfig: { units: 300_000, microLamports: 150_000 },
       });
-      const res = await execute({ sendAndConfirm: true });
-      txId = res.txId;
+      const sig = bs58.encode(transaction.signatures[0]);
+      const currentHeight = await solanaConnection.getBlockHeight('confirmed');
+      txId = await sendAndConfirmRawWithRebroadcast(transaction, sig, currentHeight + 145);
     }
 
     if (lastLiveTestPosition?.nftMint === targetPos.nftMint.toBase58()) {
@@ -1058,16 +1252,18 @@ async function runRemoveLpPipelineTest(mode: PipelineRunMode): Promise<PipelineS
       details: `已销毁仓位 NFT ${maskSolanaAddress(targetPos.nftMint.toBase58())} · TX: ${txId}`,
       durationMs: Date.now() - started,
     };
-  } catch (err: any) {
+  } catch (err: unknown) {
     return {
       step: 'removeLp',
       title: '3. 撤池子与关仓退租',
       status: 'failed',
       mode,
-      summary: `真实撤池执行失败: ${err.message}`,
+      summary: `真实撤池执行失败: ${formatChainError(err)}`,
       details: '请确认钱包持有至少 0.002 SOL 支付链上撤销手续费。',
       durationMs: Date.now() - started,
     };
+  } finally {
+    raydium?.account.clearAccountChangeCkb();
   }
 }
 
@@ -1146,7 +1342,7 @@ async function runSweepPipelineTest(mode: PipelineRunMode): Promise<PipelineStep
         title: '4. 利润转移 (SystemProgram 转账)',
         status: 'warning',
         mode: 'simulate',
-        summary: `仿真检查提示钱包余额/租金状态: ${JSON.stringify(sim.value.err)}`,
+        summary: `仿真检查提示钱包余额/租金状态: ${formatChainError(sim.value.err)}`,
         details: `目标地址 ${maskSolanaAddress(recipientPubkey.toBase58())} 合法且签名有效。`,
         durationMs: Date.now() - started,
       };
@@ -1161,13 +1357,13 @@ async function runSweepPipelineTest(mode: PipelineRunMode): Promise<PipelineStep
       details: `已通过 simulateTransaction 验证（消耗 ${sim.value.unitsConsumed ?? 150} CU，未真实扣款）。`,
       durationMs: Date.now() - started,
     };
-  } catch (err: any) {
+  } catch (err: unknown) {
     return {
       step: 'sweep',
       title: '4. 利润转移 (SystemProgram 转账)',
       status: 'failed',
       mode,
-      summary: `真实利润转账失败: ${err.message}`,
+      summary: `真实利润转账失败: ${formatChainError(err)}`,
       details: '请检查钱包 SOL 余额、Helius RPC 连通性与 RECIPIENT_ADDRESS 配置。',
       durationMs: Date.now() - started,
     };
