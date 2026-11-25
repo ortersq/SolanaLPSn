@@ -11,11 +11,14 @@ import {
   CheckCircle2,
   XCircle,
   Info,
+  ExternalLink,
 } from 'lucide-react';
 import {
   ApiKeyRequirement,
+  PipelineRunMode,
   PipelineStepKey,
   PipelineStepResult,
+  PipelineTestAsset,
   RiskLogEntry,
   StrategyConfig,
 } from '../utils/strategyEngine';
@@ -79,26 +82,26 @@ const PIPELINE_STEP_META: { key: PipelineStepKey; title: string; buttonLabel: st
   {
     key: 'swap',
     title: '1. 代币兑换 (Jupiter Swap v1)',
-    buttonLabel: '测试兑换',
-    hint: '验证 0.01 SOL → USDC 聚合报价、交易序列化及私钥签名仿真',
+    buttonLabel: '实测兑换',
+    hint: '真实广播 0.01 SOL → USDC（或 0.1 USDC/USDT → SOL）主网兑换并等待链上确认',
   },
   {
     key: 'addLp',
     title: '2. 加池子 (Raydium CLMM)',
-    buttonLabel: '测试加池',
-    hint: '核验首选池合约账户数据，并按当前策略计算 50:50 资金与集中区间',
+    buttonLabel: '实测加池',
+    hint: '真实调用 Raydium CLMM 合约向 WSOL/USDC 注入 0.1 USDC / 0.002 SOL 开仓（含可退还 NFT 租金）',
   },
   {
     key: 'removeLp',
-    title: '3. 撤池子与防滑点熔断',
-    buttonLabel: '测试撤池',
-    hint: '探测反向 10 USDC → SOL 退出滑点与止损紧急撤池通道',
+    title: '3. 撤池子与关仓退租',
+    buttonLabel: '实测撤池',
+    hint: '真实调用 decreaseLiquidity + closePosition 提取 100% 流动资金并退回仓位 NFT 押金',
   },
   {
     key: 'sweep',
     title: '4. 利润转移 (SystemProgram 转账)',
-    buttonLabel: '测试利润转移',
-    hint: '校验收款冷钱包公钥并执行 0.0001 SOL 转账主网模拟（不扣费）',
+    buttonLabel: '实测利润转移',
+    hint: '真实转账 0.0005 SOL 至后台 .env 配置的冷钱包接收公钥地址并输出 Solscan 哈希',
   },
 ];
 
@@ -126,6 +129,8 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
   } | null>(null);
   const [quoteError, setQuoteError] = useState('');
   const [testingStep, setTestingStep] = useState<'all' | PipelineStepKey | null>(null);
+  const [testMode, setTestMode] = useState<PipelineRunMode>('live');
+  const [testAsset, setTestAsset] = useState<PipelineTestAsset>('SOL');
   const [pipelineResults, setPipelineResults] = useState<Partial<Record<PipelineStepKey, PipelineStepResult>>>({});
   const [pipelineError, setPipelineError] = useState('');
   const [lastPipelineTestedAt, setLastPipelineTestedAt] = useState('');
@@ -146,11 +151,11 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
       const res = await fetch('/api/pipeline/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ step }),
+        body: JSON.stringify({ step, mode: testMode, asset: testAsset }),
       });
       const data = await res.json();
       if (!res.ok || !data.success) {
-        setPipelineError(data.error || '链路自检请求失败');
+        setPipelineError(data.error || '全流程实测请求失败');
         return;
       }
       if (Array.isArray(data.results)) {
@@ -361,26 +366,80 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
             ) : (
               <Play className="w-4 h-4" />
             )}
-            {testingStep === 'all' ? '正在执行全流程主网预演...' : '一键测试全流程（兑换/加池/撤池/转利润）'}
+            {testingStep === 'all'
+              ? testMode === 'live'
+                ? '正在发送主网真实交易...'
+                : '正在执行只读核验...'
+              : testMode === 'live'
+              ? `一键真实全流程实测 (${testAsset === 'SOL' ? '0.01 SOL' : `0.1 ${testAsset}`})`
+              : '一键全流程只读仿真检查'}
           </button>
         </div>
 
         {/* One-Click Individual Step Tests */}
         <div className="space-y-3">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
             <div>
               <h2 className="text-base font-semibold text-white">
-                全流程执行链路自检（真实主网仿真 · 零真实扣款）
+                真实链上小额全流程测试台（支持 0.01 SOL / 0.1 USDC / 0.1 USDT 实盘跑通）
               </h2>
               <p className="text-xs text-slate-400 mt-0.5">
-                逐项验证服务器私钥签名、Jupiter Swap 兑换、Raydium CLMM 选池配比、撤池防滑点与冷钱包利润转移通路。
+                默认直接发送真实 Solana 主网交易并返回 Solscan 哈希；全程净耗约 0.0005 SOL 手续费（加池约 0.018 SOL 仓位租金会在第 3 步撤池时自动全额退回）。
               </p>
             </div>
-            {lastPipelineTestedAt && (
-              <span className="text-xs font-mono text-slate-400 shrink-0">
-                最近自检: {lastPipelineTestedAt}
-              </span>
-            )}
+
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <div className="flex items-center gap-1 p-1 bg-[#090d16] rounded-lg border border-slate-800">
+                {(['SOL', 'USDC', 'USDT'] as PipelineTestAsset[]).map((assetOpt) => (
+                  <button
+                    key={assetOpt}
+                    type="button"
+                    disabled={testingStep !== null}
+                    onClick={() => setTestAsset(assetOpt)}
+                    className={`px-2.5 py-1 text-xs font-mono font-medium rounded-md transition-colors cursor-pointer ${
+                      testAsset === assetOpt
+                        ? 'bg-slate-800 text-emerald-400'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {assetOpt === 'SOL' ? '0.01 SOL' : `0.1 ${assetOpt}`}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex items-center gap-1 p-1 bg-[#090d16] rounded-lg border border-slate-800">
+                <button
+                  type="button"
+                  disabled={testingStep !== null}
+                  onClick={() => setTestMode('live')}
+                  className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                    testMode === 'live'
+                      ? 'bg-emerald-500/20 text-emerald-400'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  真实上链
+                </button>
+                <button
+                  type="button"
+                  disabled={testingStep !== null}
+                  onClick={() => setTestMode('simulate')}
+                  className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                    testMode === 'simulate'
+                      ? 'bg-slate-800 text-sky-400'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  仅仿真
+                </button>
+              </div>
+
+              {lastPipelineTestedAt && (
+                <span className="text-xs font-mono text-slate-400">
+                  最近: {lastPipelineTestedAt}
+                </span>
+              )}
+            </div>
           </div>
 
           {pipelineError && (
@@ -410,12 +469,14 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
               const statusLabel = !res
                 ? '未测试'
                 : res.status === 'passed'
-                ? '主网仿真通过'
+                ? res.mode === 'live'
+                  ? '真实主网上链成功'
+                  : '只读仿真通过'
                 : res.status === 'readonly_only'
-                ? '只读核验通过（缺私钥待签名）'
+                ? '只读核验通过（缺私钥）'
                 : res.status === 'warning'
-                ? '配置/余额提醒'
-                : '探测失败';
+                ? '余额/仓位提醒'
+                : '真实交易未通过';
 
               return (
                 <div
@@ -444,15 +505,28 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
                       onClick={() => handleRunPipelineTest(meta.key)}
                       className="px-3 py-1.5 text-xs font-medium text-slate-100 bg-slate-800 border border-slate-700 rounded-md hover:bg-slate-700 disabled:opacity-50 transition-colors cursor-pointer shrink-0 whitespace-nowrap"
                     >
-                      {isBusy ? '测试中...' : meta.buttonLabel}
+                      {isBusy ? '执行中...' : meta.buttonLabel}
                     </button>
                   </div>
 
-                  <div className="text-xs leading-relaxed border-t border-slate-800/70 pt-2.5 space-y-1">
+                  <div className="text-xs leading-relaxed border-t border-slate-800/70 pt-2.5 space-y-1.5">
                     {res ? (
                       <>
                         <div className="text-slate-100 font-medium">{res.summary}</div>
                         <div className="text-slate-400 font-mono break-all">{res.details}</div>
+                        {res.explorerUrl && res.txId && (
+                          <a
+                            href={res.explorerUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 text-emerald-400 hover:text-emerald-300 font-mono underline underline-offset-2"
+                          >
+                            <ExternalLink className="w-3 h-3 shrink-0" />
+                            <span>
+                              查看 Solscan 真实交易哈希 ({res.txId.slice(0, 8)}...{res.txId.slice(-8)})
+                            </span>
+                          </a>
+                        )}
                       </>
                     ) : (
                       <div className="text-slate-400">{meta.hint}</div>

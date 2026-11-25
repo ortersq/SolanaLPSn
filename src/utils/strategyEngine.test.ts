@@ -2,8 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DEFAULT_200U_STRATEGY,
+  assessLiveTestWalletReadiness,
   buildPresetForCapital,
   calculateImpermanentLossPct,
+  calculateLpDepositAmounts,
   estimateNetYieldForCapital,
   evaluateLiveRiskAlerts,
   evaluateRiskAction,
@@ -157,14 +159,59 @@ test('evaluateLiveRiskAlerts detects volatility traps, shallow pools, and exit s
   assert.ok(alerts.some((a) => a.category === '浅池撤池高滑点预警' && a.target === 'TINY / SOL'));
 });
 
-import { calculateLpDepositAmounts } from './strategyEngine';
-
 test('calculateLpDepositAmounts splits 185U 50/50 with concentrated price bounds', () => {
   const split = calculateLpDepositAmounts(185, 100, 10);
   assert.equal(split.usdcAmount, 92.5);
   assert.equal(split.solAmount, 0.925);
   assert.equal(split.lowerPriceUsd, 90);
   assert.equal(split.upperPriceUsd, 110);
+});
+
+test('assessLiveTestWalletReadiness validates private key, recipient, and balances honestly', () => {
+  const noKey = assessLiveTestWalletReadiness({
+    step: 'all',
+    asset: 'SOL',
+    solBalance: 1,
+    usdcBalance: 10,
+    usdtBalance: 0,
+    hasPrivateKey: false,
+    hasValidRecipient: true,
+  });
+  assert.equal(noKey.ok, false);
+
+  const lowSol = assessLiveTestWalletReadiness({
+    step: 'all',
+    asset: 'SOL',
+    solBalance: 0.015,
+    usdcBalance: 0,
+    usdtBalance: 0,
+    hasPrivateKey: true,
+    hasValidRecipient: true,
+  });
+  assert.equal(lowSol.ok, false);
+  assert.equal(lowSol.requiredSol, 0.035);
+
+  const lowUsdt = assessLiveTestWalletReadiness({
+    step: 'swap',
+    asset: 'USDT',
+    solBalance: 0.1,
+    usdcBalance: 0,
+    usdtBalance: 0.02,
+    hasPrivateKey: true,
+    hasValidRecipient: true,
+  });
+  assert.equal(lowUsdt.ok, false);
+
+  const ready = assessLiveTestWalletReadiness({
+    step: 'all',
+    asset: 'SOL',
+    solBalance: 0.08,
+    usdcBalance: 0,
+    usdtBalance: 0,
+    hasPrivateKey: true,
+    hasValidRecipient: true,
+  });
+  assert.equal(ready.ok, true);
 });
 
 

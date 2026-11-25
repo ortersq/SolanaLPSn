@@ -544,14 +544,103 @@ export function evaluateLiveRiskAlerts(input: LiveRiskScanInput): RiskLogEntry[]
 
 export type PipelineStepKey = 'swap' | 'addLp' | 'removeLp' | 'sweep';
 export type PipelineStepStatus = 'passed' | 'readonly_only' | 'warning' | 'failed';
+export type PipelineRunMode = 'live' | 'simulate';
+export type PipelineTestAsset = 'SOL' | 'USDC' | 'USDT';
 
 export interface PipelineStepResult {
   step: PipelineStepKey;
   title: string;
   status: PipelineStepStatus;
+  mode?: PipelineRunMode;
+  txId?: string;
+  explorerUrl?: string;
+  positionNftMint?: string;
   summary: string;
   details: string;
   durationMs: number;
+}
+
+export interface WalletReadinessInput {
+  step: 'all' | PipelineStepKey;
+  asset: PipelineTestAsset;
+  solBalance: number;
+  usdcBalance: number;
+  usdtBalance: number;
+  hasPrivateKey: boolean;
+  hasValidRecipient: boolean;
+}
+
+export function assessLiveTestWalletReadiness(input: WalletReadinessInput): {
+  ok: boolean;
+  requiredSol: number;
+  reason?: string;
+  note: string;
+} {
+  const { step, asset, solBalance, usdcBalance, usdtBalance, hasPrivateKey, hasValidRecipient } = input;
+
+  if (!hasPrivateKey) {
+    return {
+      ok: false,
+      requiredSol: 0.035,
+      reason: '服务器后台 .env 未配置有效 PRIVATE_KEY，无法签名并发送真实链上交易。',
+      note: '请在服务器 .env 配置 PRIVATE_KEY 后重启服务，或切换至“只读仿真”模式验证接口连通性。',
+    };
+  }
+
+  if ((step === 'all' || step === 'sweep') && !hasValidRecipient) {
+    return {
+      ok: false,
+      requiredSol: 0.002,
+      reason: '服务器后台 .env 未配置有效的 RECIPIENT_ADDRESS 收款公钥，无法执行利润转移测试。',
+      note: '请在服务器 .env 配置 RECIPIENT_ADDRESS 后重启服务。',
+    };
+  }
+
+  const requiredSol =
+    step === 'all'
+      ? asset === 'SOL'
+        ? 0.035
+        : 0.025
+      : step === 'swap'
+      ? asset === 'SOL'
+        ? 0.012
+        : 0.003
+      : step === 'addLp'
+      ? 0.022
+      : 0.002;
+
+  if (solBalance < requiredSol) {
+    return {
+      ok: false,
+      requiredSol,
+      reason: `交易钱包当前余额为 ${solBalance.toFixed(4)} SOL，真实全流程至少需要约 ${requiredSol} SOL（含 0.018 SOL 可退还仓位 NFT 租金及链上 Gas）。`,
+      note: '撤池平仓后 0.018 SOL 仓位租金会自动原路退回钱包，实际净耗损仅约 0.0005 SOL 手续费。',
+    };
+  }
+
+  if ((step === 'all' || step === 'swap') && asset === 'USDC' && usdcBalance < 0.1) {
+    return {
+      ok: false,
+      requiredSol,
+      reason: `交易钱包当前 USDC 余额为 ${usdcBalance.toFixed(4)} USDC，不足 0.1 USDC 实测要求（建议改选 0.01 SOL 实测，会自动换出 USDC）。`,
+      note: '使用 0.01 SOL 实测可自动换出 USDC 并串联后续加池/撤池闭环。',
+    };
+  }
+
+  if ((step === 'all' || step === 'swap') && asset === 'USDT' && usdtBalance < 0.1) {
+    return {
+      ok: false,
+      requiredSol,
+      reason: `交易钱包当前 USDT 余额为 ${usdtBalance.toFixed(4)} USDT，不足 0.1 USDT 实测要求（建议改选 0.01 SOL 实测）。`,
+      note: '使用 0.01 SOL 实测无需预先持有 USDT/USDC 即可完成全流程真实交易测试。',
+    };
+  }
+
+  return {
+    ok: true,
+    requiredSol,
+    note: `钱包余额充足（${solBalance.toFixed(4)} SOL / ${usdcBalance.toFixed(2)} USDC / ${usdtBalance.toFixed(2)} USDT），即将发送真实 Solana 主网交易。`,
+  };
 }
 
 export function calculateLpDepositAmounts(
