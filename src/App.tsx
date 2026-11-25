@@ -10,7 +10,9 @@ import { BackendStatus, OverviewAndKeysView } from './components/OverviewAndKeys
 import { PoolMatrixView } from './components/PoolMatrixView';
 import { StrategyRiskView } from './components/StrategyRiskView';
 import {
+  ActiveLpPosition,
   ApiKeyRequirement,
+  PoolSelectionRound,
   RiskProfileKey,
   ScoredPool,
   StrategyConfig,
@@ -27,6 +29,20 @@ export default function App() {
   const [lastScanTime, setLastScanTime] = useState('');
   const [loadingPools, setLoadingPools] = useState(false);
   const [scanningRisk, setScanningRisk] = useState(false);
+  const [activePositions, setActivePositions] = useState<ActiveLpPosition[]>([]);
+  const [selectionRounds, setSelectionRounds] = useState<PoolSelectionRound[]>([]);
+
+  const handleRefreshPositions = useCallback(async () => {
+    try {
+      const res = await fetch('/api/positions?force=true');
+      const data = await res.json();
+      if (data.success && Array.isArray(data.positions)) {
+        setActivePositions(data.positions);
+      }
+    } catch (err) {
+      console.error('刷新做市仓位失败', err);
+    }
+  }, []);
 
   const loadInitialStatus = useCallback(async () => {
     try {
@@ -39,6 +55,12 @@ export default function App() {
         setBackendStatus(statusData.backendStatus);
         setStrategyConfig(statusData.strategyConfig);
         setApiKeyRequirements(statusData.apiKeyRequirements || []);
+        if (statusData.activePositions) {
+          setActivePositions(statusData.activePositions);
+        }
+        if (statusData.selectionRounds) {
+          setSelectionRounds(statusData.selectionRounds);
+        }
       }
       if (heliusRes.ok) {
         const heliusData = await heliusRes.json();
@@ -71,6 +93,9 @@ export default function App() {
             prev ? { ...prev, riskAlerts: data.riskAlerts } : prev
           );
         }
+        if (data.selectionRounds) {
+          setSelectionRounds(data.selectionRounds);
+        }
       }
     } catch (err) {
       console.error('加载矿池失败', err);
@@ -86,6 +111,12 @@ export default function App() {
       const data = await res.json();
       if (data.success && data.backendStatus) {
         setBackendStatus(data.backendStatus);
+        if (data.activePositions) {
+          setActivePositions(data.activePositions);
+        }
+        if (data.selectionRounds) {
+          setSelectionRounds(data.selectionRounds);
+        }
       }
     } catch (err) {
       console.error('风控巡检失败', err);
@@ -172,8 +203,12 @@ export default function App() {
             strategyConfig={strategyConfig}
             apiKeyRequirements={apiKeyRequirements}
             scanningRisk={scanningRisk}
+            activePositions={activePositions}
+            selectionRounds={selectionRounds}
+            topPool={pools[0]}
             onCheckHelius={handleCheckHelius}
             onRunRiskScan={handleRunRiskScan}
+            onRefreshPositions={handleRefreshPositions}
             onUpdateBackendStatus={setBackendStatus}
             onGoToStrategy={() => setActiveTab('strategy')}
             onGoToPools={() => setActiveTab('pools')}

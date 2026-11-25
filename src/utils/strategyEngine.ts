@@ -739,3 +739,161 @@ export function computeSafeClmmOtherAmountMax(
   return ceiling.toString();
 }
 
+export interface ActiveLpPosition {
+  nftMint: string;
+  nftMintMasked: string;
+  poolId: string;
+  poolName: string;
+  dex: string;
+  priceCurrentUsd: number;
+  priceLowerUsd: number;
+  priceUpperUsd: number;
+  tickLower: number;
+  tickUpper: number;
+  inRange: boolean;
+  tokenASymbol: string;
+  tokenBSymbol: string;
+  tokenAAmount: number;
+  tokenBAmount: number;
+  injectedValueUsd: number;
+  uncollectedFeeUsd: number;
+  unrealizedPnlUsd: number;
+  unrealizedPnlPct: number;
+  liquidity: string;
+  openedAt?: string;
+}
+
+export interface PoolSelectionRound {
+  round: number;
+  time: string;
+  timestamp: number;
+  candidateCount: number;
+  chosenPool: {
+    id: string;
+    name: string;
+    dex: string;
+    apr: number;
+    tvlUsd: number;
+    volume24hUsd: number;
+    alphaScore: number;
+    role: 'core' | 'satellite' | 'rejected';
+    selectionReason: string;
+  } | null;
+  rejectedSamples: Array<{
+    name: string;
+    reason: string;
+    apr: number;
+    tvlUsd: number;
+  }>;
+  strategyAction: string;
+  jupiterSlippageBps: number | null;
+  solPriceUsd: number | null;
+}
+
+export function calculatePositionMetrics(params: {
+  currentPrice: number;
+  priceLower: number;
+  priceUpper: number;
+  amountA: number;
+  amountB: number;
+  tokenASymbol?: string;
+  tokenBSymbol?: string;
+  uncollectedFeeUsd?: number;
+}): {
+  inRange: boolean;
+  injectedValueUsd: number;
+  unrealizedPnlUsd: number;
+  unrealizedPnlPct: number;
+} {
+  const {
+    currentPrice,
+    priceLower,
+    priceUpper,
+    amountA,
+    amountB,
+    tokenASymbol = 'WSOL',
+    uncollectedFeeUsd = 0,
+  } = params;
+  const inRange =
+    currentPrice >= Math.min(priceLower, priceUpper) &&
+    currentPrice <= Math.max(priceLower, priceUpper);
+
+  const isSolA = tokenASymbol.toUpperCase().includes('SOL');
+  const valA = isSolA ? amountA * Math.max(currentPrice, 0) : amountA * 1.0;
+  const valB = !isSolA ? amountB * Math.max(currentPrice, 0) : amountB * 1.0;
+  const injectedValueUsd = Number((valA + valB).toFixed(2));
+
+  const unrealizedPnlUsd = Number(uncollectedFeeUsd.toFixed(2));
+  const unrealizedPnlPct =
+    injectedValueUsd > 0 ? Number(((unrealizedPnlUsd / injectedValueUsd) * 100).toFixed(2)) : 0;
+
+  return {
+    inRange,
+    injectedValueUsd,
+    unrealizedPnlUsd,
+    unrealizedPnlPct,
+  };
+}
+
+export function buildSelectionRoundFromPools(params: {
+  roundNumber: number;
+  pools: ScoredPool[];
+  jupiterSlippageBps: number | null;
+  solPriceUsd: number | null;
+  timeStr: string;
+  timestamp?: number;
+}): PoolSelectionRound {
+  const {
+    roundNumber,
+    pools,
+    jupiterSlippageBps,
+    solPriceUsd,
+    timeStr,
+    timestamp = Date.now(),
+  } = params;
+  const winner = pools.find((p) => p.autoSelected || p.eligibleFor200U) || pools[0] || null;
+
+  const rejected = pools
+    .filter((p) => !p.eligibleFor200U)
+    .slice(0, 4)
+    .map((p) => ({
+      name: p.name,
+      reason: p.selectionReason || (p.ilRisk === '高' ? '无常损失过高淘汰' : '深度不达标淘汰'),
+      apr: p.apr,
+      tvlUsd: p.tvl,
+    }));
+
+  let strategyAction = '全网风控扫描完成：未发现符合极低回撤要求的安全池，维持空仓避险';
+  if (winner) {
+    if (winner.alphaScore >= 80) {
+      strategyAction = `优选【${winner.name}】核心蓝筹池做市（评分 ${winner.alphaScore}/100 · 年化 +${winner.apr}%）`;
+    } else {
+      strategyAction = `次优池【${winner.name}】在列，当前处于谨慎做市观察状态`;
+    }
+  }
+
+  return {
+    round: roundNumber,
+    time: timeStr,
+    timestamp,
+    candidateCount: pools.length,
+    chosenPool: winner
+      ? {
+          id: winner.id,
+          name: winner.name,
+          dex: winner.dex,
+          apr: winner.apr,
+          tvlUsd: winner.tvl,
+          volume24hUsd: winner.volume24h,
+          alphaScore: winner.alphaScore,
+          role: winner.poolRole,
+          selectionReason: winner.selectionReason,
+        }
+      : null,
+    rejectedSamples: rejected,
+    strategyAction,
+    jupiterSlippageBps,
+    solPriceUsd,
+  };
+}
+

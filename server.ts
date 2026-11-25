@@ -26,18 +26,23 @@ import {
 } from '@raydium-io/raydium-sdk-v2';
 import {
   API_KEY_REQUIREMENTS,
+  ActiveLpPosition,
   DEFAULT_200U_STRATEGY,
   PipelineRunMode,
   PipelineStepKey,
   PipelineStepResult,
   PipelineTestAsset,
   PoolMetrics,
+  PoolSelectionRound,
   RiskLogEntry,
   RiskProfileKey,
+  ScoredPool,
   StrategyConfig,
   assessLiveTestWalletReadiness,
   buildPresetForCapital,
+  buildSelectionRoundFromPools,
   calculateLpDepositAmounts,
+  calculatePositionMetrics,
   computeSafeClmmOtherAmountMax,
   evaluateLiveRiskAlerts,
   formatChainError,
@@ -112,6 +117,7 @@ export interface WorkerHeartbeatStatus {
   jupiterOutUsdc: number | null;
   impactBps: number | null;
   lastError: string | null;
+  latestRound?: PoolSelectionRound | null;
 }
 
 const nowTime = () => new Date().toTimeString().split(' ')[0];
@@ -159,6 +165,15 @@ function readWorkerHeartbeat(): WorkerHeartbeatStatus {
     const parsed = JSON.parse(raw);
     const lastTickMs = parsed?.lastTickAt ? Date.parse(parsed.lastTickAt) : 0;
     const isFresh = Number.isFinite(lastTickMs) && Date.now() - lastTickMs < 90_000;
+    const workerRound = parsed?.latestRound;
+    if (
+      workerRound &&
+      (!selectionRounds.length || selectionRounds[0].round !== workerRound.round)
+    ) {
+      selectionRounds.unshift(workerRound);
+      if (selectionRounds.length > 40) selectionRounds.pop();
+    }
+
     return {
       running: isFresh,
       pid: parsed?.pid ?? null,
@@ -174,6 +189,7 @@ function readWorkerHeartbeat(): WorkerHeartbeatStatus {
       jupiterOutUsdc: parsed?.jupiterOutUsdc ?? null,
       impactBps: parsed?.impactBps ?? null,
       lastError: parsed?.lastError ?? null,
+      latestRound: workerRound ?? null,
     };
   } catch {
     return defaultState;
@@ -244,6 +260,168 @@ function appendRiskAlerts(newAlerts: RiskLogEntry[]) {
     id: `${a.id}-${stamp}-${idx}`,
   }));
   backendStatus.riskAlerts = [...stamped, ...backendStatus.riskAlerts].slice(0, 40);
+}
+
+let cachedActivePositions: ActiveLpPosition[] = [];
+let lastPositionsFetchTime = 0;
+let selectionRoundCounter = 0;
+let selectionRounds: PoolSelectionRound[] = [];
+
+async function fetchActivePositions(force = false): Promise<ActiveLpPosition[]> {
+  const now = Date.now();
+  if (!force && now - lastPositionsFetchTime < 12_000) {
+    return cachedActivePositions;
+  }
+  const targetWallet =
+    BACKEND_KEYPAIR?.publicKey ||
+    (isValidSolanaAddress(EFFECTIVE_WALLET_ADDRESS)
+      ? new PublicKey(EFFECTIVE_WALLET_ADDRESS)
+      : null);
+  if (!targetWallet) {
+    cachedActivePositions = [];
+    lastPositionsFetchTime = now;
+    return [];
+  }
+
+  try {
+    const raydium = await Raydium.load({
+      owner: targetWallet,
+      connection: solanaConnection,
+      cluster: 'mainnet',
+      disableFeatureCheck: true,
+      disableLoadToken: true,
+    });
+    const rawPositions = await raydium.clmm.getOwnerPositionInfo({
+      programId: CLMM_PROGRAM_ID,
+    });
+    raydium.account.clearAccountChangeCkb();
+
+    if (!rawPositions || rawPositions.length === 0) {
+      cachedActivePositions = [];
+      lastPositionsFetchTime = now;
+      return [];
+    }
+
+    const epochInfo = await solanaConnection.getEpochInfo('confirmed');
+    const parsed: ActiveLpPosition[] = [];
+
+    for (const pos of rawPositions) {
+      try {
+        const poolIdStr = pos.poolId.toBase58();
+        const { poolInfo } = await raydium.clmm.getPoolInfoFromRpc(poolIdStr);
+        const currentPrice = Number(poolInfo.price || 0);
+
+        const lowerTick = Math.min(pos.tickLower, pos.tickUpper);
+        const upperTick = Math.max(pos.tickLower, pos.tickUpper);
+        const priceLower = TickUtil.tickToPrice(
+          lowerTick,
+          poolInfo.mintA.decimals,
+          poolInfo.mintB.decimals
+        ).toNumber();
+        const priceUpper = TickUtil.tickToPrice(
+          upperTick,
+          poolInfo.mintA.decimals,
+          poolInfo.mintB.decimals
+        ).toNumber();
+
+        let amountA = 0;
+        let amountB = 0;
+        if (!pos.liquidity.isZero()) {
+          const liqAmounts = await PoolUtils.getAmountsFromLiquidity({
+            epochInfo,
+            poolInfo,
+            tickLower: lowerTick,
+            tickUpper: upperTick,
+            liquidity: pos.liquidity,
+            slippage: 0,
+            add: false,
+          });
+          amountA =
+            Number(liqAmounts.amountA.amount.toString()) / 10 ** poolInfo.mintA.decimals;
+          amountB =
+            Number(liqAmounts.amountB.amount.toString()) / 10 ** poolInfo.mintB.decimals;
+        }
+
+        const symA =
+          poolInfo.mintA.symbol ||
+          (poolInfo.mintA.address === SOL_MINT_ADDR ? 'WSOL' : 'USDC');
+        const symB =
+          poolInfo.mintB.symbol ||
+          (poolInfo.mintB.address === USDC_MINT_ADDR ? 'USDC' : 'SOL');
+
+        const feeA = Number(pos.tokenFeesOwedA.toString()) / 10 ** poolInfo.mintA.decimals;
+        const feeB = Number(pos.tokenFeesOwedB.toString()) / 10 ** poolInfo.mintB.decimals;
+        const isSolA = symA.toUpperCase().includes('SOL');
+        const uncollectedFeeUsd = Number(
+          (isSolA ? feeA * currentPrice + feeB : feeA + feeB * currentPrice).toFixed(3)
+        );
+
+        const metrics = calculatePositionMetrics({
+          currentPrice,
+          priceLower,
+          priceUpper,
+          amountA,
+          amountB,
+          tokenASymbol: symA,
+          tokenBSymbol: symB,
+          uncollectedFeeUsd,
+        });
+
+        parsed.push({
+          nftMint: pos.nftMint.toBase58(),
+          nftMintMasked: maskSolanaAddress(pos.nftMint.toBase58()),
+          poolId: poolIdStr,
+          poolName: `${symA} / ${symB}`,
+          dex: 'Raydium CLMM',
+          priceCurrentUsd: currentPrice,
+          priceLowerUsd: Number(priceLower.toFixed(4)),
+          priceUpperUsd: Number(priceUpper.toFixed(4)),
+          tickLower: lowerTick,
+          tickUpper: upperTick,
+          inRange: metrics.inRange,
+          tokenASymbol: symA,
+          tokenBSymbol: symB,
+          tokenAAmount: Number(amountA.toFixed(5)),
+          tokenBAmount: Number(amountB.toFixed(4)),
+          injectedValueUsd: metrics.injectedValueUsd,
+          uncollectedFeeUsd,
+          unrealizedPnlUsd: metrics.unrealizedPnlUsd,
+          unrealizedPnlPct: metrics.unrealizedPnlPct,
+          liquidity: pos.liquidity.toString(),
+        });
+      } catch (posErr) {
+        console.error('解析单个 CLMM 仓位失败:', posErr);
+      }
+    }
+
+    cachedActivePositions = parsed;
+    lastPositionsFetchTime = now;
+    return cachedActivePositions;
+  } catch (err) {
+    console.error('获取链上 CLMM 仓位列表失败:', err);
+    return cachedActivePositions;
+  }
+}
+
+function recordSelectionRound(
+  pools: ScoredPool[],
+  jupiterSlippageBps: number | null,
+  solPriceUsd: number | null
+): PoolSelectionRound | null {
+  if (!pools.length) return null;
+  selectionRoundCounter += 1;
+  const newRound = buildSelectionRoundFromPools({
+    roundNumber: selectionRoundCounter,
+    pools,
+    jupiterSlippageBps,
+    solPriceUsd,
+    timeStr: nowTime(),
+  });
+  selectionRounds.unshift(newRound);
+  if (selectionRounds.length > 40) {
+    selectionRounds.pop();
+  }
+  return newRound;
 }
 
 async function callHeliusRpc(method: string, params: unknown[] = []) {
@@ -406,12 +584,43 @@ app.get('/api/helius/health', async (_req, res) => {
   }
 });
 
-app.get('/api/status', (_req, res) => {
+app.get('/api/status', async (_req, res) => {
+  if (selectionRounds.length === 0) {
+    try {
+      const { pools } = await fetchRealPools();
+      const ranked = rankPools(pools, strategyConfig);
+      recordSelectionRound(ranked, backendStatus.lastJupiterImpactBps, 142);
+    } catch {
+      // fallback
+    }
+  }
+  const positions = await fetchActivePositions(false);
   res.json({
     success: true,
     backendStatus: getLiveBackendStatus(),
     strategyConfig,
     apiKeyRequirements: API_KEY_REQUIREMENTS,
+    activePositions: positions,
+    selectionRounds,
+  });
+});
+
+app.get('/api/positions', async (req, res) => {
+  const force = req.query.force === 'true';
+  const positions = await fetchActivePositions(force);
+  res.json({
+    success: true,
+    positions,
+    updatedAt: new Date().toISOString(),
+  });
+});
+
+app.get('/api/selection-rounds', (_req, res) => {
+  res.json({
+    success: true,
+    rounds: selectionRounds,
+    totalRounds: selectionRoundCounter,
+    latestRound: selectionRounds[0] || null,
   });
 });
 
@@ -449,6 +658,7 @@ async function fetchJupiterQuoteMetrics(amountSol: number) {
 app.get('/api/pools/scan', async (_req, res) => {
   const { pools, source } = await fetchRealPools();
   const ranked = rankPools(pools, strategyConfig);
+  recordSelectionRound(ranked, backendStatus.lastJupiterImpactBps, 142);
   if (backendStatus.riskAlerts.length === 0) {
     const initialAlerts = evaluateLiveRiskAlerts({
       pools: ranked,
@@ -465,6 +675,7 @@ app.get('/api/pools/scan', async (_req, res) => {
     source,
     pools: ranked,
     riskAlerts: backendStatus.riskAlerts,
+    selectionRounds,
     timestamp: new Date().toISOString(),
   });
 });
@@ -490,6 +701,13 @@ app.post('/api/risk/scan', async (_req, res) => {
     const jupiterImpactBps =
       jupiterRes.status === 'fulfilled' ? jupiterRes.value.impactBps : null;
 
+    const solPriceUsd =
+      jupiterRes.status === 'fulfilled'
+        ? Number((jupiterRes.value.outAmountUsdc * 10).toFixed(2))
+        : 142;
+
+    recordSelectionRound(ranked, jupiterImpactBps, solPriceUsd);
+
     const alerts = evaluateLiveRiskAlerts({
       pools: ranked,
       jupiterImpactBps,
@@ -500,10 +718,14 @@ app.post('/api/risk/scan', async (_req, res) => {
     });
     appendRiskAlerts(alerts);
 
+    const positions = await fetchActivePositions(false);
+
     res.json({
       success: true,
       backendStatus: getLiveBackendStatus(),
       riskAlerts: backendStatus.riskAlerts,
+      activePositions: positions,
+      selectionRounds,
       timestamp: new Date().toISOString(),
     });
   } catch (err: any) {
@@ -1077,6 +1299,7 @@ async function runAddLpPipelineTest(mode: PipelineRunMode): Promise<PipelineStep
     const nftMint = extInfo.nftMint.toBase58();
     lastLiveTestPosition = { poolId, nftMint };
     await getWalletBalances(BACKEND_KEYPAIR.publicKey);
+    await fetchActivePositions(true);
 
     const symA = poolInfo.mintA.symbol || (isMintASol ? 'WSOL' : 'USDC');
     const symB = poolInfo.mintB.symbol || (isMintBSol ? 'WSOL' : 'USDC');
@@ -1239,6 +1462,7 @@ async function runRemoveLpPipelineTest(mode: PipelineRunMode): Promise<PipelineS
       lastLiveTestPosition = null;
     }
     await getWalletBalances(BACKEND_KEYPAIR.publicKey);
+    await fetchActivePositions(true);
 
     return {
       step: 'removeLp',

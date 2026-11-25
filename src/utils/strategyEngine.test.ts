@@ -4,8 +4,10 @@ import {
   DEFAULT_200U_STRATEGY,
   assessLiveTestWalletReadiness,
   buildPresetForCapital,
+  buildSelectionRoundFromPools,
   calculateImpermanentLossPct,
   calculateLpDepositAmounts,
+  calculatePositionMetrics,
   computeSafeClmmOtherAmountMax,
   estimateNetYieldForCapital,
   evaluateLiveRiskAlerts,
@@ -233,4 +235,82 @@ test('computeSafeClmmOtherAmountMax enforces an upper-bound ceiling above SDK sl
   assert.ok(safeMax > 1367343n);
   assert.equal(safeMax, 1709179n);
   assert.equal(computeSafeClmmOtherAmountMax('0', '0', 25), '0');
+});
+
+test('calculatePositionMetrics calculates inRange, USD value and unrealized PnL', () => {
+  const inRangeRes = calculatePositionMetrics({
+    currentPrice: 140,
+    priceLower: 125,
+    priceUpper: 155,
+    amountA: 0.5, // 0.5 SOL
+    amountB: 70, // 70 USDC
+    tokenASymbol: 'WSOL',
+    tokenBSymbol: 'USDC',
+    uncollectedFeeUsd: 1.45,
+  });
+
+  assert.equal(inRangeRes.inRange, true);
+  assert.equal(inRangeRes.injectedValueUsd, 140); // 0.5 * 140 + 70
+  assert.equal(inRangeRes.unrealizedPnlUsd, 1.45);
+  assert.equal(inRangeRes.unrealizedPnlPct, 1.04);
+
+  const outOfRangeRes = calculatePositionMetrics({
+    currentPrice: 160,
+    priceLower: 125,
+    priceUpper: 155,
+    amountA: 0,
+    amountB: 140,
+    tokenASymbol: 'WSOL',
+    tokenBSymbol: 'USDC',
+    uncollectedFeeUsd: 0,
+  });
+  assert.equal(outOfRangeRes.inRange, false);
+});
+
+test('buildSelectionRoundFromPools creates a comprehensive round record with winner and rejected reasons', () => {
+  const samplePools = rankPools(
+    [
+      {
+        id: 'wsol-usdc-pool',
+        name: 'WSOL / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: '2QdhepnKRTLjQQPL14MYYvE2j2y97uK2xH2237fK66rY',
+        tvl: 6_000_000,
+        volume24h: 22_000_000,
+        apr: 62.5,
+        feeTier: '0.04%',
+        priceUsd: '142.0',
+        safetyScore: 96,
+        ilRisk: '低',
+      },
+      {
+        id: 'meme-pool',
+        name: 'MEME / SOL',
+        dex: 'RAYDIUM CLMM',
+        address: '11111111111111111111111111111111',
+        tvl: 1_200_000,
+        volume24h: 5_000_000,
+        apr: 290,
+        feeTier: '0.25%',
+        priceUsd: '0.04',
+        safetyScore: 80,
+        ilRisk: '高',
+      },
+    ],
+    DEFAULT_200U_STRATEGY
+  );
+
+  const round = buildSelectionRoundFromPools({
+    roundNumber: 1,
+    pools: samplePools,
+    jupiterSlippageBps: 3.5,
+    solPriceUsd: 142.5,
+    timeStr: '12:00:00',
+  });
+
+  assert.equal(round.round, 1);
+  assert.equal(round.chosenPool?.name, 'WSOL / USDC');
+  assert.equal(round.candidateCount, 2);
+  assert.ok(round.rejectedSamples.some((r) => r.name === 'MEME / SOL'));
+  assert.ok(round.strategyAction.includes('WSOL / USDC'));
 });
