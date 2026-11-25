@@ -145,9 +145,9 @@ fi
 
 # 6. 安装依赖、编译前端并通过 PM2 启动双服务（零 Docker）
 echo "[6/6] 安装依赖、构建页面并启动后台进程..."
-npm install --include=dev
+npm install --include=dev --legacy-peer-deps --no-audit --no-fund
 npm run build
-(cd bot && npm install --omit=dev)
+(cd bot && npm install --omit=dev --no-audit --no-fund)
 
 pm2 delete solana-lp-web solana-lp-bot >/dev/null 2>&1 || true
 pm2 start ecosystem.config.cjs
