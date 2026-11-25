@@ -1,0 +1,6 @@
+{
+  "name": "Solana LP Sniper & Yield Bot Studio",
+  "description": "Advanced Solana Liquidity Provisioning & Yield Farming Strategy Hub with Real-Time Pool Analytics, Automated Risk Controls, and One-Click Server Deployment.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
