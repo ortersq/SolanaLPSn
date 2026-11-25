@@ -157,3 +157,14 @@ test('evaluateLiveRiskAlerts detects volatility traps, shallow pools, and exit s
   assert.ok(alerts.some((a) => a.category === '浅池撤池高滑点预警' && a.target === 'TINY / SOL'));
 });
 
+import { calculateLpDepositAmounts } from './strategyEngine';
+
+test('calculateLpDepositAmounts splits 185U 50/50 with concentrated price bounds', () => {
+  const split = calculateLpDepositAmounts(185, 100, 10);
+  assert.equal(split.usdcAmount, 92.5);
+  assert.equal(split.solAmount, 0.925);
+  assert.equal(split.lowerPriceUsd, 90);
+  assert.equal(split.upperPriceUsd, 110);
+});
+
+

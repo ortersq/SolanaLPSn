@@ -174,6 +174,7 @@ export default function App() {
             scanningRisk={scanningRisk}
             onCheckHelius={handleCheckHelius}
             onRunRiskScan={handleRunRiskScan}
+            onUpdateBackendStatus={setBackendStatus}
             onGoToStrategy={() => setActiveTab('strategy')}
             onGoToPools={() => setActiveTab('pools')}
           />

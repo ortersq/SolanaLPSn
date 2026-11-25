@@ -542,3 +542,36 @@ export function evaluateLiveRiskAlerts(input: LiveRiskScanInput): RiskLogEntry[]
   return alerts;
 }
 
+export type PipelineStepKey = 'swap' | 'addLp' | 'removeLp' | 'sweep';
+export type PipelineStepStatus = 'passed' | 'readonly_only' | 'warning' | 'failed';
+
+export interface PipelineStepResult {
+  step: PipelineStepKey;
+  title: string;
+  status: PipelineStepStatus;
+  summary: string;
+  details: string;
+  durationMs: number;
+}
+
+export function calculateLpDepositAmounts(
+  lpUsdt: number,
+  solPriceUsd: number,
+  rangeWidthPct: number
+): {
+  usdcAmount: number;
+  solAmount: number;
+  lowerPriceUsd: number;
+  upperPriceUsd: number;
+} {
+  const safeLp = Math.max(lpUsdt, 0);
+  const safeSolPrice = Math.max(solPriceUsd, 1);
+  const halfUsd = safeLp / 2;
+  const usdcAmount = Number(halfUsd.toFixed(2));
+  const solAmount = Number((halfUsd / safeSolPrice).toFixed(4));
+  const lowerPriceUsd = Number((safeSolPrice * (1 - rangeWidthPct / 100)).toFixed(2));
+  const upperPriceUsd = Number((safeSolPrice * (1 + rangeWidthPct / 100)).toFixed(2));
+  return { usdcAmount, solAmount, lowerPriceUsd, upperPriceUsd };
+}
+
+

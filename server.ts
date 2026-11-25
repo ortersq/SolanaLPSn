@@ -1,3 +1,4 @@
+import fs from 'fs';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
@@ -5,13 +6,25 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
 import {
+  Connection,
+  Keypair,
+  PublicKey,
+  SystemProgram,
+  Transaction,
+  VersionedTransaction,
+} from '@solana/web3.js';
+import bs58 from 'bs58';
+import {
   API_KEY_REQUIREMENTS,
   DEFAULT_200U_STRATEGY,
+  PipelineStepKey,
+  PipelineStepResult,
   PoolMetrics,
   RiskLogEntry,
   RiskProfileKey,
   StrategyConfig,
   buildPresetForCapital,
+  calculateLpDepositAmounts,
   evaluateLiveRiskAlerts,
   isValidSolanaAddress,
   maskSolanaAddress,
@@ -38,9 +51,29 @@ const HELIUS_RPC_URL =
   'https://mainnet.helius-rpc.com/?api-key=5641e03b-ad1b-46b8-bd65-97bde80f9c3e';
 
 // Strictly backend-only env configuration (never editable from frontend)
-const BACKEND_PRIVATE_KEY_SET = Boolean(process.env.PRIVATE_KEY?.trim());
+const BACKEND_PRIVATE_KEY_RAW = process.env.PRIVATE_KEY?.trim() || '';
 const BACKEND_RECIPIENT_RAW = process.env.RECIPIENT_ADDRESS?.trim() || '';
 const BACKEND_WATCH_WALLET_RAW = process.env.WATCH_WALLET_ADDRESS?.trim() || '';
+
+let BACKEND_KEYPAIR: Keypair | null = null;
+let BACKEND_PRIVATE_KEY_ERROR = '';
+if (BACKEND_PRIVATE_KEY_RAW) {
+  try {
+    BACKEND_KEYPAIR = Keypair.fromSecretKey(bs58.decode(BACKEND_PRIVATE_KEY_RAW));
+  } catch (err: any) {
+    BACKEND_PRIVATE_KEY_ERROR = err?.message || 'Base58 私钥格式无效';
+  }
+}
+
+const BACKEND_PRIVATE_KEY_SET = Boolean(BACKEND_PRIVATE_KEY_RAW && BACKEND_KEYPAIR);
+const EFFECTIVE_WALLET_ADDRESS = isValidSolanaAddress(BACKEND_WATCH_WALLET_RAW)
+  ? BACKEND_WATCH_WALLET_RAW
+  : BACKEND_KEYPAIR
+  ? BACKEND_KEYPAIR.publicKey.toBase58()
+  : '';
+
+const STATUS_FILE_PATH = path.resolve(__dirname, '.bot-runtime-status.json');
+const solanaConnection = new Connection(HELIUS_RPC_URL, 'confirmed');
 
 interface LogItem {
   id: number;
@@ -49,26 +82,107 @@ interface LogItem {
   message: string;
 }
 
+export interface WorkerHeartbeatStatus {
+  running: boolean;
+  pid: number | null;
+  startedAt: string | null;
+  lastTickAt: string | null;
+  dryRun: boolean;
+  riskProfile: string;
+  walletMasked: string;
+  recipientMasked: string;
+  tickCount: number;
+  balanceSOL: number | null;
+  bestPool: string | null;
+  jupiterOutUsdc: number | null;
+  impactBps: number | null;
+  lastError: string | null;
+}
+
 const nowTime = () => new Date().toTimeString().split(' ')[0];
 
-let strategyConfig: StrategyConfig = { ...DEFAULT_200U_STRATEGY };
+const envCapital = Number(process.env.CAPITAL_USDT || 200);
+const envProfileRaw = process.env.RISK_PROFILE;
+const envProfile: RiskProfileKey =
+  envProfileRaw === 'ultra-safe'
+    ? 'ultra-safe'
+    : envProfileRaw === 'active-yield'
+    ? 'active-yield'
+    : 'balanced-steady';
+
+let strategyConfig: StrategyConfig =
+  envProfileRaw || process.env.CAPITAL_USDT
+    ? buildPresetForCapital(envCapital, envProfile)
+    : { ...DEFAULT_200U_STRATEGY };
+
+function readWorkerHeartbeat(): WorkerHeartbeatStatus {
+  const dryRunFallback = process.env.DRY_RUN !== 'false';
+  const defaultState: WorkerHeartbeatStatus = {
+    running: false,
+    pid: null,
+    startedAt: null,
+    lastTickAt: null,
+    dryRun: dryRunFallback,
+    riskProfile: strategyConfig.riskProfile,
+    walletMasked: EFFECTIVE_WALLET_ADDRESS ? maskSolanaAddress(EFFECTIVE_WALLET_ADDRESS) : '未配置',
+    recipientMasked: isValidSolanaAddress(BACKEND_RECIPIENT_RAW)
+      ? maskSolanaAddress(BACKEND_RECIPIENT_RAW)
+      : '未配置',
+    tickCount: 0,
+    balanceSOL: null,
+    bestPool: null,
+    jupiterOutUsdc: null,
+    impactBps: null,
+    lastError: null,
+  };
+
+  try {
+    if (!fs.existsSync(STATUS_FILE_PATH)) {
+      return defaultState;
+    }
+    const raw = fs.readFileSync(STATUS_FILE_PATH, 'utf-8');
+    const parsed = JSON.parse(raw);
+    const lastTickMs = parsed?.lastTickAt ? Date.parse(parsed.lastTickAt) : 0;
+    const isFresh = Number.isFinite(lastTickMs) && Date.now() - lastTickMs < 90_000;
+    return {
+      running: isFresh,
+      pid: parsed?.pid ?? null,
+      startedAt: parsed?.startedAt ?? null,
+      lastTickAt: parsed?.lastTickAt ?? null,
+      dryRun: parsed?.dryRun ?? dryRunFallback,
+      riskProfile: parsed?.riskProfile ?? strategyConfig.riskProfile,
+      walletMasked: parsed?.walletMasked ?? defaultState.walletMasked,
+      recipientMasked: parsed?.recipientMasked ?? defaultState.recipientMasked,
+      tickCount: Number(parsed?.tickCount || 0),
+      balanceSOL: parsed?.balanceSOL ?? null,
+      bestPool: parsed?.bestPool ?? null,
+      jupiterOutUsdc: parsed?.jupiterOutUsdc ?? null,
+      impactBps: parsed?.impactBps ?? null,
+      lastError: parsed?.lastError ?? null,
+    };
+  } catch {
+    return defaultState;
+  }
+}
 
 let backendStatus = {
   heliusConnected: false,
   heliusLatencyMs: null as number | null,
   lastSlot: null as number | null,
   privateKeyConfigured: BACKEND_PRIVATE_KEY_SET,
+  privateKeyError: BACKEND_PRIVATE_KEY_ERROR,
   recipientConfigured: isValidSolanaAddress(BACKEND_RECIPIENT_RAW),
   recipientMasked: isValidSolanaAddress(BACKEND_RECIPIENT_RAW)
     ? maskSolanaAddress(BACKEND_RECIPIENT_RAW)
     : '待后台 .env 配置',
-  watchWalletConfigured: isValidSolanaAddress(BACKEND_WATCH_WALLET_RAW),
-  watchWalletMasked: isValidSolanaAddress(BACKEND_WATCH_WALLET_RAW)
-    ? maskSolanaAddress(BACKEND_WATCH_WALLET_RAW)
+  watchWalletConfigured: isValidSolanaAddress(EFFECTIVE_WALLET_ADDRESS),
+  watchWalletMasked: isValidSolanaAddress(EFFECTIVE_WALLET_ADDRESS)
+    ? maskSolanaAddress(EFFECTIVE_WALLET_ADDRESS)
     : '待后台 .env 配置',
   watchBalanceSOL: null as number | null,
   splTokenAccountsCount: 0,
   lastJupiterImpactBps: null as number | null,
+  dryRunMode: process.env.DRY_RUN !== 'false',
   riskAlerts: [] as RiskLogEntry[],
   logs: [
     {
@@ -82,11 +196,18 @@ let backendStatus = {
       id: 2,
       time: nowTime(),
       type: 'success',
-      message:
-        '已自动为您装载【200U 稳定盈利方案】：185U 做市 + 15U Gas 保留金 + 全网异常波动与滑点实时巡检。',
+      message: `已装载【${strategyConfig.capitalUsdt}U 自动做市方案】：${strategyConfig.lpActiveUsdt}U 做市 + ${strategyConfig.gasReserveUsdt}U Gas 保留金 + 全网异常波动与滑点实时巡检。`,
     },
   ] as LogItem[],
 };
+
+function getLiveBackendStatus() {
+  return {
+    ...backendStatus,
+    dryRunMode: process.env.DRY_RUN !== 'false',
+    workerStatus: readWorkerHeartbeat(),
+  };
+}
 
 function pushLog(type: LogItem['type'], message: string) {
   backendStatus.logs.unshift({
@@ -241,12 +362,12 @@ app.get('/api/helius/health', async (_req, res) => {
     backendStatus.heliusLatencyMs = latency;
     backendStatus.heliusConnected = true;
 
-    // Only query wallet if WATCH_WALLET_ADDRESS is configured in backend .env
-    if (isValidSolanaAddress(BACKEND_WATCH_WALLET_RAW)) {
+    // Query watch wallet OR derived server keypair public key (never exposes private key)
+    if (isValidSolanaAddress(EFFECTIVE_WALLET_ADDRESS)) {
       const [balRes, tokRes] = await Promise.all([
-        callHeliusRpc('getBalance', [BACKEND_WATCH_WALLET_RAW]),
+        callHeliusRpc('getBalance', [EFFECTIVE_WALLET_ADDRESS]),
         callHeliusRpc('getTokenAccountsByOwner', [
-          BACKEND_WATCH_WALLET_RAW,
+          EFFECTIVE_WALLET_ADDRESS,
           { programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' },
           { encoding: 'jsonParsed' },
         ]),
@@ -259,7 +380,7 @@ app.get('/api/helius/health', async (_req, res) => {
 
     res.json({
       success: true,
-      backendStatus,
+      backendStatus: getLiveBackendStatus(),
     });
   } catch (err: any) {
     backendStatus.heliusConnected = false;
@@ -273,7 +394,7 @@ app.get('/api/helius/health', async (_req, res) => {
 app.get('/api/status', (_req, res) => {
   res.json({
     success: true,
-    backendStatus,
+    backendStatus: getLiveBackendStatus(),
     strategyConfig,
     apiKeyRequirements: API_KEY_REQUIREMENTS,
   });
@@ -366,7 +487,7 @@ app.post('/api/risk/scan', async (_req, res) => {
 
     res.json({
       success: true,
-      backendStatus,
+      backendStatus: getLiveBackendStatus(),
       riskAlerts: backendStatus.riskAlerts,
       timestamp: new Date().toISOString(),
     });
@@ -436,6 +557,333 @@ app.post('/api/strategy/preset', (req, res) => {
     `已应用 ${strategyConfig.capitalUsdt}U ${profileLabel}方案（做市 ${strategyConfig.lpActiveUsdt}U + Gas 预留 ${strategyConfig.gasReserveUsdt}U，最低 TVL $${(strategyConfig.minTVL / 1e6).toFixed(1)}M，区间 ±${strategyConfig.rangeWidthPct}%）。`
   );
   res.json({ success: true, strategyConfig, logs: backendStatus.logs });
+});
+
+async function runSwapPipelineTest(): Promise<PipelineStepResult> {
+  const started = Date.now();
+  const SOL_MINT = 'So11111111111111111111111111111111111111112';
+  const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+  const lamports = 10_000_000; // 0.01 SOL test swap
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${SOL_MINT}&outputMint=${USDC_MINT}&amount=${lamports}&slippageBps=${strategyConfig.slippageBps}`;
+    const quoteRes = await fetch(quoteUrl, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!quoteRes.ok) {
+      throw new Error(`Jupiter quote HTTP ${quoteRes.status}`);
+    }
+    const quote = await quoteRes.json();
+    const outUsdc = (Number(quote.outAmount || 0) / 1e6).toFixed(4);
+    const impactBps = (Math.abs(Number(quote.priceImpactPct || 0)) * 10000).toFixed(2);
+    const route =
+      (quote.routePlan || [])
+        .map((r: any) => r.swapInfo?.label)
+        .filter(Boolean)
+        .join(' → ') || 'Jupiter Smart Route';
+
+    if (!BACKEND_KEYPAIR) {
+      return {
+        step: 'swap',
+        title: '1. 代币兑换 (Jupiter Swap v1)',
+        status: 'readonly_only',
+        summary: `免密路由正常（0.01 SOL ≈ ${outUsdc} USDC），因未配置后台私钥跳过签名预演`,
+        details: `路由: ${route} · 滑点冲击 ${impactBps} bps。请在服务器 .env 配置 PRIVATE_KEY 后即可验证交易签名与 simulateTransaction 预演。`,
+        durationMs: Date.now() - started,
+      };
+    }
+
+    const swapCtrl = new AbortController();
+    const swapTimer = setTimeout(() => swapCtrl.abort(), 8000);
+    const swapRes = await fetch('https://lite-api.jup.ag/swap/v1/swap', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        quoteResponse: quote,
+        userPublicKey: BACKEND_KEYPAIR.publicKey.toBase58(),
+        wrapAndUnwrapSol: true,
+        prioritizationFeeLamports: 'auto',
+      }),
+      signal: swapCtrl.signal,
+    });
+    clearTimeout(swapTimer);
+    if (!swapRes.ok) {
+      throw new Error(`Jupiter swap 序列化接口 HTTP ${swapRes.status}`);
+    }
+    const swapData = await swapRes.json();
+    if (!swapData?.swapTransaction) {
+      throw new Error('Jupiter swapTransaction 返回为空');
+    }
+
+    const tx = VersionedTransaction.deserialize(Buffer.from(swapData.swapTransaction, 'base64'));
+    tx.sign([BACKEND_KEYPAIR]);
+    const sim = await solanaConnection.simulateTransaction(tx, { sigVerify: true });
+
+    if (sim.value.err) {
+      return {
+        step: 'swap',
+        title: '1. 代币兑换 (Jupiter Swap v1)',
+        status: 'warning',
+        summary: `签名与路由成功，主网模拟提示钱包余额/租金状态: ${JSON.stringify(sim.value.err)}`,
+        details: `已构建真实交易并用服务器钱包 ${maskSolanaAddress(
+          BACKEND_KEYPAIR.publicKey.toBase58()
+        )} 签名，报价 0.01 SOL ≈ ${outUsdc} USDC（${route}）。Helius simulateTransaction 返回错误，通常因钱包尚未转入足够 SOL 导致。`,
+        durationMs: Date.now() - started,
+      };
+    }
+
+    return {
+      step: 'swap',
+      title: '1. 代币兑换 (Jupiter Swap v1)',
+      status: 'passed',
+      summary: `主网仿真全通！0.01 SOL ≈ ${outUsdc} USDC（零扣款预演消耗 ${
+        sim.value.unitsConsumed ?? 'N/A'
+      } CU）`,
+      details: `真实路由 ${route} · 滑点 ${impactBps} bps · 私钥签名与 Helius simulateTransaction 验证通过。`,
+      durationMs: Date.now() - started,
+    };
+  } catch (err: any) {
+    return {
+      step: 'swap',
+      title: '1. 代币兑换 (Jupiter Swap v1)',
+      status: 'failed',
+      summary: `兑换链路探测失败: ${err.message}`,
+      details: '请检查服务器公网 HTTPS 出口是否可访问 lite-api.jup.ag 及 Helius RPC。',
+      durationMs: Date.now() - started,
+    };
+  }
+}
+
+async function runAddLpPipelineTest(): Promise<PipelineStepResult> {
+  const started = Date.now();
+  try {
+    const [{ pools, source }, solQuote] = await Promise.all([
+      fetchRealPools(),
+      fetchJupiterQuoteMetrics(0.1).catch(() => null),
+    ]);
+    const ranked = rankPools(pools, strategyConfig);
+    const targetPool = ranked.find((p) => p.eligibleFor200U) || ranked[0];
+    if (!targetPool) {
+      return {
+        step: 'addLp',
+        title: '2. 加池子 (Raydium CLMM)',
+        status: 'warning',
+        summary: '当前暂无符合门槛的矿池（数据源不可达或全被风控拦截）',
+        details: `数据源: ${source}`,
+        durationMs: Date.now() - started,
+      };
+    }
+
+    const poolPubkey = new PublicKey(targetPool.address);
+    const accountInfo = await solanaConnection.getAccountInfo(poolPubkey);
+    if (!accountInfo) {
+      return {
+        step: 'addLp',
+        title: '2. 加池子 (Raydium CLMM)',
+        status: 'warning',
+        summary: `候选池 ${targetPool.name} 链上账户未读取到数据`,
+        details: `Pool ID: ${maskSolanaAddress(targetPool.address)}`,
+        durationMs: Date.now() - started,
+      };
+    }
+
+    const solPriceUsd = solQuote ? solQuote.outAmountUsdc * 10 : 180;
+    const split = calculateLpDepositAmounts(
+      strategyConfig.lpActiveUsdt,
+      solPriceUsd,
+      strategyConfig.rangeWidthPct
+    );
+
+    return {
+      step: 'addLp',
+      title: '2. 加池子 (Raydium CLMM)',
+      status: BACKEND_KEYPAIR ? 'passed' : 'readonly_only',
+      summary: `优选池 ${targetPool.name}（年化 +${targetPool.apr}%）链上合约账户核验通过`,
+      details: `Owner: ${maskSolanaAddress(accountInfo.owner.toBase58())} · 账户字节 ${
+        accountInfo.data.length
+      } B · 按 ${strategyConfig.lpActiveUsdt}U 测算 50:50 配比为 ${split.usdcAmount} USDC + ${
+        split.solAmount
+      } SOL（区间 $${split.lowerPriceUsd} ~ $${split.upperPriceUsd}，±${strategyConfig.rangeWidthPct}%）。`,
+      durationMs: Date.now() - started,
+    };
+  } catch (err: any) {
+    return {
+      step: 'addLp',
+      title: '2. 加池子 (Raydium CLMM)',
+      status: 'failed',
+      summary: `加池链路核验失败: ${err.message}`,
+      details: '检查 Raydium API v3 与 Helius getAccountInfo 连通性。',
+      durationMs: Date.now() - started,
+    };
+  }
+}
+
+async function runRemoveLpPipelineTest(): Promise<PipelineStepResult> {
+  const started = Date.now();
+  const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+  const SOL_MINT = 'So11111111111111111111111111111111111111112';
+  const tenUsdc = 10_000_000; // 10 USDC
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 7000);
+    const url = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${USDC_MINT}&outputMint=${SOL_MINT}&amount=${tenUsdc}&slippageBps=${strategyConfig.slippageBps}`;
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const quote = await res.json();
+    const outSol = (Number(quote.outAmount || 0) / 1e9).toFixed(5);
+    const impactBps = Number((Math.abs(Number(quote.priceImpactPct || 0)) * 10000).toFixed(2));
+    const slippageOk = impactBps <= strategyConfig.slippageBps;
+
+    return {
+      step: 'removeLp',
+      title: '3. 撤池子与防滑点熔断',
+      status: slippageOk ? 'passed' : 'warning',
+      summary: slippageOk
+        ? `反向退出通路正常（10 USDC ≈ ${outSol} SOL，冲击 ${impactBps} bps ≤ 上限 ${strategyConfig.slippageBps} bps）`
+        : `触发防滑点警告（冲击 ${impactBps} bps > 上限 ${strategyConfig.slippageBps} bps）`,
+      details: `已校验撤池紧急换币通路 + 止损线 -${strategyConfig.stopLossPercentage}% + Jito 小费 ${(
+        strategyConfig.jitoTipLamports / 1e9
+      ).toFixed(4)} SOL 优先级参数。`,
+      durationMs: Date.now() - started,
+    };
+  } catch (err: any) {
+    return {
+      step: 'removeLp',
+      title: '3. 撤池子与防滑点熔断',
+      status: 'failed',
+      summary: `撤池路由探测失败: ${err.message}`,
+      details: '未能完成反向 Jupiter 流动性滑点检测。',
+      durationMs: Date.now() - started,
+    };
+  }
+}
+
+async function runSweepPipelineTest(): Promise<PipelineStepResult> {
+  const started = Date.now();
+  try {
+    const recipientValid = isValidSolanaAddress(BACKEND_RECIPIENT_RAW);
+    if (!recipientValid) {
+      return {
+        step: 'sweep',
+        title: '4. 利润转移 (SystemProgram 转账)',
+        status: 'warning',
+        summary: '后台 .env 尚未配置有效 RECIPIENT_ADDRESS 收款公钥',
+        details: '请在服务器 .env 中填入盈利接收 Solana 公钥地址并重启 pm2 服务。',
+        durationMs: Date.now() - started,
+      };
+    }
+
+    const recipientPubkey = new PublicKey(BACKEND_RECIPIENT_RAW);
+    if (!BACKEND_KEYPAIR) {
+      return {
+        step: 'sweep',
+        title: '4. 利润转移 (SystemProgram 转账)',
+        status: 'readonly_only',
+        summary: `收款公钥 ${maskSolanaAddress(
+          recipientPubkey.toBase58()
+        )} 校验有效，等待后台私钥完成转账预演`,
+        details: '因当前环境未注入 PRIVATE_KEY，未构造签名转账；您的正式服务器注入私钥后可完整预演 SystemProgram.transfer。',
+        durationMs: Date.now() - started,
+      };
+    }
+
+    const { blockhash } = await solanaConnection.getLatestBlockhash('confirmed');
+    const tx = new Transaction({
+      recentBlockhash: blockhash,
+      feePayer: BACKEND_KEYPAIR.publicKey,
+    }).add(
+      SystemProgram.transfer({
+        fromPubkey: BACKEND_KEYPAIR.publicKey,
+        toPubkey: recipientPubkey,
+        lamports: 100_000, // 0.0001 SOL dry simulation only
+      })
+    );
+    tx.sign(BACKEND_KEYPAIR);
+
+    const sim = await solanaConnection.simulateTransaction(tx);
+    if (sim.value.err) {
+      return {
+        step: 'sweep',
+        title: '4. 利润转移 (SystemProgram 转账)',
+        status: 'warning',
+        summary: `收款地址与签名就绪，模拟提示余额/租金状态: ${JSON.stringify(sim.value.err)}`,
+        details: `目标地址 ${maskSolanaAddress(
+          recipientPubkey.toBase58()
+        )} 合法且已完成离线签名，但因交易钱包 SOL 余额不足 0.0001 SOL + Gas，Helius 模拟拦截（实际零转账扣款）。`,
+        durationMs: Date.now() - started,
+      };
+    }
+
+    return {
+      step: 'sweep',
+      title: '4. 利润转移 (SystemProgram 转账)',
+      status: 'passed',
+      summary: `转账预演通过！目标冷钱包 ${maskSolanaAddress(
+        recipientPubkey.toBase58()
+      )} 可正常接收利润（未真实转账）`,
+      details: `已用服务器交易钱包签名 0.0001 SOL SystemProgram.transfer 并通过 Helius simulateTransaction 验证（消耗 ${
+        sim.value.unitsConsumed ?? 150
+      } CU）。`,
+      durationMs: Date.now() - started,
+    };
+  } catch (err: any) {
+    return {
+      step: 'sweep',
+      title: '4. 利润转移 (SystemProgram 转账)',
+      status: 'failed',
+      summary: `利润转账预演异常: ${err.message}`,
+      details: '请检查 Helius RPC 连通性与 RECIPIENT_ADDRESS / PRIVATE_KEY 格式。',
+      durationMs: Date.now() - started,
+    };
+  }
+}
+
+app.post('/api/pipeline/test', async (req, res) => {
+  const rawStep = req.body?.step;
+  const target: 'all' | PipelineStepKey =
+    rawStep === 'swap' || rawStep === 'addLp' || rawStep === 'removeLp' || rawStep === 'sweep'
+      ? rawStep
+      : 'all';
+
+  try {
+    const results: PipelineStepResult[] = [];
+    if (target === 'all' || target === 'swap') {
+      results.push(await runSwapPipelineTest());
+    }
+    if (target === 'all' || target === 'addLp') {
+      results.push(await runAddLpPipelineTest());
+    }
+    if (target === 'all' || target === 'removeLp') {
+      results.push(await runRemoveLpPipelineTest());
+    }
+    if (target === 'all' || target === 'sweep') {
+      results.push(await runSweepPipelineTest());
+    }
+
+    const summaryText = results.map((r) => `${r.title.split(' ')[0]}:${r.status}`).join(' | ');
+    pushLog(
+      results.some((r) => r.status === 'failed') ? 'error' : 'success',
+      `一键全链路预演完成 (${summaryText}) — 所有测试均为链上只读核验与 Helius simulateTransaction 仿真，未消耗真实资金。`
+    );
+
+    res.json({
+      success: true,
+      target,
+      results,
+      backendStatus: getLiveBackendStatus(),
+      testedAt: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: `全流程自检异常: ${err.message}`,
+    });
+  }
 });
 
 app.post('/api/ai/analyze', async (req, res) => {

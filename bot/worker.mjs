@@ -1,3 +1,4 @@
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
@@ -14,6 +15,7 @@ import {
 import bs58 from 'bs58';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const STATUS_FILE_PATH = path.resolve(__dirname, '../.bot-runtime-status.json');
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 dotenv.config();
 
@@ -45,6 +47,37 @@ if (!PRIVATE_KEY || !RECIPIENT_ADDRESS) {
 const connection = new Connection(RPC_URL, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(PRIVATE_KEY));
 const recipientPubkey = new PublicKey(RECIPIENT_ADDRESS);
+const startedAt = new Date().toISOString();
+let tickCount = 0;
+
+function maskAddr(addr) {
+  return addr.length > 10 ? `${addr.slice(0, 4)}...${addr.slice(-4)}` : '****';
+}
+
+function writeHeartbeat(payload) {
+  try {
+    fs.writeFileSync(
+      STATUS_FILE_PATH,
+      JSON.stringify(
+        {
+          pid: process.pid,
+          startedAt,
+          lastTickAt: new Date().toISOString(),
+          dryRun: DRY_RUN,
+          riskProfile: RISK_PROFILE,
+          walletMasked: maskAddr(wallet.publicKey.toBase58()),
+          recipientMasked: maskAddr(recipientPubkey.toBase58()),
+          tickCount,
+          ...payload,
+        },
+        null,
+        2
+      )
+    );
+  } catch (e) {
+    console.error('[状态写入失败]', e.message);
+  }
+}
 
 console.log('====================================================');
 console.log(' Solana LP 新加坡后台执行引擎已启动');
@@ -145,16 +178,25 @@ export async function buildJupiterSwapTx(inputMint, outputMint, amountLamports) 
 }
 
 async function tick() {
+  tickCount += 1;
   try {
     const lamports = await connection.getBalance(wallet.publicKey);
-    const solBalance = lamports / LAMPORTS_PER_SOL;
+    const solBalance = Number((lamports / LAMPORTS_PER_SOL).toFixed(4));
     const [{ best, alerts }, { outUsdc, impactBps }] = await Promise.all([
       scanLivePools(),
       checkExitSlippageGuard(),
     ]);
 
+    writeHeartbeat({
+      balanceSOL: solBalance,
+      bestPool: best ? `${best.pair} (+${best.apr.toFixed(1)}%)` : '空仓避险中',
+      jupiterOutUsdc: Number(outUsdc.toFixed(4)),
+      impactBps: Number(impactBps.toFixed(2)),
+      lastError: null,
+    });
+
     console.log(
-      `[${new Date().toISOString()}] 余额 ${solBalance.toFixed(4)} SOL | 0.1 SOL ≈ ${outUsdc.toFixed(4)} USDC (滑点 ${impactBps.toFixed(2)} bps)`
+      `[${new Date().toISOString()}] #${tickCount} 余额 ${solBalance} SOL | 0.1 SOL ≈ ${outUsdc.toFixed(4)} USDC (滑点 ${impactBps.toFixed(2)} bps)`
     );
     if (best) {
       console.log(
@@ -165,6 +207,7 @@ async function tick() {
       console.warn(`  [风控拦截] ${msg}`);
     }
   } catch (err) {
+    writeHeartbeat({ lastError: err.message });
     console.error('[巡检异常]', err.message);
   }
 }

@@ -6,9 +6,16 @@ import {
   Lock,
   TrendingUp,
   AlertTriangle,
+  Play,
+  Activity,
+  CheckCircle2,
+  XCircle,
+  Info,
 } from 'lucide-react';
 import {
   ApiKeyRequirement,
+  PipelineStepKey,
+  PipelineStepResult,
   RiskLogEntry,
   StrategyConfig,
 } from '../utils/strategyEngine';
@@ -20,11 +27,29 @@ export interface LogItem {
   message: string;
 }
 
+export interface WorkerHeartbeatStatus {
+  running: boolean;
+  pid: number | null;
+  startedAt: string | null;
+  lastTickAt: string | null;
+  dryRun: boolean;
+  riskProfile: string;
+  walletMasked: string;
+  recipientMasked: string;
+  tickCount: number;
+  balanceSOL: number | null;
+  bestPool: string | null;
+  jupiterOutUsdc: number | null;
+  impactBps: number | null;
+  lastError: string | null;
+}
+
 export interface BackendStatus {
   heliusConnected: boolean;
   heliusLatencyMs: number | null;
   lastSlot: number | null;
   privateKeyConfigured: boolean;
+  privateKeyError?: string;
   recipientConfigured: boolean;
   recipientMasked: string;
   watchWalletConfigured: boolean;
@@ -32,6 +57,8 @@ export interface BackendStatus {
   watchBalanceSOL: number | null;
   splTokenAccountsCount: number;
   lastJupiterImpactBps: number | null;
+  dryRunMode?: boolean;
+  workerStatus?: WorkerHeartbeatStatus;
   riskAlerts: RiskLogEntry[];
   logs: LogItem[];
 }
@@ -43,9 +70,37 @@ interface OverviewProps {
   scanningRisk: boolean;
   onCheckHelius: () => Promise<void>;
   onRunRiskScan: () => Promise<void>;
+  onUpdateBackendStatus: (status: BackendStatus) => void;
   onGoToStrategy: () => void;
   onGoToPools: () => void;
 }
+
+const PIPELINE_STEP_META: { key: PipelineStepKey; title: string; buttonLabel: string; hint: string }[] = [
+  {
+    key: 'swap',
+    title: '1. 代币兑换 (Jupiter Swap v1)',
+    buttonLabel: '测试兑换',
+    hint: '验证 0.01 SOL → USDC 聚合报价、交易序列化及私钥签名仿真',
+  },
+  {
+    key: 'addLp',
+    title: '2. 加池子 (Raydium CLMM)',
+    buttonLabel: '测试加池',
+    hint: '核验首选池合约账户数据，并按当前策略计算 50:50 资金与集中区间',
+  },
+  {
+    key: 'removeLp',
+    title: '3. 撤池子与防滑点熔断',
+    buttonLabel: '测试撤池',
+    hint: '探测反向 10 USDC → SOL 退出滑点与止损紧急撤池通道',
+  },
+  {
+    key: 'sweep',
+    title: '4. 利润转移 (SystemProgram 转账)',
+    buttonLabel: '测试利润转移',
+    hint: '校验收款冷钱包公钥并执行 0.0001 SOL 转账主网模拟（不扣费）',
+  },
+];
 
 export const OverviewAndKeysView: React.FC<OverviewProps> = ({
   backendStatus,
@@ -54,6 +109,7 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
   scanningRisk,
   onCheckHelius,
   onRunRiskScan,
+  onUpdateBackendStatus,
   onGoToStrategy,
   onGoToPools,
 }) => {
@@ -69,6 +125,10 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
     route: string;
   } | null>(null);
   const [quoteError, setQuoteError] = useState('');
+  const [testingStep, setTestingStep] = useState<'all' | PipelineStepKey | null>(null);
+  const [pipelineResults, setPipelineResults] = useState<Partial<Record<PipelineStepKey, PipelineStepResult>>>({});
+  const [pipelineError, setPipelineError] = useState('');
+  const [lastPipelineTestedAt, setLastPipelineTestedAt] = useState('');
 
   const handleHeliusClick = async () => {
     setCheckingHelius(true);
@@ -76,6 +136,44 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
       await onCheckHelius();
     } finally {
       setCheckingHelius(false);
+    }
+  };
+
+  const handleRunPipelineTest = async (step: 'all' | PipelineStepKey) => {
+    setPipelineError('');
+    setTestingStep(step);
+    try {
+      const res = await fetch('/api/pipeline/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ step }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setPipelineError(data.error || '链路自检请求失败');
+        return;
+      }
+      if (Array.isArray(data.results)) {
+        setPipelineResults((prev) => {
+          const next = { ...prev };
+          for (const item of data.results as PipelineStepResult[]) {
+            next[item.step] = item;
+          }
+          return next;
+        });
+      }
+      if (data.backendStatus) {
+        onUpdateBackendStatus(data.backendStatus);
+      }
+      if (data.testedAt) {
+        setLastPipelineTestedAt(
+          new Date(data.testedAt).toLocaleTimeString('zh-CN', { hour12: false })
+        );
+      }
+    } catch (err: any) {
+      setPipelineError(err?.message || '网络请求异常');
+    } finally {
+      setTestingStep(null);
     }
   };
 
@@ -198,6 +296,171 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
             {backendStatus.watchWalletConfigured
               ? `${backendStatus.watchWalletMasked} · ${backendStatus.splTokenAccountsCount} 个代币账户`
               : '未在服务器配钱包前绝不显示假持仓'}
+          </div>
+        </div>
+      </section>
+
+      {/* Background Auto-Execution Worker Heartbeat + One-Click Pipeline Test Console */}
+      <section
+        aria-label="后台自动运行状态与全流程一键测试台"
+        className="p-6 rounded-xl bg-[#101624] border border-slate-800/90 space-y-5"
+      >
+        {/* Worker Heartbeat Bar */}
+        <div className="p-4 rounded-lg bg-[#090d16] border border-slate-800/80 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div className="flex items-start gap-3">
+            <Activity
+              className={`w-5 h-5 mt-0.5 shrink-0 ${
+                backendStatus.workerStatus?.running ? 'text-emerald-400' : 'text-amber-400'
+              }`}
+            />
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-2 text-sm font-semibold text-white">
+                <span>
+                  后台自动策略引擎（solana-lp-bot）：
+                  {backendStatus.workerStatus?.running ? (
+                    <span className="text-emerald-400 ml-1">正在自动运行中</span>
+                  ) : (
+                    <span className="text-amber-400 ml-1">未检测到活跃心跳</span>
+                  )}
+                </span>
+                <span className="text-xs font-mono text-slate-400">
+                  · {(backendStatus.workerStatus?.dryRun ?? backendStatus.dryRunMode) ? 'DRY_RUN=true 安全演练模式' : '实盘自动运行模式'}
+                </span>
+              </div>
+              <p className="text-xs text-slate-400 leading-relaxed">
+                {backendStatus.workerStatus?.running ? (
+                  <>
+                    PID {backendStatus.workerStatus.pid} · 已自动巡检{' '}
+                    <span className="text-slate-200 font-mono">{backendStatus.workerStatus.tickCount}</span> 轮 · 最近心跳{' '}
+                    <span className="text-slate-200 font-mono">
+                      {backendStatus.workerStatus.lastTickAt
+                        ? new Date(backendStatus.workerStatus.lastTickAt).toLocaleTimeString('zh-CN', { hour12: false })
+                        : '--'}
+                    </span>
+                    {backendStatus.workerStatus.bestPool ? ` · 当前主选池：${backendStatus.workerStatus.bestPool}` : ''}
+                  </>
+                ) : (
+                  <>
+                    {backendStatus.privateKeyError
+                      ? `私钥格式异常（${backendStatus.privateKeyError}），请检查服务器 .env。`
+                      : '若您在服务器通过 deploy.sh 启动了 PM2，请确认 pm2 list 中 solana-lp-bot 为 online（或私钥已写入 .env）；当前控制台每 30 秒仍会自动扫描主网风险。'}
+                  </>
+                )}
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            disabled={testingStep !== null}
+            onClick={() => handleRunPipelineTest('all')}
+            className="px-4 py-2.5 text-xs font-semibold text-slate-950 bg-emerald-400 rounded-lg hover:bg-emerald-300 disabled:opacity-50 transition-colors cursor-pointer inline-flex items-center justify-center gap-2 whitespace-nowrap shrink-0"
+          >
+            {testingStep === 'all' ? (
+              <RefreshCw className="w-4 h-4 animate-spin" />
+            ) : (
+              <Play className="w-4 h-4" />
+            )}
+            {testingStep === 'all' ? '正在执行全流程主网预演...' : '一键测试全流程（兑换/加池/撤池/转利润）'}
+          </button>
+        </div>
+
+        {/* One-Click Individual Step Tests */}
+        <div className="space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <h2 className="text-base font-semibold text-white">
+                全流程执行链路自检（真实主网仿真 · 零真实扣款）
+              </h2>
+              <p className="text-xs text-slate-400 mt-0.5">
+                逐项验证服务器私钥签名、Jupiter Swap 兑换、Raydium CLMM 选池配比、撤池防滑点与冷钱包利润转移通路。
+              </p>
+            </div>
+            {lastPipelineTestedAt && (
+              <span className="text-xs font-mono text-slate-400 shrink-0">
+                最近自检: {lastPipelineTestedAt}
+              </span>
+            )}
+          </div>
+
+          {pipelineError && (
+            <div className="p-3 rounded-lg bg-rose-500/10 border border-rose-500/30 text-xs text-rose-300">
+              {pipelineError}
+            </div>
+          )}
+
+          <div
+            data-testid="pipeline-test-grid"
+            className="grid grid-cols-1 md:grid-cols-2 gap-4"
+          >
+            {PIPELINE_STEP_META.map((meta) => {
+              const res = pipelineResults[meta.key];
+              const isBusy = testingStep === 'all' || testingStep === meta.key;
+
+              const statusColor = !res
+                ? 'text-slate-400'
+                : res.status === 'passed'
+                ? 'text-emerald-400'
+                : res.status === 'readonly_only'
+                ? 'text-sky-400'
+                : res.status === 'warning'
+                ? 'text-amber-400'
+                : 'text-rose-400';
+
+              const statusLabel = !res
+                ? '未测试'
+                : res.status === 'passed'
+                ? '主网仿真通过'
+                : res.status === 'readonly_only'
+                ? '只读核验通过（缺私钥待签名）'
+                : res.status === 'warning'
+                ? '配置/余额提醒'
+                : '探测失败';
+
+              return (
+                <div
+                  key={meta.key}
+                  data-testid={`pipeline-card-${meta.key}`}
+                  className="p-4 rounded-lg bg-[#090d16] border border-slate-800/80 flex flex-col justify-between gap-3"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="space-y-1">
+                      <div className="text-sm font-semibold text-white">{meta.title}</div>
+                      <div className={`text-xs font-medium inline-flex items-center gap-1.5 ${statusColor}`}>
+                        {res?.status === 'passed' && <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />}
+                        {res?.status === 'readonly_only' && <Info className="w-3.5 h-3.5 shrink-0" />}
+                        {res?.status === 'warning' && <AlertTriangle className="w-3.5 h-3.5 shrink-0" />}
+                        {res?.status === 'failed' && <XCircle className="w-3.5 h-3.5 shrink-0" />}
+                        <span>{statusLabel}</span>
+                        {res && (
+                          <span className="text-slate-500 font-mono">({res.durationMs} ms)</span>
+                        )}
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      disabled={testingStep !== null}
+                      onClick={() => handleRunPipelineTest(meta.key)}
+                      className="px-3 py-1.5 text-xs font-medium text-slate-100 bg-slate-800 border border-slate-700 rounded-md hover:bg-slate-700 disabled:opacity-50 transition-colors cursor-pointer shrink-0 whitespace-nowrap"
+                    >
+                      {isBusy ? '测试中...' : meta.buttonLabel}
+                    </button>
+                  </div>
+
+                  <div className="text-xs leading-relaxed border-t border-slate-800/70 pt-2.5 space-y-1">
+                    {res ? (
+                      <>
+                        <div className="text-slate-100 font-medium">{res.summary}</div>
+                        <div className="text-slate-400 font-mono break-all">{res.details}</div>
+                      </>
+                    ) : (
+                      <div className="text-slate-400">{meta.hint}</div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
       </section>
