@@ -9,15 +9,23 @@ import {
   calculateImpermanentLossPct,
   calculateLpDepositAmounts,
   calculatePositionMetrics,
+  computePositionRangeDeviation,
   computeSafeClmmOtherAmountMax,
   estimateNetYieldForCapital,
+  evaluateAutoAssetRebalance,
+  evaluateAutoCompoundOpportunity,
+  evaluateAutonomousHighYieldSwitch,
   evaluateLiveRiskAlerts,
+  evaluateMultiCurrencyHedgePlan,
   evaluateRiskAction,
+  evaluateSafeWithdrawSafety,
   formatChainError,
   isValidSolanaAddress,
   maskSolanaAddress,
   rankPools,
   PoolMetrics,
+  SolanaLendingReserve,
+  StrategyConfig,
 } from './strategyEngine';
 
 test('buildPresetForCapital allocates 200U with 15U gas reserve and 185U active LP', () => {
@@ -410,3 +418,710 @@ test('turbo-high-yield unlocks high-APR pools and calculateAutoPortfolioPlan det
   assert.ok(plan.slotPlans[0].targetUsd > 10);
   assert.ok(plan.slotPlans[1].targetUsd > 10);
 });
+
+test('evaluateAutonomousHighYieldSwitch opens new pool when idle funds exist, rotates when dry and +APR>=20%, and holds when optimal', () => {
+  const turboCfg = buildPresetForCapital(200, 'turbo-high-yield');
+  const samplePools: PoolMetrics[] = [
+    {
+      id: 'wsol-usdc-id',
+      name: 'WSOL / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'wsol-usdc-id',
+      tvl: 5_600_000,
+      volume24h: 21_000_000,
+      apr: 54.5,
+      feeTier: '0.04%',
+      priceUsd: '85.0',
+      safetyScore: 96,
+      ilRisk: '低',
+    },
+    {
+      id: 'spcx-usdc-id',
+      name: 'SPCX / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'spcx-usdc-id',
+      tvl: 2_200_000,
+      volume24h: 4_200_000,
+      apr: 173.1,
+      feeTier: '0.25%',
+      priceUsd: '1.25',
+      safetyScore: 92,
+      ilRisk: '中',
+    },
+  ];
+  const ranked = rankPools(samplePools, turboCfg);
+
+  // 1. Idle funds >= $5 -> OPEN_NEW (keep existing position, open SPCX/USDC)
+  const openNewDecision = evaluateAutonomousHighYieldSwitch({
+    rankedPools: ranked,
+    activePositions: [
+      {
+        poolId: 'wsol-usdc-id',
+        poolName: 'WSOL / USDC',
+        nftMint: 'nft-wsol',
+        injectedValueUsd: 14,
+      },
+    ],
+    idleDeployableUsd: 16,
+    config: turboCfg,
+  });
+  assert.equal(openNewDecision.decision, 'OPEN_NEW');
+  assert.equal(openNewDecision.shouldAct, true);
+  assert.equal(openNewDecision.targetPool?.poolId, 'spcx-usdc-id');
+  assert.equal(openNewDecision.sourcePositionToReplace, null);
+
+  // 2. No idle funds (< $5) + significant APR boost (+118.6%) -> ROTATE_SWAP
+  const rotateDecision = evaluateAutonomousHighYieldSwitch({
+    rankedPools: ranked,
+    activePositions: [
+      {
+        poolId: 'wsol-usdc-id',
+        poolName: 'WSOL / USDC',
+        nftMint: 'nft-wsol',
+        injectedValueUsd: 28,
+      },
+    ],
+    idleDeployableUsd: 1.5,
+    config: turboCfg,
+  });
+  assert.equal(rotateDecision.decision, 'ROTATE_SWAP');
+  assert.equal(rotateDecision.shouldAct, true);
+  assert.equal(rotateDecision.targetPool?.poolId, 'spcx-usdc-id');
+  assert.equal(rotateDecision.sourcePositionToReplace?.nftMint, 'nft-wsol');
+
+  // 3. No idle funds (< $5) + already in best pool (tiny APR delta) -> HOLD_OPTIMAL
+  const tinyDiffPools = rankPools(
+    [
+      samplePools[1],
+      {
+        ...samplePools[0],
+        apr: 175.0,
+      },
+    ],
+    turboCfg
+  );
+  const holdDecision = evaluateAutonomousHighYieldSwitch({
+    rankedPools: tinyDiffPools,
+    activePositions: [
+      {
+        poolId: 'spcx-usdc-id',
+        poolName: 'SPCX / USDC',
+        nftMint: 'nft-spcx',
+        injectedValueUsd: 28,
+      },
+    ],
+    idleDeployableUsd: 1.0,
+    config: turboCfg,
+  });
+  assert.equal(holdDecision.decision, 'HOLD_OPTIMAL');
+  assert.equal(holdDecision.shouldAct, false);
+});
+
+test('multiPositionParallel diversifies across parallel pools and smartCapitalAllocation detects USDC > injected incremental deployment', () => {
+  const cfg = buildPresetForCapital(200, 'turbo-high-yield');
+  assert.equal(cfg.multiPositionParallel, true);
+  assert.equal(cfg.smartCapitalAllocation, true);
+
+  const ranked = rankPools(
+    [
+      {
+        id: 'wsol-usdc-id',
+        name: 'WSOL / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: 'wsol-usdc-id',
+        tvl: 5_600_000,
+        volume24h: 21_000_000,
+        apr: 54.5,
+        feeTier: '0.04%',
+        priceUsd: '85.0',
+        safetyScore: 96,
+        ilRisk: '低',
+      },
+      {
+        id: 'spcx-usdc-id',
+        name: 'SPCX / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: 'spcx-usdc-id',
+        tvl: 2_200_000,
+        volume24h: 4_200_000,
+        apr: 173.1,
+        feeTier: '0.25%',
+        priceUsd: '1.25',
+        safetyScore: 92,
+        ilRisk: '中',
+      },
+      {
+        id: 'cards-usdc-id',
+        name: 'CARDS / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: 'cards-usdc-id',
+        tvl: 3_200_000,
+        volume24h: 2_300_000,
+        apr: 101.9,
+        feeTier: '0.40%',
+        priceUsd: '0.25',
+        safetyScore: 92,
+        ilRisk: '中',
+      },
+    ],
+    cfg
+  );
+
+  // Case A: Wallet USDC ($16.2) exceeds active injected ($10.0) with parallel enabled -> incremental trigger active & 2-3 slots planned
+  const planParallel = calculateAutoPortfolioPlan({
+    solBalance: 0.21,
+    usdcBalance: 16.2,
+    solPriceUsd: 85,
+    activePositions: [
+      {
+        poolId: 'wsol-usdc-id',
+        poolName: 'WSOL / USDC',
+        injectedValueUsd: 10,
+      },
+    ],
+    rankedPools: ranked,
+    config: cfg,
+  });
+  assert.equal(planParallel.usdcExceedsInjected, true);
+  assert.equal(planParallel.incrementalTriggerActive, true);
+  assert.ok(planParallel.slotPlans.length >= 2);
+  assert.ok(planParallel.incrementalBudgetUsd >= 10);
+
+  // Case B: multiPositionParallel = false restricts slotPlans to 1 and chooses ROTATE_SWAP instead of parallel OPEN_NEW
+  const singleFocusCfg: StrategyConfig = {
+    ...cfg,
+    multiPositionParallel: false,
+  };
+  const planSingle = calculateAutoPortfolioPlan({
+    solBalance: 0.21,
+    usdcBalance: 16.2,
+    solPriceUsd: 85,
+    activePositions: [
+      {
+        poolId: 'wsol-usdc-id',
+        poolName: 'WSOL / USDC',
+        injectedValueUsd: 10,
+      },
+    ],
+    rankedPools: ranked,
+    config: singleFocusCfg,
+  });
+  assert.equal(planSingle.targetSlots, 1);
+  assert.equal(planSingle.slotPlans.length, 1);
+
+  const rotateWhenSingle = evaluateAutonomousHighYieldSwitch({
+    rankedPools: ranked,
+    activePositions: [
+      {
+        poolId: 'wsol-usdc-id',
+        poolName: 'WSOL / USDC',
+        nftMint: 'nft-wsol',
+        injectedValueUsd: 10,
+      },
+    ],
+    idleDeployableUsd: 20,
+    usdcBalance: 16.2,
+    config: singleFocusCfg,
+  });
+  assert.equal(rotateWhenSingle.decision, 'ROTATE_SWAP');
+
+  // Case C: smartCapitalAllocation = false disables automatic incremental trigger
+  const pausedAllocPlan = calculateAutoPortfolioPlan({
+    solBalance: 0.21,
+    usdcBalance: 16.2,
+    solPriceUsd: 85,
+    activePositions: [
+      {
+        poolId: 'wsol-usdc-id',
+        poolName: 'WSOL / USDC',
+        injectedValueUsd: 10,
+      },
+    ],
+    rankedPools: ranked,
+    config: {
+      ...cfg,
+      smartCapitalAllocation: false,
+    },
+  });
+  assert.equal(pausedAllocPlan.incrementalTriggerActive, false);
+  assert.equal(pausedAllocPlan.incrementalBudgetUsd, 0);
+});
+
+test('evaluateAutoAssetRebalance detects severe pool depth drops, share drift, balanced allocations, and paused mode', () => {
+  const cfg = buildPresetForCapital(200, 'turbo-high-yield');
+  assert.equal(cfg.autoAssetRebalance, true);
+  assert.equal(cfg.rebalanceDriftThresholdPct, 15);
+
+  const ranked = rankPools(
+    [
+      {
+        id: 'wsol-usdc-id',
+        name: 'WSOL / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: 'wsol-usdc-id',
+        tvl: 5_600_000,
+        volume24h: 21_000_000,
+        apr: 54.5,
+        feeTier: '0.04%',
+        priceUsd: '85.0',
+        safetyScore: 96,
+        ilRisk: '低',
+      },
+      {
+        id: 'spcx-usdc-id',
+        name: 'SPCX / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: 'spcx-usdc-id',
+        tvl: 1_100_000, // dropped > 50% from 2.4M baseline!
+        volume24h: 2_000_000,
+        apr: 173.1,
+        feeTier: '0.25%',
+        priceUsd: '1.25',
+        safetyScore: 90,
+        ilRisk: '中',
+      },
+      {
+        id: 'cards-usdc-id',
+        name: 'CARDS / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: 'cards-usdc-id',
+        tvl: 3_200_000,
+        volume24h: 2_300_000,
+        apr: 101.9,
+        feeTier: '0.40%',
+        priceUsd: '0.25',
+        safetyScore: 92,
+        ilRisk: '中',
+      },
+    ],
+    cfg
+  );
+
+  // 1. Severe pool depth drop (-54.2% TVL shock on SPCX/USDC) -> DEPTH_DROP_REDUCE
+  const depthShockPlan = evaluateAutoAssetRebalance({
+    activePositions: [
+      { poolId: 'wsol-usdc-id', poolName: 'WSOL / USDC', nftMint: 'nft-wsol', injectedValueUsd: 15, inRange: true },
+      { poolId: 'spcx-usdc-id', poolName: 'SPCX / USDC', nftMint: 'nft-spcx', injectedValueUsd: 15, inRange: true },
+    ],
+    rankedPools: ranked,
+    baselinePoolTvls: { 'wsol-usdc-id': 5_600_000, 'spcx-usdc-id': 2_400_000 },
+    config: cfg,
+  });
+  assert.equal(depthShockPlan.triggerType, 'DEPTH_DROP_REDUCE');
+  assert.equal(depthShockPlan.shouldRebalance, true);
+  assert.equal(depthShockPlan.sourcePositionToTrim?.poolId, 'spcx-usdc-id');
+  assert.equal(depthShockPlan.sourcePositionToTrim?.closeFull, true);
+  assert.ok(depthShockPlan.targetPoolToBoost && depthShockPlan.targetPoolToBoost.poolId !== 'spcx-usdc-id');
+
+  // 2. Parallel share drift (> 15% drift: $32 vs $6 with stable TVL) -> SHARE_DRIFT_REBALANCE
+  const driftPlan = evaluateAutoAssetRebalance({
+    activePositions: [
+      { poolId: 'wsol-usdc-id', poolName: 'WSOL / USDC', nftMint: 'nft-wsol', injectedValueUsd: 32, inRange: true },
+      { poolId: 'cards-usdc-id', poolName: 'CARDS / USDC', nftMint: 'nft-cards', injectedValueUsd: 6, inRange: true },
+    ],
+    rankedPools: ranked,
+    baselinePoolTvls: { 'wsol-usdc-id': 5_600_000, 'cards-usdc-id': 3_200_000 },
+    config: cfg,
+  });
+  assert.equal(driftPlan.triggerType, 'SHARE_DRIFT_REBALANCE');
+  assert.equal(driftPlan.shouldRebalance, true);
+  assert.equal(driftPlan.sourcePositionToTrim?.poolId, 'wsol-usdc-id');
+  assert.equal(driftPlan.targetPoolToBoost?.poolId, 'cards-usdc-id');
+  assert.ok(driftPlan.maxAbsDriftPct >= 15);
+
+  // 3. Balanced parallel allocations ($15 vs $15) -> BALANCED (no unnecessary gas)
+  const balancedPlan = evaluateAutoAssetRebalance({
+    activePositions: [
+      { poolId: 'wsol-usdc-id', poolName: 'WSOL / USDC', nftMint: 'nft-wsol', injectedValueUsd: 15, inRange: true },
+      { poolId: 'cards-usdc-id', poolName: 'CARDS / USDC', nftMint: 'nft-cards', injectedValueUsd: 15, inRange: true },
+    ],
+    rankedPools: ranked,
+    baselinePoolTvls: { 'wsol-usdc-id': 5_600_000, 'cards-usdc-id': 3_200_000 },
+    config: cfg,
+  });
+  assert.equal(balancedPlan.triggerType, 'BALANCED');
+  assert.equal(balancedPlan.shouldRebalance, false);
+
+  // 4. Paused toggle -> PAUSED
+  const pausedPlan = evaluateAutoAssetRebalance({
+    activePositions: [
+      { poolId: 'wsol-usdc-id', poolName: 'WSOL / USDC', nftMint: 'nft-wsol', injectedValueUsd: 32, inRange: true },
+      { poolId: 'cards-usdc-id', poolName: 'CARDS / USDC', nftMint: 'nft-cards', injectedValueUsd: 6, inRange: true },
+    ],
+    rankedPools: ranked,
+    baselinePoolTvls: { 'wsol-usdc-id': 5_600_000, 'cards-usdc-id': 3_200_000 },
+    config: { ...cfg, autoAssetRebalance: false },
+  });
+  assert.equal(pausedPlan.triggerType, 'PAUSED');
+  assert.equal(pausedPlan.shouldRebalance, false);
+});
+
+test('evaluateSafeWithdrawSafety detects persistent liquidity depletion, IL threshold breach, safe hold, and paused state', () => {
+  const cfg = buildPresetForCapital(200, 'balanced-steady'); // maxILTolerance = 2.0%, autoWithdrawSafety = true
+  const ranked = rankPools(
+    [
+      {
+        id: 'wsol-usdc-id',
+        name: 'WSOL / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: 'wsol-usdc-id',
+        tvl: 5_200_000,
+        volume24h: 18_000_000,
+        apr: 54,
+        feeTier: '0.04%',
+        priceUsd: '85',
+        safetyScore: 96,
+        ilRisk: '低',
+      },
+      {
+        id: 'dry-pool-id',
+        name: 'DRY / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: 'dry-pool-id',
+        tvl: 180_000, // severe depletion below baseline & floor
+        volume24h: 5_000,
+        apr: 120,
+        feeTier: '0.25%',
+        priceUsd: '1.0',
+        safetyScore: 70,
+        ilRisk: '中',
+      },
+    ],
+    cfg
+  );
+
+  // 1. Persistent liquidity depletion (>= 2 ticks) triggers LIQUIDITY_DEPLETION
+  const depletionPlan = evaluateSafeWithdrawSafety({
+    activePositions: [
+      {
+        poolId: 'dry-pool-id',
+        poolName: 'DRY / USDC',
+        nftMint: 'nft-dry',
+        injectedValueUsd: 20,
+        priceCurrentUsd: 1.0,
+        priceLowerUsd: 0.9,
+        priceUpperUsd: 1.1,
+        unrealizedPnlPct: -0.5,
+        inRange: true,
+      },
+    ],
+    rankedPools: ranked,
+    baselinePoolTvls: { 'dry-pool-id': 800_000 },
+    depletionStreaks: { 'dry-pool-id': 2 },
+    config: cfg,
+  });
+  assert.equal(depletionPlan.triggerType, 'LIQUIDITY_DEPLETION');
+  assert.equal(depletionPlan.shouldAutoWithdraw, true);
+  assert.equal(depletionPlan.positionsAtRisk[0].shouldWithdraw, true);
+
+  // 2. Impermanent loss exceeding maxILTolerance triggers IL_THRESHOLD_EXCEEDED
+  const ilPlan = evaluateSafeWithdrawSafety({
+    activePositions: [
+      {
+        poolId: 'wsol-usdc-id',
+        poolName: 'WSOL / USDC',
+        nftMint: 'nft-wsol',
+        injectedValueUsd: 30,
+        priceCurrentUsd: 62, // sharp divergence vs [76.5, 93.5] range
+        priceLowerUsd: 76.5,
+        priceUpperUsd: 93.5,
+        unrealizedPnlPct: -3.4,
+        inRange: false,
+      },
+    ],
+    rankedPools: ranked,
+    baselinePoolTvls: { 'wsol-usdc-id': 5_200_000 },
+    depletionStreaks: { 'wsol-usdc-id': 0 },
+    config: cfg,
+  });
+  assert.equal(ilPlan.triggerType, 'IL_THRESHOLD_EXCEEDED');
+  assert.equal(ilPlan.shouldAutoWithdraw, true);
+  assert.ok(ilPlan.maxObservedIlPct >= cfg.maxILTolerance);
+
+  // 3. Healthy position stays SAFE_HOLD
+  const safePlan = evaluateSafeWithdrawSafety({
+    activePositions: [
+      {
+        poolId: 'wsol-usdc-id',
+        poolName: 'WSOL / USDC',
+        nftMint: 'nft-wsol',
+        injectedValueUsd: 30,
+        priceCurrentUsd: 85.2,
+        priceLowerUsd: 76.5,
+        priceUpperUsd: 93.5,
+        unrealizedPnlPct: 0.8,
+        inRange: true,
+      },
+    ],
+    rankedPools: ranked,
+    baselinePoolTvls: { 'wsol-usdc-id': 5_200_000 },
+    depletionStreaks: { 'wsol-usdc-id': 0 },
+    config: cfg,
+  });
+  assert.equal(safePlan.triggerType, 'SAFE_HOLD');
+  assert.equal(safePlan.shouldAutoWithdraw, false);
+
+  // 4. Paused mode returns PAUSED
+  const pausedSafePlan = evaluateSafeWithdrawSafety({
+    activePositions: [
+      {
+        poolId: 'wsol-usdc-id',
+        poolName: 'WSOL / USDC',
+        nftMint: 'nft-wsol',
+        injectedValueUsd: 30,
+        priceCurrentUsd: 62,
+        priceLowerUsd: 76.5,
+        priceUpperUsd: 93.5,
+        unrealizedPnlPct: -3.4,
+        inRange: false,
+      },
+    ],
+    rankedPools: ranked,
+    config: { ...cfg, autoWithdrawSafety: false },
+  });
+  assert.equal(pausedSafePlan.triggerType, 'PAUSED');
+  assert.equal(pausedSafePlan.shouldAutoWithdraw, false);
+});
+
+test('computePositionRangeDeviation & evaluateAutoCompoundOpportunity compute offsets and compound readiness accurately', () => {
+  // 1. Range midpoint = 0%, edge = ±100%, near edge >=75% needs intervention, outside >100%
+  const centered = computePositionRangeDeviation({
+    poolId: 'p1',
+    poolName: 'WSOL / USDC',
+    nftMint: 'nft1',
+    priceCurrentUsd: 100,
+    priceLowerUsd: 90,
+    priceUpperUsd: 110,
+    inRange: true,
+    unrealizedPnlUsd: 2.5,
+    uncollectedFeeUsd: 1.8,
+  });
+  assert.equal(centered.rangeOffsetPct, 0);
+  assert.equal(centered.needsIntervention, false);
+
+  const nearUpper = computePositionRangeDeviation({
+    poolId: 'p1',
+    poolName: 'WSOL / USDC',
+    nftMint: 'nft1',
+    priceCurrentUsd: 108,
+    priceLowerUsd: 90,
+    priceUpperUsd: 110,
+    inRange: true,
+    unrealizedPnlUsd: 3.2,
+    uncollectedFeeUsd: 2.1,
+  });
+  assert.equal(nearUpper.rangeOffsetPct, 80);
+  assert.equal(nearUpper.needsIntervention, true);
+
+  const outLow = computePositionRangeDeviation({
+    poolId: 'p1',
+    poolName: 'WSOL / USDC',
+    nftMint: 'nft1',
+    priceCurrentUsd: 88,
+    priceLowerUsd: 90,
+    priceUpperUsd: 110,
+    inRange: false,
+    unrealizedPnlUsd: -1.4,
+    uncollectedFeeUsd: 0.4,
+  });
+  assert.equal(outLow.rangeOffsetPct, -120);
+  assert.equal(outLow.needsIntervention, true);
+
+  // 2. Auto-Compound ready when fees >= harvestMinUsd and autoCompound enabled
+  const cfg = buildPresetForCapital(200, 'active-yield'); // harvestMinUsd = 2.0, autoCompound = true
+  const readyCompound = evaluateAutoCompoundOpportunity({
+    activePositions: [
+      { poolId: 'p1', poolName: 'WSOL / USDC', nftMint: 'nft1', uncollectedFeeUsd: 2.45, injectedValueUsd: 60 },
+      { poolId: 'p2', poolName: 'CARDS / USDC', nftMint: 'nft2', uncollectedFeeUsd: 0.3, injectedValueUsd: 40 },
+    ],
+    config: cfg,
+    referenceAprPct: 90,
+  });
+  assert.equal(readyCompound.status, 'COMPOUND_READY');
+  assert.equal(readyCompound.shouldCompound, true);
+  assert.equal(readyCompound.targets.length, 1);
+  assert.ok(readyCompound.estimatedApyBoostPct > 0);
+
+  // 3. Monitoring when below harvestMinUsd
+  const monitoringCompound = evaluateAutoCompoundOpportunity({
+    activePositions: [
+      { poolId: 'p1', poolName: 'WSOL / USDC', nftMint: 'nft1', uncollectedFeeUsd: 0.4, injectedValueUsd: 60 },
+    ],
+    config: cfg,
+    referenceAprPct: 90,
+  });
+  assert.equal(monitoringCompound.status, 'MONITORING');
+  assert.equal(monitoringCompound.shouldCompound, false);
+
+  // 4. Paused when autoCompound is false
+  const pausedCompound = evaluateAutoCompoundOpportunity({
+    activePositions: [
+      { poolId: 'p1', poolName: 'WSOL / USDC', nftMint: 'nft1', uncollectedFeeUsd: 5.0, injectedValueUsd: 60 },
+    ],
+    config: { ...cfg, autoCompound: false },
+    referenceAprPct: 90,
+  });
+  assert.equal(pausedCompound.status, 'PAUSED');
+  assert.equal(pausedCompound.shouldCompound, false);
+});
+
+test('evaluateMultiCurrencyHedgePlan computes delta-neutral short legs, safe LTV collateral, and status transitions', () => {
+  const cfg = buildPresetForCapital(200, 'active-yield');
+  assert.equal(cfg.multiCurrencyHedge, true);
+
+  const reserves: SolanaLendingReserve[] = [
+    {
+      protocol: 'Solend (Save)',
+      marketAddress: '4UpD2fh7xH3VP9QQaXtsS1YY3bxzWhtfpks7FatyKvdY',
+      reserveAddress: '8PbodeaosQP19SjYFx855UMqWxH2HynZLdBXmsrbac36',
+      symbol: 'SOL',
+      mint: 'So11111111111111111111111111111111111111112',
+      maxLtv: 0.74,
+      borrowApyPct: 4.03,
+      supplyApyPct: 1.84,
+      totalSupplyUsd: 95_000_000,
+      totalBorrowUsd: 62_000_000,
+    },
+    {
+      protocol: 'Kamino Finance',
+      marketAddress: '7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF',
+      reserveAddress: 'usdcRes1',
+      symbol: 'USDC',
+      mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+      maxLtv: 0.8,
+      borrowApyPct: 5.78,
+      supplyApyPct: 4.15,
+      totalSupplyUsd: 163_000_000,
+      totalBorrowUsd: 112_000_000,
+    },
+    {
+      protocol: 'Kamino Finance',
+      marketAddress: '7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF',
+      reserveAddress: 'cbbtcRes1',
+      symbol: 'cbBTC',
+      mint: 'cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij',
+      maxLtv: 0.79,
+      borrowApyPct: 0.2,
+      supplyApyPct: 0.01,
+      totalSupplyUsd: 44_000_000,
+      totalBorrowUsd: 8_000_000,
+    },
+  ];
+
+  // 1. HEDGE_READY when volatile LP exposure exists and wallet USDC covers safe <=55% LTV collateral
+  const readyPlan = evaluateMultiCurrencyHedgePlan({
+    activePositions: [
+      {
+        poolId: 'p1',
+        poolName: 'WSOL / USDC',
+        tokenASymbol: 'WSOL',
+        tokenBSymbol: 'USDC',
+        tokenAAmount: 0.25,
+        tokenBAmount: 20,
+        priceCurrentUsd: 80,
+        injectedValueUsd: 40,
+      },
+      {
+        poolId: 'p2',
+        poolName: 'cbBTC / USDC',
+        tokenASymbol: 'cbBTC',
+        tokenBSymbol: 'USDC',
+        tokenAAmount: 0.0002,
+        tokenBAmount: 20,
+        priceCurrentUsd: 100_000,
+        injectedValueUsd: 40,
+      },
+    ],
+    reserves,
+    walletUsdcBalance: 85,
+    solPriceUsd: 80,
+    activeShortDebtUsd: 0,
+    activeCollateralUsd: 0,
+    config: cfg,
+  });
+
+  assert.equal(readyPlan.status, 'HEDGE_READY');
+  assert.equal(readyPlan.shouldExecuteHedge, true);
+  assert.equal(readyPlan.totalVolatileExposureUsd, 40);
+  assert.equal(readyPlan.totalShortTargetUsd, 40);
+  assert.equal(readyPlan.legs.length, 2);
+  assert.equal(readyPlan.legs[0].hedgeMode, 'DIRECT_BORROW_SHORT');
+  assert.equal(readyPlan.ilEliminatedPct, 100);
+  assert.ok(readyPlan.requiredUsdcCollateralUsd > 70);
+
+  // 2. HEDGED_NEUTRAL when on-chain lending short debt covers >=85% of target short
+  const neutralPlan = evaluateMultiCurrencyHedgePlan({
+    activePositions: [
+      {
+        poolId: 'p1',
+        poolName: 'WSOL / USDC',
+        tokenASymbol: 'WSOL',
+        tokenBSymbol: 'USDC',
+        tokenAAmount: 0.5,
+        tokenBAmount: 40,
+        priceCurrentUsd: 80,
+        injectedValueUsd: 80,
+      },
+    ],
+    reserves,
+    walletUsdcBalance: 10,
+    solPriceUsd: 80,
+    activeShortDebtUsd: 38,
+    activeCollateralUsd: 75,
+    config: cfg,
+  });
+
+  assert.equal(neutralPlan.status, 'HEDGED_NEUTRAL');
+  assert.equal(neutralPlan.shouldExecuteHedge, false);
+  assert.ok(neutralPlan.netDeltaPct <= 5);
+  assert.ok(neutralPlan.ilEliminatedPct >= 95);
+
+  // 3. INSUFFICIENT_COLLATERAL when wallet USDC is below safe LTV margin
+  const insufficientPlan = evaluateMultiCurrencyHedgePlan({
+    activePositions: [
+      {
+        poolId: 'p1',
+        poolName: 'WSOL / USDC',
+        tokenASymbol: 'WSOL',
+        tokenBSymbol: 'USDC',
+        tokenAAmount: 1.0,
+        tokenBAmount: 80,
+        priceCurrentUsd: 80,
+        injectedValueUsd: 160,
+      },
+    ],
+    reserves,
+    walletUsdcBalance: 15,
+    solPriceUsd: 80,
+    config: cfg,
+  });
+  assert.equal(insufficientPlan.status, 'INSUFFICIENT_COLLATERAL');
+  assert.equal(insufficientPlan.shouldExecuteHedge, false);
+
+  // 4. PAUSED when multiCurrencyHedge is false
+  const pausedPlan = evaluateMultiCurrencyHedgePlan({
+    activePositions: [
+      {
+        poolId: 'p1',
+        poolName: 'WSOL / USDC',
+        tokenASymbol: 'WSOL',
+        tokenBSymbol: 'USDC',
+        tokenAAmount: 0.5,
+        tokenBAmount: 40,
+        priceCurrentUsd: 80,
+        injectedValueUsd: 80,
+      },
+    ],
+    reserves,
+    walletUsdcBalance: 100,
+    solPriceUsd: 80,
+    config: { ...cfg, multiCurrencyHedge: false },
+  });
+  assert.equal(pausedPlan.status, 'PAUSED');
+  assert.equal(pausedPlan.shouldExecuteHedge, false);
+  assert.equal(pausedPlan.ilEliminatedPct, 0);
+});
+
+
+
+

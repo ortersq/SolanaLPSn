@@ -233,7 +233,13 @@ export default function App() {
           <StrategyRiskView
             strategyConfig={strategyConfig}
             topPool={pools[0]}
+            pools={pools}
+            activePositions={activePositions}
+            backendStatus={backendStatus}
             onApplyPreset={handleApplyPreset}
+            onUpdateStrategyConfig={setStrategyConfig}
+            onUpdateBackendStatus={setBackendStatus}
+            onRefreshPositions={handleRefreshPositions}
           />
         )}
       </main>

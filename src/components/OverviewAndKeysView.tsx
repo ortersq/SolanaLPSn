@@ -23,13 +23,18 @@ import {
 import {
   ActiveLpPosition,
   ApiKeyRequirement,
+  AutoCompoundPlan,
   AutoPortfolioPlan,
+  AutoRebalancePlan,
+  AutonomousHighYieldRecommendation,
+  MultiCurrencyHedgePlan,
   PipelineRunMode,
   PipelineStepKey,
   PipelineStepResult,
   PipelineTestAsset,
   PoolSelectionRound,
   RiskLogEntry,
+  SafeWithdrawPlan,
   ScoredPool,
   StrategyConfig,
 } from '../utils/strategyEngine';
@@ -69,6 +74,19 @@ export interface StrategyDiagnostic {
   walletSolBalance?: number;
   solPriceUsd?: number;
   portfolioPlan?: AutoPortfolioPlan;
+  highYieldRecommendation?: AutonomousHighYieldRecommendation;
+  rebalancePlan?: AutoRebalancePlan;
+  safeWithdrawPlan?: SafeWithdrawPlan;
+  autoCompoundPlan?: AutoCompoundPlan;
+  multiCurrencyHedgePlan?: MultiCurrencyHedgePlan;
+  positionPnlHistory?: Array<{
+    time: string;
+    timestamp: number;
+    totalPnlUsd: number;
+    totalFeesUsd: number;
+    maxRangeOffsetPct: number;
+    avgRangeOffsetPct: number;
+  }>;
   bestCandidatePool: {
     name: string;
     dex: string;
@@ -241,6 +259,40 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
   const [deployingFull, setDeployingFull] = useState(false);
   const [triggeringAutoTick, setTriggeringAutoTick] = useState(false);
   const [optimizeMessage, setOptimizeMessage] = useState('');
+  const [safeWithdrawing, setSafeWithdrawing] = useState(false);
+  const [safeWithdrawFeedback, setSafeWithdrawFeedback] = useState<{
+    ok: boolean;
+    message: string;
+    txId?: string;
+  } | null>(null);
+
+  const handleSafeWithdrawClick = async () => {
+    setSafeWithdrawing(true);
+    setSafeWithdrawFeedback(null);
+    try {
+      const res = await fetch('/api/strategy/safe-withdraw', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json();
+      if (data.backendStatus) {
+        onUpdateBackendStatus(data.backendStatus);
+      }
+      if (onRefreshPositions) await onRefreshPositions();
+      setSafeWithdrawFeedback({
+        ok: Boolean(data.success),
+        message: data.message || data.error || '已完成安全回撤扫描',
+        txId: data.txId,
+      });
+    } catch (e: any) {
+      setSafeWithdrawFeedback({
+        ok: false,
+        message: `安全回撤请求异常: ${e.message}`,
+      });
+    } finally {
+      setSafeWithdrawing(false);
+    }
+  };
 
   const handleOptimizePreset = async (target: 'bluechip-optimized' | 'turbo-high-yield' = 'turbo-high-yield') => {
     setOptimizingPreset(true);
@@ -932,7 +984,16 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
             </p>
           </div>
 
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              disabled={safeWithdrawing}
+              onClick={handleSafeWithdrawClick}
+              className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-rose-500/15 border border-rose-500/40 hover:bg-rose-500/25 text-rose-300 disabled:opacity-50 transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+            >
+              <ShieldCheck className="w-3.5 h-3.5" />
+              <span>{safeWithdrawing ? '正在撤池转 USDC...' : '一键安全回撤（转 USDC）'}</span>
+            </button>
             <button
               type="button"
               disabled={refreshingPositions}
@@ -948,6 +1009,29 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
             </button>
           </div>
         </div>
+
+        {safeWithdrawFeedback && (
+          <div
+            role="status"
+            className={`px-4 py-3 rounded-lg border text-xs flex flex-wrap items-center justify-between gap-2 ${
+              safeWithdrawFeedback.ok
+                ? 'bg-emerald-950/35 border-emerald-500/40 text-emerald-200'
+                : 'bg-amber-950/35 border-amber-500/40 text-amber-200'
+            }`}
+          >
+            <span>{safeWithdrawFeedback.message}</span>
+            {safeWithdrawFeedback.txId && (
+              <a
+                href={`https://solscan.io/tx/${safeWithdrawFeedback.txId}`}
+                target="_blank"
+                rel="noreferrer"
+                className="font-mono underline text-emerald-300 hover:text-emerald-200"
+              >
+                Solscan: {safeWithdrawFeedback.txId.slice(0, 8)}...
+              </a>
+            )}
+          </div>
+        )}
 
         {effectivePositions.length > 0 ? (
           <div className="space-y-4">
