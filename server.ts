@@ -4072,6 +4072,7 @@ app.post('/api/strategy/automation-options', async (req, res) => {
     const prevMaxIlTolerance = strategyConfig.maxILTolerance;
     const prevAutoCompound = strategyConfig.autoCompound;
     const prevMultiCurrencyHedge = strategyConfig.multiCurrencyHedge;
+    const prevLargeCapitalProt = strategyConfig.largeCapitalProtection;
 
     const nextParallel =
       typeof body.multiPositionParallel === 'boolean'
@@ -4107,6 +4108,10 @@ app.post('/api/strategy/automation-options', async (req, res) => {
       typeof body.multiCurrencyHedge === 'boolean'
         ? body.multiCurrencyHedge
         : prevMultiCurrencyHedge;
+    const nextLargeCapitalProt =
+      typeof body.largeCapitalProtection === 'boolean'
+        ? body.largeCapitalProtection
+        : prevLargeCapitalProt;
 
     strategyConfig = {
       ...strategyConfig,
@@ -4118,6 +4123,7 @@ app.post('/api/strategy/automation-options', async (req, res) => {
       maxILTolerance: nextMaxIlTolerance,
       autoCompound: nextAutoCompound,
       multiCurrencyHedge: nextMultiCurrencyHedge,
+      largeCapitalProtection: nextLargeCapitalProt,
     };
 
     if (nextParallel !== prevParallel) {

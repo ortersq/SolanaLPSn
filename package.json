@@ -17,6 +17,7 @@
     "@solana/web3.js": "^1.98.0",
     "@tailwindcss/vite": "^4.3.3",
     "@types/bn.js": "^5.2.0",
+    "@types/react-is": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.1",
     "bn.js": "^5.2.5",
     "bs58": "^6.0.0",
@@ -27,6 +28,7 @@
     "motion": "^12.23.24",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
+    "react-is": "^19.3.1",
     "recharts": "^3.11.1",
     "vite": "^8.3.0"
   },

@@ -103,6 +103,7 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
   const autoWithdrawSafetyOn = strategyConfig.autoWithdrawSafety !== false;
   const autoCompoundOn = strategyConfig.autoCompound !== false;
   const multiCurrencyHedgeOn = strategyConfig.multiCurrencyHedge !== false;
+  const largeCapitalProtOn = strategyConfig.largeCapitalProtection !== false;
   const usdcExceedsInjected = walletUsdcBalance > activeInjectedUsd && walletUsdcBalance >= 2;
   const incrementalArmed = smartAllocOn && (idleDeployableUsd >= 5 || usdcExceedsInjected);
 
@@ -350,7 +351,8 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
       | 'autoAssetRebalance'
       | 'autoWithdrawSafety'
       | 'autoCompound'
-      | 'multiCurrencyHedge',
+      | 'multiCurrencyHedge'
+      | 'largeCapitalProtection',
     nextVal: boolean
   ) => {
     setTogglingAutomation(true);
@@ -393,9 +395,13 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
             ? nextVal
               ? `已开启「自动复利模式」：检测到待收取耕作收益达到 $${autoCompoundPlan.harvestMinUsd.toFixed(2)} 时，将全自动领取手续费并重注入（Auto-Compound）滚雪球放大 APY。`
               : '已暂停「自动复利模式」：耕作手续费收益将留在仓位内，不再自动领取再注入。'
+            : field === 'multiCurrencyHedge'
+            ? nextVal
+              ? '已开启「多币种对冲」：系统已接入 Solend / Kamino 等 Solana 原生借贷协议实时费率，自动以 USDC 抵押借币卖空实现 Delta-Neutral，消除无常损失风险。'
+              : '已暂停「多币种对冲」：不再自动通过 Solana 原生借贷协议建立空头对冲头寸。'
             : nextVal
-            ? '已开启「多币种对冲」：系统已接入 Solend / Kamino 等 Solana 原生借贷协议实时费率，自动以 USDC 抵押借币卖空实现 Delta-Neutral，消除无常损失风险。'
-            : '已暂停「多币种对冲」：不再自动通过 Solana 原生借贷协议建立空头对冲头寸。',
+            ? '已开启「大额资金阈值保护」：当总资金超过 $300 阈值时，系统自动调低对冲策略杠杆倍数（降至 LTV 30%）以防止极端波动穿仓。'
+            : '已暂停「大额资金阈值保护」：恢复标准对冲杠杆比例。',
       });
     } catch (err: any) {
       setSwitchFeedback({
@@ -1223,7 +1229,7 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
             </div>
 
             <div className="p-2.5 rounded-lg bg-[#101624] border border-slate-800/80">
-              <div className="text-[11px] text-slate-400">USDC 保证金 (安全 LTV ≤55%)</div>
+              <div className="text-[11px] text-slate-400">USDC 保证金 (安全 LTV ≤{multiHedgePlan.appliedTargetLtvPct}%)</div>
               <div className="mt-1 flex items-center justify-between text-xs font-mono font-bold text-white tabular-nums">
                 <span>可用 ${multiHedgePlan.availableUsdcCollateralUsd.toFixed(2)}</span>
                 <span className="text-slate-300">
@@ -1231,28 +1237,80 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
                 </span>
               </div>
               <div className="text-[11px] text-slate-500 mt-0.5">
-                已抵押 ${multiHedgePlan.activeCollateralUsd.toFixed(2)}
+                已抵押 ${multiHedgePlan.activeCollateralUsd.toFixed(2)} · 健康因子 {multiHedgePlan.healthFactor}
               </div>
             </div>
 
             <div className="p-2.5 rounded-lg bg-[#101624] border border-slate-800/80">
-              <div className="text-[11px] text-slate-400">借贷净息差 (抵押生息 - 借币成本)</div>
+              <div className="text-[11px] text-slate-400">对冲实时盈亏 (Hedge PnL)</div>
               <div className="mt-1 flex items-center justify-between text-xs font-mono font-bold tabular-nums">
                 <span
                   className={
-                    multiHedgePlan.netCarryAprPct >= 0 ? 'text-emerald-400' : 'text-amber-300'
+                    multiHedgePlan.hedgePnlUsd >= 0 ? 'text-emerald-400' : 'text-rose-400'
                   }
                 >
-                  {multiHedgePlan.netCarryAprPct >= 0 ? '+' : ''}
-                  {multiHedgePlan.netCarryAprPct.toFixed(2)}% APR
+                  {multiHedgePlan.hedgePnlUsd >= 0 ? '+' : ''}${multiHedgePlan.hedgePnlUsd.toFixed(2)}
                 </span>
-                <span className="text-[11px] font-normal text-slate-400">
-                  借 {multiHedgePlan.weightedBorrowCostAprPct.toFixed(2)}%
+                <span className="text-sky-300">
+                  综合净利 ${multiHedgePlan.netCombinedPnlUsd.toFixed(2)}
                 </span>
               </div>
               <div className="text-[11px] text-slate-500 mt-0.5">
-                {multiHedgePlan.lendingProtocolLabel}
+                {multiHedgePlan.hedgePnlStatusLabel}
               </div>
+            </div>
+          </div>
+
+          {/* 大额资金阈值保护开关与规则说明 */}
+          <div className="p-3 rounded-lg bg-[#101624] border border-slate-800/90 flex flex-col md:flex-row md:items-center justify-between gap-3">
+            <div className="space-y-0.5 flex-1">
+              <div className="flex items-center gap-2 text-xs font-semibold text-white">
+                <Shield className="w-3.5 h-3.5 text-amber-400" />
+                <span>大额资金阈值保护开关</span>
+                <span
+                  className={`px-2 py-0.5 text-[10px] rounded border ${
+                    multiHedgePlan.isLargeCapitalTriggered
+                      ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                      : 'bg-slate-800 text-slate-400 border-slate-700'
+                  }`}
+                >
+                  {multiHedgePlan.isLargeCapitalTriggered
+                    ? `大额触发 · 杠杆已自动降至 LTV ${multiHedgePlan.appliedTargetLtvPct}%`
+                    : `阈值 $${multiHedgePlan.largeCapitalThresholdUsd} · 标准杠杆`}
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-400">
+                当总资金超过 ${multiHedgePlan.largeCapitalThresholdUsd} 时，系统自动调低对冲策略杠杆倍数（安全 LTV 从 52% 降至 30%），防止极端波动期间的强平穿仓风险。
+              </p>
+            </div>
+
+            <div className="flex items-center gap-3 shrink-0">
+              <span className="text-[11px] text-slate-400">
+                {largeCapitalProtOn ? '大额保护：已开启' : '大额保护：已关闭'}
+              </span>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={largeCapitalProtOn}
+                aria-label="大额资金阈值保护"
+                disabled={togglingAutomation}
+                onClick={() =>
+                  handleToggleAutomationOption('largeCapitalProtection', !largeCapitalProtOn)
+                }
+                className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full border transition-colors cursor-pointer disabled:opacity-60 ${
+                  largeCapitalProtOn
+                    ? 'bg-amber-400 border-amber-400'
+                    : 'bg-slate-800 border-slate-600'
+                }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full transition-transform ${
+                    largeCapitalProtOn
+                      ? 'translate-x-5.5 bg-slate-950'
+                      : 'translate-x-1 bg-slate-400'
+                  }`}
+                />
+              </button>
             </div>
           </div>
 

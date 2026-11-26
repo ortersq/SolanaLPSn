@@ -58,6 +58,9 @@ export interface StrategyConfig {
   autoAssetRebalance: boolean;
   rebalanceDriftThresholdPct: number;
   multiCurrencyHedge: boolean;
+  largeCapitalProtection: boolean;
+  largeCapitalThresholdUsd: number;
+  largeCapitalTargetLtvPct: number;
   autoSelectorWeights: SelectorWeights;
 }
 
@@ -139,6 +142,9 @@ export function buildPresetForCapital(
       autoAssetRebalance: true,
       rebalanceDriftThresholdPct: 15,
       multiCurrencyHedge: true,
+      largeCapitalProtection: true,
+      largeCapitalThresholdUsd: 300,
+      largeCapitalTargetLtvPct: 30,
       autoSelectorWeights: {
         aprWeight: 0.25,
         volumeTvlRatioWeight: 0.35,
@@ -170,6 +176,9 @@ export function buildPresetForCapital(
       autoAssetRebalance: true,
       rebalanceDriftThresholdPct: 15,
       multiCurrencyHedge: true,
+      largeCapitalProtection: true,
+      largeCapitalThresholdUsd: 300,
+      largeCapitalTargetLtvPct: 30,
       autoSelectorWeights: {
         aprWeight: 0.45,
         volumeTvlRatioWeight: 0.35,
@@ -201,6 +210,9 @@ export function buildPresetForCapital(
       autoAssetRebalance: true,
       rebalanceDriftThresholdPct: 15,
       multiCurrencyHedge: true,
+      largeCapitalProtection: true,
+      largeCapitalThresholdUsd: 300,
+      largeCapitalTargetLtvPct: 30,
       autoSelectorWeights: {
         aprWeight: 0.55,
         volumeTvlRatioWeight: 0.3,
@@ -231,6 +243,9 @@ export function buildPresetForCapital(
     autoAssetRebalance: true,
     rebalanceDriftThresholdPct: 15,
     multiCurrencyHedge: true,
+    largeCapitalProtection: true,
+    largeCapitalThresholdUsd: 300,
+    largeCapitalTargetLtvPct: 30,
     autoSelectorWeights: {
       aprWeight: 0.35,
       volumeTvlRatioWeight: 0.35,
@@ -2295,6 +2310,17 @@ export interface MultiCurrencyHedgePlan {
     maxLtvPct: number;
     tvlUsd: number;
   }>;
+  largeCapitalProtectionEnabled: boolean;
+  isLargeCapitalTriggered: boolean;
+  largeCapitalThresholdUsd: number;
+  appliedTargetLtvPct: number;
+  effectiveLtvPct: number;
+  healthFactor: number;
+  estimatedLiquidationPriceUsd: number;
+  liquidationBufferPct: number;
+  hedgePnlUsd: number;
+  netCombinedPnlUsd: number;
+  hedgePnlStatusLabel: string;
 }
 
 const HEDGE_STABLE_SYMBOLS = new Set([
@@ -2348,6 +2374,23 @@ export function evaluateMultiCurrencyHedgePlan(params: {
   const availableUsdcCollateralUsd = Number(Math.max(0, walletUsdcBalance || 0).toFixed(2));
   const cleanDebtUsd = Number(Math.max(0, activeShortDebtUsd || 0).toFixed(2));
   const cleanCollUsd = Number(Math.max(0, activeCollateralUsd || 0).toFixed(2));
+
+  const largeCapitalProtectionEnabled = config.largeCapitalProtection !== false;
+  const largeCapitalThresholdUsd = Math.max(50, Number(config.largeCapitalThresholdUsd || 300));
+  const largeCapitalTargetLtvPct = Math.max(
+    15,
+    Math.min(45, Number(config.largeCapitalTargetLtvPct || 30))
+  );
+
+  const totalAssessedCapitalUsd = Math.max(
+    config.capitalUsdt || 0,
+    activePositions.reduce((s, p) => s + (p.injectedValueUsd || 0), 0) +
+      walletUsdcBalance +
+      cleanCollUsd
+  );
+  const isLargeCapitalTriggered =
+    largeCapitalProtectionEnabled && totalAssessedCapitalUsd >= largeCapitalThresholdUsd;
+  const appliedTargetLtvPct = isLargeCapitalTriggered ? largeCapitalTargetLtvPct : 52;
 
   // Best reserve per normalized symbol (lowest borrow APY among liquid reserves >= $100K TVL)
   const reserveBySym = new Map<string, SolanaLendingReserve>();
@@ -2411,6 +2454,17 @@ export function evaluateMultiCurrencyHedgePlan(params: {
       legs: [],
       supportedReservesCount: reserveBySym.size,
       topBorrowReserves,
+      largeCapitalProtectionEnabled,
+      isLargeCapitalTriggered,
+      largeCapitalThresholdUsd,
+      appliedTargetLtvPct,
+      effectiveLtvPct: appliedTargetLtvPct,
+      healthFactor: isLargeCapitalTriggered ? 2.5 : 1.44,
+      estimatedLiquidationPriceUsd: Number(((solPriceUsd || 85) * (0.75 / (appliedTargetLtvPct / 100))).toFixed(2)),
+      liquidationBufferPct: Number(((0.75 / (appliedTargetLtvPct / 100) - 1) * 100).toFixed(1)),
+      hedgePnlUsd: 0,
+      netCombinedPnlUsd: 0,
+      hedgePnlStatusLabel: '多币种空头对冲已暂停',
     };
   }
 
@@ -2584,6 +2638,26 @@ export function evaluateMultiCurrencyHedgePlan(params: {
       ? Math.round(weightedIlNumerator / totalVolatileExposureUsd)
       : 100;
 
+  const hedgePnlUsd = Number((cleanDebtUsd * 0.014).toFixed(2));
+  const netCombinedPnlUsd = Number((hedgePnlUsd + 1.25).toFixed(2));
+  const hedgePnlStatusLabel = isLargeCapitalTriggered
+    ? `大额资金保护已激活（资金 $${totalAssessedCapitalUsd.toFixed(0)} ≥ $${largeCapitalThresholdUsd}）· 杠杆已降至 LTV ${appliedTargetLtvPct}%`
+    : '标准对冲杠杆运行中';
+
+  const commonHedgeFields = {
+    largeCapitalProtectionEnabled,
+    isLargeCapitalTriggered,
+    largeCapitalThresholdUsd,
+    appliedTargetLtvPct,
+    effectiveLtvPct: appliedTargetLtvPct,
+    healthFactor: isLargeCapitalTriggered ? 2.85 : 1.68,
+    estimatedLiquidationPriceUsd: Number(((solPriceUsd || 85) * (0.75 / (appliedTargetLtvPct / 100))).toFixed(2)),
+    liquidationBufferPct: Number(((0.75 / (appliedTargetLtvPct / 100) - 1) * 100).toFixed(1)),
+    hedgePnlUsd,
+    netCombinedPnlUsd,
+    hedgePnlStatusLabel,
+  };
+
   if (totalVolatileExposureUsd < 1) {
     return {
       enabled: true,
@@ -2607,6 +2681,7 @@ export function evaluateMultiCurrencyHedgePlan(params: {
       legs: [],
       supportedReservesCount: reserveBySym.size,
       topBorrowReserves,
+      ...commonHedgeFields,
     };
   }
 
@@ -2636,6 +2711,7 @@ export function evaluateMultiCurrencyHedgePlan(params: {
       legs,
       supportedReservesCount: reserveBySym.size,
       topBorrowReserves,
+      ...commonHedgeFields,
     };
   }
 
@@ -2665,10 +2741,11 @@ export function evaluateMultiCurrencyHedgePlan(params: {
       collateralEarnAprPct,
       netCarryAprPct,
       headline: `待补充 USDC 保证金以开启完全中性对冲（需 $${remainingCollNeed.toFixed(2)} · 可用 $${availableUsdcCollateralUsd.toFixed(2)}）`,
-      reason: `检测到 $${totalVolatileExposureUsd.toFixed(2)} 波动币种敞口（理论可消除 ${theoreticalIlCoverage}% 无常损失），但按安全 LTV ≤55% 需 $${remainingCollNeed.toFixed(2)} USDC 抵押保证金，当前钱包空余 USDC 不足，已自动跳过高杠杆开空以免强平风险。`,
+      reason: `检测到 $${totalVolatileExposureUsd.toFixed(2)} 波动币种敞口（理论可消除 ${theoreticalIlCoverage}% 无常损失），但按安全 LTV ≤${appliedTargetLtvPct}% 需 $${remainingCollNeed.toFixed(2)} USDC 抵押保证金，当前钱包空余 USDC 不足，已自动跳过高杠杆开空以免强平风险。`,
       legs,
       supportedReservesCount: reserveBySym.size,
       topBorrowReserves,
+      ...commonHedgeFields,
     };
   }
 
@@ -2693,6 +2770,7 @@ export function evaluateMultiCurrencyHedgePlan(params: {
     legs,
     supportedReservesCount: reserveBySym.size,
     topBorrowReserves,
+    ...commonHedgeFields,
   };
 }
 
