@@ -30,7 +30,11 @@ export interface ScoredPool extends PoolMetrics {
   selectionReason: string;
 }
 
-export type RiskProfileKey = 'ultra-safe' | 'balanced-steady' | 'active-yield';
+export type RiskProfileKey =
+  | 'ultra-safe'
+  | 'balanced-steady'
+  | 'active-yield'
+  | 'turbo-high-yield';
 
 export interface StrategyConfig {
   capitalUsdt: number;
@@ -159,6 +163,32 @@ export function buildPresetForCapital(
     };
   }
 
+  if (riskProfile === 'turbo-high-yield') {
+    return {
+      capitalUsdt: safeCapital,
+      riskProfile: 'turbo-high-yield',
+      gasReserveUsdt,
+      lpActiveUsdt,
+      coreSplitPct: 45, // 45% ultra-tight Core CLMM + 55% #1 Highest-APR Satellite CLMM
+      autoCompound: true,
+      minAPR: 45,
+      minTVL: 300_000, // >= $300K real liquidity unlocks top-APR CLMM pairs
+      rangeWidthPct: 4, // Ultra-tight ±4% CLMM range boosts fee capture ~3.45x
+      harvestMinUsd: 0.5, // Fast compounding for rapid fee turnover
+      stopLossPercentage: 10, // -10% drawdown exit
+      takeProfitSweepUsd: 5, // Frequent profit sweep at $5 net profit
+      maxILTolerance: 4.5,
+      jitoTipLamports: 1_200_000,
+      slippageBps: 80,
+      autoWithdrawSafety: true,
+      autoSelectorWeights: {
+        aprWeight: 0.55,
+        volumeTvlRatioWeight: 0.3,
+        safetyWeight: 0.15,
+      },
+    };
+  }
+
   return {
     capitalUsdt: safeCapital,
     riskProfile: 'balanced-steady',
@@ -236,13 +266,23 @@ export function estimateNetYieldForCapital(
   estimatedWinProbRange: string;
 } {
   const concentrationMultiplier =
-    rangeWidthPct <= 6 ? 2.45 : rangeWidthPct <= 10 ? 1.65 : rangeWidthPct <= 15 ? 1.25 : 1.0;
+    rangeWidthPct <= 4
+      ? 3.45
+      : rangeWidthPct <= 6
+      ? 2.45
+      : rangeWidthPct <= 10
+      ? 1.65
+      : rangeWidthPct <= 15
+      ? 1.25
+      : 1.0;
 
   const compoundMultiplier = autoCompound ? 1.08 : 1.0;
   // Cap base APR conservatively so temporary spikes don't inflate illusions
-  const cappedBaseApr = Math.min(Math.max(aprPct, 10), 160);
-  // Active-yield combines 70% core + 30% higher-APR satellite boost (~1.2x effective blend)
-  const satelliteBlend = riskProfile === 'active-yield' ? 1.2 : 1.0;
+  const maxAprCap = riskProfile === 'turbo-high-yield' ? 260 : 160;
+  const cappedBaseApr = Math.min(Math.max(aprPct, 10), maxAprCap);
+  // Active-yield combines 70% core + 30% satellite; Turbo pushes 45% tight core + 55% top-APR satellite
+  const satelliteBlend =
+    riskProfile === 'turbo-high-yield' ? 1.45 : riskProfile === 'active-yield' ? 1.2 : 1.0;
 
   const effectiveAprPct = Number(
     (cappedBaseApr * concentrationMultiplier * compoundMultiplier * satelliteBlend).toFixed(1)
@@ -251,17 +291,25 @@ export function estimateNetYieldForCapital(
 
   // Tight ranges rebalance more frequently -> subtract realistic rebalance gas + swap slippage
   const monthlyGasAndSlippageUsd =
-    rangeWidthPct <= 6 ? 5.2 : rangeWidthPct <= 10 ? 3.0 : 1.8;
+    rangeWidthPct <= 4
+      ? Math.max(2.2, Number((lpUsdt * 0.032).toFixed(1)))
+      : rangeWidthPct <= 6
+      ? 5.2
+      : rangeWidthPct <= 10
+      ? 3.0
+      : 1.8;
 
   const monthlyGross = dailyGrossUsd * 30;
   const monthlyNetUsd = Number(Math.max(0, monthlyGross - monthlyGasAndSlippageUsd).toFixed(2));
   const monthlyNetPct = lpUsdt > 0 ? Number(((monthlyNetUsd / lpUsdt) * 100).toFixed(1)) : 0;
 
-  const realisticMinUsd = Number(Math.max(0, monthlyNetUsd * 0.65).toFixed(1));
-  const realisticMaxUsd = Number((monthlyNetUsd * 1.3).toFixed(1));
+  const realisticMinUsd = Number(Math.max(0, monthlyNetUsd * 0.6).toFixed(1));
+  const realisticMaxUsd = Number((monthlyNetUsd * 1.35).toFixed(1));
   const estimatedWinProbRange =
     riskProfile === 'ultra-safe'
       ? '65% ~ 75%'
+      : riskProfile === 'turbo-high-yield'
+      ? '35% ~ 50%'
       : riskProfile === 'active-yield'
       ? '45% ~ 55%'
       : '55% ~ 65%';
@@ -298,21 +346,36 @@ export function scorePoolForSteadyProfit(
   const wVol = w.volumeTvlRatioWeight / totalW;
   const wSafe = w.safetyWeight / totalW;
 
-  const aprCap = config.riskProfile === 'active-yield' ? 240 : 180;
+  const aprCap =
+    config.riskProfile === 'turbo-high-yield'
+      ? 320
+      : config.riskProfile === 'active-yield'
+      ? 240
+      : 180;
   const aprScore = Math.min((Math.max(pool.apr, 0) / aprCap) * 100, 100);
   const activityScore = Math.min(volTvlRatio * 25, 100);
   const safetyComponent = Math.min(Math.max(pool.safetyScore, 0), 100);
 
-  const isHighRisk = pool.ilRisk === '高';
+  // In turbo mode, allow high-APR pools up to 420% APR provided TVL is deep enough
+  const isHighRisk =
+    config.riskProfile === 'turbo-high-yield'
+      ? pool.apr > 420
+      : pool.ilRisk === '高';
   const isCoreBluechip = pool.ilRisk === '低' && pool.tvl >= 1_500_000;
   const tvlTooLow = pool.tvl < config.minTVL;
   const effectiveMinApr =
-    config.riskProfile === 'active-yield' && isCoreBluechip ? 30 : config.minAPR;
+    (config.riskProfile === 'active-yield' || config.riskProfile === 'turbo-high-yield') &&
+    isCoreBluechip
+      ? 30
+      : config.minAPR;
   const aprTooLow = pool.apr < effectiveMinApr;
 
-  // In active-yield mode, medium-risk high-liquidity pools (TVL >= $500K, safety >= 80) are allowed as satellite pools;
-  // in ultra-safe mode, require low-IL bluechip pools
-  const minSafety = config.riskProfile === 'active-yield' ? 80 : 85;
+  const minSafety =
+    config.riskProfile === 'turbo-high-yield'
+      ? 68
+      : config.riskProfile === 'active-yield'
+      ? 80
+      : 85;
   const riskRejected =
     isHighRisk ||
     (config.riskProfile === 'ultra-safe' && pool.ilRisk !== '低');
@@ -790,6 +853,8 @@ export interface PoolSelectionRound {
   solPriceUsd: number | null;
 }
 
+const STABLE_SYMBOLS = new Set(['USDC', 'USDT', 'PYUSD', 'USDS', 'USD1']);
+
 export function calculatePositionMetrics(params: {
   currentPrice: number;
   priceLower: number;
@@ -799,6 +864,7 @@ export function calculatePositionMetrics(params: {
   tokenASymbol?: string;
   tokenBSymbol?: string;
   uncollectedFeeUsd?: number;
+  solPriceUsd?: number;
 }): {
   inRange: boolean;
   injectedValueUsd: number;
@@ -812,17 +878,42 @@ export function calculatePositionMetrics(params: {
     amountA,
     amountB,
     tokenASymbol = 'WSOL',
+    tokenBSymbol = 'USDC',
     uncollectedFeeUsd = 0,
+    solPriceUsd = 0,
   } = params;
   const inRange =
     currentPrice >= Math.min(priceLower, priceUpper) &&
     currentPrice <= Math.max(priceLower, priceUpper);
 
-  const isSolA = tokenASymbol.toUpperCase().includes('SOL');
-  const valA = isSolA ? amountA * Math.max(currentPrice, 0) : amountA * 1.0;
-  const valB = !isSolA ? amountB * Math.max(currentPrice, 0) : amountB * 1.0;
-  const injectedValueUsd = Number((valA + valB).toFixed(2));
+  const symA = tokenASymbol.toUpperCase();
+  const symB = tokenBSymbol.toUpperCase();
+  const isStableA = STABLE_SYMBOLS.has(symA);
+  const isStableB = STABLE_SYMBOLS.has(symB);
+  const isSolA = symA === 'SOL' || symA === 'WSOL';
+  const isSolB = symB === 'SOL' || symB === 'WSOL';
 
+  let valA = 0;
+  let valB = 0;
+  if (isStableB) {
+    // Raydium poolInfo.price is MintB per MintA (USD per TokenA)
+    valA = amountA * Math.max(currentPrice, 0);
+    valB = amountB * 1.0;
+  } else if (isStableA) {
+    valA = amountA * 1.0;
+    valB = currentPrice > 0 ? amountB / currentPrice : 0;
+  } else if (isSolA && solPriceUsd > 0) {
+    valA = amountA * solPriceUsd;
+    valB = currentPrice > 0 ? amountB * (solPriceUsd / currentPrice) : 0;
+  } else if (isSolB && solPriceUsd > 0) {
+    valB = amountB * solPriceUsd;
+    valA = amountA * Math.max(currentPrice, 0) * solPriceUsd;
+  } else {
+    valA = amountA * Math.max(currentPrice, 0);
+    valB = amountB;
+  }
+
+  const injectedValueUsd = Number((valA + valB).toFixed(2));
   const unrealizedPnlUsd = Number(uncollectedFeeUsd.toFixed(2));
   const unrealizedPnlPct =
     injectedValueUsd > 0 ? Number(((unrealizedPnlUsd / injectedValueUsd) * 100).toFixed(2)) : 0;
@@ -832,6 +923,182 @@ export function calculatePositionMetrics(params: {
     injectedValueUsd,
     unrealizedPnlUsd,
     unrealizedPnlPct,
+  };
+}
+
+export interface AutoPortfolioSlotPlan {
+  slotIndex: number;
+  poolId: string;
+  poolName: string;
+  role: 'core' | 'satellite';
+  targetUsd: number;
+  apr: number;
+  rangeWidthPct: number;
+}
+
+export interface AutoPortfolioPlan {
+  walletTotalUsd: number;
+  activeInjectedUsd: number;
+  idleDeployableUsd: number;
+  utilizationPct: number;
+  reserveSol: number;
+  deployableSol: number;
+  deployableUsdc: number;
+  targetSlots: number;
+  hasDustPositionToConsolidate: boolean;
+  dustPositionUsd: number;
+  slotPlans: AutoPortfolioSlotPlan[];
+  diagnosisNote: string;
+}
+
+export function calculateAutoPortfolioPlan(params: {
+  solBalance: number;
+  usdcBalance: number;
+  solPriceUsd: number;
+  activePositions: Array<{
+    poolId: string;
+    poolName: string;
+    injectedValueUsd: number;
+    inRange?: boolean;
+  }>;
+  rankedPools: ScoredPool[];
+  config: StrategyConfig;
+}): AutoPortfolioPlan {
+  const {
+    solBalance,
+    usdcBalance,
+    solPriceUsd,
+    activePositions,
+    rankedPools,
+    config,
+  } = params;
+  const safeSolPrice = Math.max(solPriceUsd || 68, 1);
+  const walletTotalUsd = Number((solBalance * safeSolPrice + usdcBalance).toFixed(2));
+  const activeInjectedUsd = Number(
+    activePositions.reduce((acc, p) => acc + Math.max(0, p.injectedValueUsd), 0).toFixed(2)
+  );
+
+  const isDualSlot =
+    config.riskProfile === 'active-yield' ||
+    config.riskProfile === 'turbo-high-yield' ||
+    config.coreSplitPct < 100;
+  const targetSlots = isDualSlot ? 2 : 1;
+  // Reserve 0.048 SOL for up to 2 position NFTs (~0.018 * 2) + gas fees; 0.028 SOL for 1 position
+  const reserveSol = targetSlots >= 2 ? 0.048 : 0.028;
+  const deployableSol = Number(Math.max(0, solBalance - reserveSol).toFixed(6));
+  const deployableUsdc = Number(Math.max(0, usdcBalance).toFixed(4));
+  const idleDeployableUsd = Number(
+    (deployableSol * safeSolPrice + deployableUsdc).toFixed(2)
+  );
+
+  const dustPositions = activePositions.filter(
+    (p) => p.injectedValueUsd > 0 && p.injectedValueUsd < 1.5
+  );
+  const dustPositionUsd = Number(
+    dustPositions.reduce((acc, p) => acc + p.injectedValueUsd, 0).toFixed(2)
+  );
+  const hasDustPositionToConsolidate =
+    dustPositions.length > 0 && idleDeployableUsd >= 8;
+
+  const effectiveCapitalBase = activeInjectedUsd + idleDeployableUsd;
+  const utilizationPct =
+    effectiveCapitalBase > 0
+      ? Number(Math.min(100, (activeInjectedUsd / effectiveCapitalBase) * 100).toFixed(1))
+      : 0;
+
+  // Target total budget for new/rebalanced deployment (leave ~8% buffer for swap fees/slippage)
+  const totalBudgetUsd = Number(
+    Math.min(config.lpActiveUsdt, (idleDeployableUsd + dustPositionUsd) * 0.9).toFixed(2)
+  );
+
+  const eligibleOrFallback = rankedPools.filter((p) => {
+    const upperName = p.name.toUpperCase();
+    const hasUsdcOrSol = upperName.includes('USDC') || upperName.includes('WSOL') || upperName.includes('SOL');
+    return hasUsdcOrSol && p.tvl >= 250_000;
+  });
+
+  const corePool =
+    eligibleOrFallback.find((p) => p.poolRole === 'core' || p.name.includes('WSOL / USDC')) ||
+    eligibleOrFallback[0];
+
+  // For Slot 2 (Satellite), explicitly choose the highest-APR distinct pool (excluding Core pool id)
+  const satellitePool = eligibleOrFallback
+    .filter((p) => p.id !== corePool?.id)
+    .sort((a, b) => b.apr - a.apr)[0];
+
+  const slotPlans: AutoPortfolioSlotPlan[] = [];
+  if (totalBudgetUsd >= 3 && corePool) {
+    if (targetSlots >= 2 && satellitePool && totalBudgetUsd >= 8) {
+      const coreRatio = Math.min(0.75, Math.max(0.35, config.coreSplitPct / 100));
+      const coreUsd = Number((totalBudgetUsd * coreRatio).toFixed(2));
+      const satUsd = Number((totalBudgetUsd - coreUsd).toFixed(2));
+      slotPlans.push({
+        slotIndex: 1,
+        poolId: corePool.id,
+        poolName: corePool.name,
+        role: 'core',
+        targetUsd: coreUsd,
+        apr: corePool.apr,
+        rangeWidthPct: config.rangeWidthPct,
+      });
+      slotPlans.push({
+        slotIndex: 2,
+        poolId: satellitePool.id,
+        poolName: satellitePool.name,
+        role: 'satellite',
+        targetUsd: satUsd,
+        apr: satellitePool.apr,
+        rangeWidthPct: Math.max(4, config.rangeWidthPct),
+      });
+    } else {
+      slotPlans.push({
+        slotIndex: 1,
+        poolId: corePool.id,
+        poolName: corePool.name,
+        role: 'core',
+        targetUsd: totalBudgetUsd,
+        apr: corePool.apr,
+        rangeWidthPct: config.rangeWidthPct,
+      });
+    }
+  }
+
+  let diagnosisNote = '';
+  if (hasDustPositionToConsolidate) {
+    diagnosisNote = `检测到当前仅开启了 $${dustPositionUsd.toFixed(
+      2
+    )} 测试微仓，但钱包仍有 $${idleDeployableUsd.toFixed(
+      2
+    )} 闲置资金未投入（资金利用率仅 ${utilizationPct}%）。建议平掉微仓并回收 0.018 SOL 租金，将约 $${totalBudgetUsd.toFixed(
+      2
+    )} 拆入 ${slotPlans.length} 个高年化集中区间池加速赚取手续费。`;
+  } else if (activePositions.length > 0 && activePositions.length < targetSlots && idleDeployableUsd >= 6) {
+    diagnosisNote = `当前仅运行 1 个仓位（$${activeInjectedUsd.toFixed(
+      2
+    )}），钱包尚余 $${idleDeployableUsd.toFixed(
+      2
+    )} 可用资金，可立即增开第 2 个高 APR 卫星池并发赚币。`;
+  } else if (activeInjectedUsd > 0) {
+    diagnosisNote = `当前共运行 ${activePositions.length} 个活跃做市仓位，已投入 $${activeInjectedUsd.toFixed(
+      2
+    )}（资金利用率 ${utilizationPct}%）。`;
+  } else {
+    diagnosisNote = `当前空仓待建，可用本金约 $${idleDeployableUsd.toFixed(2)}（可建 ${slotPlans.length} 个并发池）。`;
+  }
+
+  return {
+    walletTotalUsd,
+    activeInjectedUsd,
+    idleDeployableUsd,
+    utilizationPct,
+    reserveSol,
+    deployableSol,
+    deployableUsdc,
+    targetSlots,
+    hasDustPositionToConsolidate,
+    dustPositionUsd,
+    slotPlans,
+    diagnosisNote,
   };
 }
 

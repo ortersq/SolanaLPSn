@@ -144,7 +144,7 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
             <span>二、选择收益与胜率档位（系统自动计算真实调仓损耗）</span>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
             <button
               type="button"
               disabled={saving}
@@ -158,9 +158,9 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
                   : 'bg-[#090d16] border-slate-800 hover:border-slate-700'
               }`}
             >
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-semibold text-white">极稳保守型</span>
-                <span className="text-xs font-mono text-slate-400">月正收益概率 65~75%</span>
+                <span className="text-[11px] font-mono text-slate-400">胜率 65~75%</span>
               </div>
               <div className="text-xs text-slate-400 leading-relaxed">
                 100% 进 ≥$3M 蓝筹池 · ±20% 超宽区间几乎不换仓 · -5% 止损。适合极少操心、容忍极低回撤。
@@ -180,9 +180,9 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
                   : 'bg-[#090d16] border-slate-800 hover:border-slate-700'
               }`}
             >
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-semibold text-sky-400">稳健平衡型</span>
-                <span className="text-xs font-mono text-slate-400">月正收益概率 55~65%</span>
+                <span className="text-[11px] font-mono text-slate-400">胜率 55~65%</span>
               </div>
               <div className="text-xs text-slate-400 leading-relaxed">
                 100% 进 ≥$2M 蓝筹池 · ±10% 集中区间（费率密度 ×1.65）+ 自动复利 · -6% 止损。
@@ -202,14 +202,34 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
                   : 'bg-[#090d16] border-slate-800 hover:border-slate-700'
               }`}
             >
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold text-emerald-400">
-                  进取增效型 (推荐提收益)
-                </span>
-                <span className="text-xs font-mono text-amber-400">月正收益概率 45~55%</span>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-emerald-400">进取增效型</span>
+                <span className="text-[11px] font-mono text-amber-400">胜率 45~55%</span>
               </div>
               <div className="text-xs text-slate-400 leading-relaxed">
-                70% 窄区间蓝筹（±6%，费率密度 ×2.45）+ 30% 高换手热池卫星仓 + 自动复利 · -8% 止损。
+                70% ±6% 蓝筹（×2.45密度）+ 30% 高换手热池卫星仓（TVL≥$500K）+ 自动复利 · -8% 止损。
+              </div>
+            </button>
+
+            <button
+              type="button"
+              disabled={saving}
+              onClick={() => {
+                setSelectedProfile('turbo-high-yield');
+                handleApply(capitalInput, 'turbo-high-yield');
+              }}
+              className={`p-4 rounded-xl border text-left transition-colors cursor-pointer space-y-2 ${
+                selectedProfile === 'turbo-high-yield'
+                  ? 'bg-amber-950/30 border-amber-400/80'
+                  : 'bg-[#090d16] border-slate-800 hover:border-amber-500/50'
+              }`}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-amber-300">极速高收益突击型</span>
+                <span className="text-[11px] font-mono text-rose-400">爆发收益 · 双仓</span>
+              </div>
+              <div className="text-xs text-slate-400 leading-relaxed">
+                45% ±4% 超窄核心 + 55% 全网第一高APR热池（TVL≥$300K, 最高420% APR）· $0.5极速复利 · 费率密度 ×3.45。
               </div>
             </button>
           </div>
@@ -225,7 +245,7 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
           </div>
           <div className="text-xs text-slate-500 mt-1">
             {satelliteUsd > 0
-              ? `70%核心蓝筹 + 30%高换手热池 + ${strategyConfig.gasReserveUsdt}U Gas`
+              ? `${strategyConfig.coreSplitPct}%核心池 + ${100 - strategyConfig.coreSplitPct}%最高APR卫星池 + ${strategyConfig.gasReserveUsdt}U Gas`
               : `另留 ${strategyConfig.gasReserveUsdt}U 作为 SOL 燃料储备`}
           </div>
         </div>
@@ -235,8 +255,8 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
             <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
             <span>集中区间净收益预估</span>
           </div>
-          <div className="text-lg font-bold font-mono text-emerald-400 mt-2 tabular-nums whitespace-nowrap">
-            +${yieldEst.realisticMinUsd} ~ +${yieldEst.realisticMaxUsd} / 月
+          <div className="text-base xl:text-lg font-bold font-mono text-emerald-400 mt-2 tabular-nums leading-snug">
+            +${yieldEst.realisticMinUsd}~${yieldEst.realisticMaxUsd} / 月
           </div>
           <div className="text-xs text-slate-500 font-mono mt-1 tabular-nums">
             均值 +${yieldEst.monthlyNetUsd}/月 ({yieldEst.monthlyNetPct}%) · 已扣调仓Gas ${yieldEst.monthlyGasAndSlippageUsd}

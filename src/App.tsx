@@ -210,6 +210,7 @@ export default function App() {
             onRunRiskScan={handleRunRiskScan}
             onRefreshPositions={handleRefreshPositions}
             onUpdateBackendStatus={setBackendStatus}
+            onUpdateStrategyConfig={setStrategyConfig}
             onGoToStrategy={() => setActiveTab('strategy')}
             onGoToPools={() => setActiveTab('pools')}
           />

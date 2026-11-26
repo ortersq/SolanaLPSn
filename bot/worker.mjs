@@ -106,25 +106,28 @@ async function checkExitSlippageGuard() {
 
 async function scanLivePools() {
   const res = await fetch(
-    'https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=volume24h&sortType=desc&pageSize=20&page=1'
+    'https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=volume24h&sortType=desc&pageSize=30&page=1'
   );
   const json = await res.json();
   const rows = json?.data?.data || [];
 
   const core = [];
   const alerts = [];
+  const maxSafeApr = RISK_PROFILE === 'turbo-high-yield' ? 420 : 180;
 
   for (const p of rows) {
     const symA = p.mintA?.symbol || '';
     const symB = p.mintB?.symbol || '';
     const tvl = Number(p.tvl || 0);
     const apr = Number(p.day?.apr || 0);
+    if (tvl < 100_000 || apr > 600) continue;
+
     const isLowIl =
       (STABLES.has(symA) && STABLES.has(symB)) ||
       (STABLES.has(symA) && BLUECHIPS.has(symB)) ||
       (STABLES.has(symB) && BLUECHIPS.has(symA));
 
-    if (!isLowIl && apr > 180) {
+    if (!isLowIl && apr > maxSafeApr) {
       alerts.push(`Token 波动异常预警: ${symA}/${symB} 年化 +${apr.toFixed(1)}%，已拦截`);
       continue;
     }

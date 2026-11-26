@@ -27,6 +27,7 @@ import {
 import {
   API_KEY_REQUIREMENTS,
   ActiveLpPosition,
+  AutoPortfolioPlan,
   DEFAULT_200U_STRATEGY,
   PipelineRunMode,
   PipelineStepKey,
@@ -41,6 +42,7 @@ import {
   assessLiveTestWalletReadiness,
   buildPresetForCapital,
   buildSelectionRoundFromPools,
+  calculateAutoPortfolioPlan,
   calculateLpDepositAmounts,
   calculatePositionMetrics,
   computeSafeClmmOtherAmountMax,
@@ -129,6 +131,8 @@ const envProfile: RiskProfileKey =
     ? 'ultra-safe'
     : envProfileRaw === 'active-yield'
     ? 'active-yield'
+    : envProfileRaw === 'turbo-high-yield'
+    ? 'turbo-high-yield'
     : 'balanced-steady';
 
 let strategyConfig: StrategyConfig =
@@ -238,6 +242,8 @@ let selectionRoundCounter = 0;
 let selectionRounds: PoolSelectionRound[] = [];
 let isAutoTicking = false;
 let lastAutoTickDiagnostic: any = null;
+let latestSolPriceUsd = 85;
+const poolActionCooldownMs = new Map<string, number>();
 
 function getLiveBackendStatus() {
   return {
@@ -301,7 +307,8 @@ async function fetchActivePositions(force = false): Promise<ActiveLpPosition[]> 
     });
     raydium.account.clearAccountChangeCkb();
 
-    if (!rawPositions || rawPositions.length === 0) {
+    const nonEmptyPositions = (rawPositions || []).filter((p) => !p.liquidity.isZero());
+    if (nonEmptyPositions.length === 0) {
       cachedActivePositions = [];
       lastPositionsFetchTime = now;
       return [];
@@ -309,8 +316,9 @@ async function fetchActivePositions(force = false): Promise<ActiveLpPosition[]> 
 
     const epochInfo = await solanaConnection.getEpochInfo('confirmed');
     const parsed: ActiveLpPosition[] = [];
+    const stables = new Set(['USDC', 'USDT', 'PYUSD', 'USDS', 'USD1']);
 
-    for (const pos of rawPositions) {
+    for (const pos of nonEmptyPositions) {
       try {
         const poolIdStr = pos.poolId.toBase58();
         const { poolInfo } = await raydium.clmm.getPoolInfoFromRpc(poolIdStr);
@@ -329,37 +337,44 @@ async function fetchActivePositions(force = false): Promise<ActiveLpPosition[]> 
           poolInfo.mintB.decimals
         ).toNumber();
 
-        let amountA = 0;
-        let amountB = 0;
-        if (!pos.liquidity.isZero()) {
-          const liqAmounts = await PoolUtils.getAmountsFromLiquidity({
-            epochInfo,
-            poolInfo,
-            tickLower: lowerTick,
-            tickUpper: upperTick,
-            liquidity: pos.liquidity,
-            slippage: 0,
-            add: false,
-          });
-          amountA =
-            Number(liqAmounts.amountA.amount.toString()) / 10 ** poolInfo.mintA.decimals;
-          amountB =
-            Number(liqAmounts.amountB.amount.toString()) / 10 ** poolInfo.mintB.decimals;
-        }
+        const liqAmounts = await PoolUtils.getAmountsFromLiquidity({
+          epochInfo,
+          poolInfo,
+          tickLower: lowerTick,
+          tickUpper: upperTick,
+          liquidity: pos.liquidity,
+          slippage: 0,
+          add: false,
+        });
+        const amountA =
+          Number(liqAmounts.amountA.amount.toString()) / 10 ** poolInfo.mintA.decimals;
+        const amountB =
+          Number(liqAmounts.amountB.amount.toString()) / 10 ** poolInfo.mintB.decimals;
 
         const symA =
           poolInfo.mintA.symbol ||
-          (poolInfo.mintA.address === SOL_MINT_ADDR ? 'WSOL' : 'USDC');
+          (poolInfo.mintA.address === SOL_MINT_ADDR ? 'WSOL' : poolInfo.mintA.address === USDC_MINT_ADDR ? 'USDC' : 'TOKENA');
         const symB =
           poolInfo.mintB.symbol ||
-          (poolInfo.mintB.address === USDC_MINT_ADDR ? 'USDC' : 'SOL');
+          (poolInfo.mintB.address === USDC_MINT_ADDR ? 'USDC' : poolInfo.mintB.address === SOL_MINT_ADDR ? 'WSOL' : 'TOKENB');
 
         const feeA = Number(pos.tokenFeesOwedA.toString()) / 10 ** poolInfo.mintA.decimals;
         const feeB = Number(pos.tokenFeesOwedB.toString()) / 10 ** poolInfo.mintB.decimals;
-        const isSolA = symA.toUpperCase().includes('SOL');
-        const uncollectedFeeUsd = Number(
-          (isSolA ? feeA * currentPrice + feeB : feeA + feeB * currentPrice).toFixed(3)
-        );
+        const upperA = symA.toUpperCase();
+        const upperB = symB.toUpperCase();
+        let uncollectedFeeUsd = 0;
+        if (stables.has(upperB)) {
+          uncollectedFeeUsd = feeA * currentPrice + feeB;
+        } else if (stables.has(upperA)) {
+          uncollectedFeeUsd = feeA + (currentPrice > 0 ? feeB / currentPrice : 0);
+        } else if (upperA === 'SOL' || upperA === 'WSOL') {
+          uncollectedFeeUsd = feeA * latestSolPriceUsd + (currentPrice > 0 ? feeB * (latestSolPriceUsd / currentPrice) : 0);
+        } else if (upperB === 'SOL' || upperB === 'WSOL') {
+          uncollectedFeeUsd = feeB * latestSolPriceUsd + feeA * currentPrice * latestSolPriceUsd;
+        } else {
+          uncollectedFeeUsd = feeA * currentPrice + feeB;
+        }
+        uncollectedFeeUsd = Number(uncollectedFeeUsd.toFixed(3));
 
         const metrics = calculatePositionMetrics({
           currentPrice,
@@ -370,6 +385,7 @@ async function fetchActivePositions(force = false): Promise<ActiveLpPosition[]> 
           tokenASymbol: symA,
           tokenBSymbol: symB,
           uncollectedFeeUsd,
+          solPriceUsd: latestSolPriceUsd,
         });
 
         parsed.push({
@@ -379,8 +395,8 @@ async function fetchActivePositions(force = false): Promise<ActiveLpPosition[]> 
           poolName: `${symA} / ${symB}`,
           dex: 'Raydium CLMM',
           priceCurrentUsd: currentPrice,
-          priceLowerUsd: Number(priceLower.toFixed(4)),
-          priceUpperUsd: Number(priceUpper.toFixed(4)),
+          priceLowerUsd: Number(priceLower.toFixed(6)),
+          priceUpperUsd: Number(priceUpper.toFixed(6)),
           tickLower: lowerTick,
           tickUpper: upperTick,
           inRange: metrics.inRange,
@@ -456,7 +472,7 @@ async function fetchRealPools(): Promise<{ pools: PoolMetrics[]; source: string 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 6000);
     const res = await fetch(
-      'https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=volume24h&sortType=desc&pageSize=20&page=1',
+      'https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=volume24h&sortType=desc&pageSize=35&page=1',
       { signal: controller.signal }
     );
     clearTimeout(timer);
@@ -467,8 +483,13 @@ async function fetchRealPools(): Promise<{ pools: PoolMetrics[]; source: string 
       const bluechips = new Set(['SOL', 'WSOL', 'MSOL', 'JITOSOL', 'BSOL', 'JUP']);
 
       const mapped: PoolMetrics[] = rows
-        .filter((p: any) => Number(p.tvl) > 20_000)
-        .slice(0, 12)
+        .filter((p: any) => {
+          const tvl = Number(p.tvl || 0);
+          const apr = Number(p.day?.apr || 0);
+          // Filter out $0/$2 TVL scam APR traps while keeping real >=$100K active CLMM pools
+          return tvl >= 100_000 && apr <= 600 && apr >= 1;
+        })
+        .slice(0, 16)
         .map((p: any) => {
           const tvl = Number(p.tvl || 0);
           const vol24h = Number(p.day?.volume || 0);
@@ -483,8 +504,8 @@ async function fetchRealPools(): Promise<{ pools: PoolMetrics[]; source: string 
           const isLowIlPair = isBothStable || isBluechipStable;
 
           const safetyScore =
-            tvl > 5_000_000 ? 96 : tvl > 2_000_000 ? 92 : tvl > 500_000 ? 84 : 70;
-          const ilRisk: '低' | '中' | '高' = isLowIlPair ? '低' : apr > 180 ? '高' : '中';
+            tvl > 5_000_000 ? 96 : tvl > 2_000_000 ? 92 : tvl > 500_000 ? 84 : tvl > 250_000 ? 74 : 64;
+          const ilRisk: '低' | '中' | '高' = isLowIlPair ? '低' : apr > 260 ? '高' : '中';
 
           return {
             id: p.id,
@@ -785,6 +806,8 @@ app.post('/api/strategy/preset', (req, res) => {
       ? 'ultra-safe'
       : rawProfile === 'active-yield'
       ? 'active-yield'
+      : rawProfile === 'turbo-high-yield'
+      ? 'turbo-high-yield'
       : 'balanced-steady';
 
   strategyConfig = buildPresetForCapital(capitalUsdt, riskProfile);
@@ -793,10 +816,12 @@ app.post('/api/strategy/preset', (req, res) => {
       ? '极稳保守'
       : riskProfile === 'active-yield'
       ? '进取增效（±6%窄区间双仓）'
+      : riskProfile === 'turbo-high-yield'
+      ? '极速高收益突击（±4%超窄双仓 · 45%核心+55%高APR卫星池）'
       : '稳健平衡（±10%集中区间）';
   pushLog(
     'info',
-    `已应用 ${strategyConfig.capitalUsdt}U ${profileLabel}方案（做市 ${strategyConfig.lpActiveUsdt}U + Gas 预留 ${strategyConfig.gasReserveUsdt}U，最低 TVL $${(strategyConfig.minTVL / 1e6).toFixed(1)}M，区间 ±${strategyConfig.rangeWidthPct}%）。`
+    `已应用 ${strategyConfig.capitalUsdt}U ${profileLabel}方案（做市 ${strategyConfig.lpActiveUsdt}U + Gas 预留 ${strategyConfig.gasReserveUsdt}U，最低 TVL $${(strategyConfig.minTVL / 1e6).toFixed(2)}M，区间 ±${strategyConfig.rangeWidthPct}%）。`
   );
   res.json({ success: true, strategyConfig, logs: backendStatus.logs });
 });
@@ -1119,6 +1144,538 @@ async function runSwapPipelineTest(
   }
 }
 
+async function getSplTokenUiBalance(pubkey: PublicKey, mintAddr: string): Promise<{
+  atomic: bigint;
+  uiAmount: number;
+  decimals: number;
+}> {
+  if (mintAddr === SOL_MINT_ADDR) {
+    const lamports = await solanaConnection.getBalance(pubkey);
+    return { atomic: BigInt(lamports), uiAmount: lamports / 1e9, decimals: 9 };
+  }
+  const accs = await solanaConnection.getParsedTokenAccountsByOwner(pubkey, {
+    mint: new PublicKey(mintAddr),
+  });
+  let totalAtomic = 0n;
+  let decimals = 6;
+  for (const acc of accs.value) {
+    const tokenAmt = acc.account.data?.parsed?.info?.tokenAmount;
+    if (tokenAmt?.amount) {
+      totalAtomic += BigInt(tokenAmt.amount);
+      decimals = Number(tokenAmt.decimals ?? decimals);
+    }
+  }
+  return {
+    atomic: totalAtomic,
+    uiAmount: Number(totalAtomic) / 10 ** decimals,
+    decimals,
+  };
+}
+
+async function executeJupiterTokenSwap(params: {
+  inputMint: string;
+  outputMint: string;
+  amountAtomic: string | number | bigint;
+  slippageBps?: number;
+}): Promise<{ txId: string; outAmountAtomic: string }> {
+  if (!BACKEND_KEYPAIR) {
+    throw new Error('后台 .env 未配置有效 PRIVATE_KEY');
+  }
+  const { inputMint, outputMint, amountAtomic, slippageBps = Math.max(strategyConfig.slippageBps, 100) } = params;
+
+  const fetchPrepared = async () => {
+    const qCtrl = new AbortController();
+    const qTimer = setTimeout(() => qCtrl.abort(), 9000);
+    const quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${String(amountAtomic)}&slippageBps=${slippageBps}`;
+    const qRes = await fetch(quoteUrl, { signal: qCtrl.signal });
+    clearTimeout(qTimer);
+    if (!qRes.ok) {
+      throw new Error(`Jupiter quote HTTP ${qRes.status}`);
+    }
+    const quote = await qRes.json();
+    const sCtrl = new AbortController();
+    const sTimer = setTimeout(() => sCtrl.abort(), 9000);
+    const sRes = await fetch('https://lite-api.jup.ag/swap/v1/swap', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        quoteResponse: quote,
+        userPublicKey: BACKEND_KEYPAIR!.publicKey.toBase58(),
+        wrapAndUnwrapSol: true,
+        dynamicComputeUnitLimit: true,
+        prioritizationFeeLamports: {
+          priorityLevelWithMaxLamports: {
+            maxLamports: 350_000,
+            priorityLevel: 'high',
+          },
+        },
+      }),
+      signal: sCtrl.signal,
+    });
+    clearTimeout(sTimer);
+    if (!sRes.ok) {
+      const errBody = await sRes.text().catch(() => '');
+      throw new Error(`Jupiter swap HTTP ${sRes.status}: ${errBody.slice(0, 120)}`);
+    }
+    const swapData = await sRes.json();
+    if (!swapData?.swapTransaction) {
+      throw new Error('Jupiter swapTransaction 返回为空');
+    }
+    return { quote, swapData };
+  };
+
+  let prepared = await fetchPrepared();
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const tx = VersionedTransaction.deserialize(
+      Buffer.from(prepared.swapData.swapTransaction, 'base64')
+    );
+    tx.sign([BACKEND_KEYPAIR]);
+    const sig = bs58.encode(tx.signatures[0]);
+    const lastValidBlockHeight =
+      Number(prepared.swapData.lastValidBlockHeight || 0) ||
+      (await solanaConnection.getBlockHeight('confirmed')) + 140;
+    try {
+      const txId = await sendAndConfirmRawWithRebroadcast(tx, sig, lastValidBlockHeight);
+      return { txId, outAmountAtomic: String(prepared.quote.outAmount || '0') };
+    } catch (err: any) {
+      const msg = formatChainError(err).toLowerCase();
+      if (attempt === 1 && (msg.includes('expired') || msg.includes('blockhash'))) {
+        prepared = await fetchPrepared();
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error('Jupiter swap retry exhausted');
+}
+
+async function closeClmmPositionByNft(nftMintFilter?: string): Promise<{
+  closedNftMint: string;
+  poolId: string;
+  txId: string;
+}> {
+  if (!BACKEND_KEYPAIR) {
+    throw new Error('后台 .env 未配置有效 PRIVATE_KEY');
+  }
+  const raydium = await Raydium.load({
+    owner: BACKEND_KEYPAIR,
+    connection: solanaConnection,
+    cluster: 'mainnet',
+    disableFeatureCheck: true,
+    disableLoadToken: true,
+  });
+  try {
+    await raydium.account.fetchWalletTokenAccounts({
+      forceUpdate: true,
+      commitment: 'confirmed',
+    });
+    const positions = await raydium.clmm.getOwnerPositionInfo({
+      programId: CLMM_PROGRAM_ID,
+    });
+    if (!positions.length) {
+      throw new Error('链上暂未检测到活跃 Raydium CLMM 仓位');
+    }
+    const targetPos =
+      (nftMintFilter && positions.find((p) => p.nftMint.toBase58() === nftMintFilter)) ||
+      positions[0];
+    const { poolInfo, poolKeys } = await raydium.clmm.getPoolInfoFromRpc(
+      targetPos.poolId.toBase58()
+    );
+
+    let txId = '';
+    if (!targetPos.liquidity.isZero()) {
+      const { transaction } = await raydium.clmm.decreaseLiquidity({
+        poolInfo,
+        poolKeys,
+        ownerPosition: targetPos,
+        ownerInfo: {
+          useSOLBalance: true,
+          closePosition: true,
+        },
+        liquidity: targetPos.liquidity,
+        amountMinA: new BN(0),
+        amountMinB: new BN(0),
+        txVersion: TxVersion.V0,
+        computeBudgetConfig: { units: 500_000, microLamports: 150_000 },
+      });
+      const sig = bs58.encode(transaction.signatures[0]);
+      const currentHeight = await solanaConnection.getBlockHeight('confirmed');
+      txId = await sendAndConfirmRawWithRebroadcast(transaction, sig, currentHeight + 145);
+    } else {
+      const { transaction } = await raydium.clmm.closePosition({
+        poolInfo,
+        poolKeys,
+        ownerPosition: targetPos,
+        txVersion: TxVersion.V0,
+        computeBudgetConfig: { units: 300_000, microLamports: 150_000 },
+      });
+      const sig = bs58.encode(transaction.signatures[0]);
+      const currentHeight = await solanaConnection.getBlockHeight('confirmed');
+      txId = await sendAndConfirmRawWithRebroadcast(transaction, sig, currentHeight + 145);
+    }
+
+    await getWalletBalances(BACKEND_KEYPAIR.publicKey);
+    await fetchActivePositions(true);
+    return {
+      closedNftMint: targetPos.nftMint.toBase58(),
+      poolId: targetPos.poolId.toBase58(),
+      txId,
+    };
+  } finally {
+    raydium.account.clearAccountChangeCkb();
+  }
+}
+
+async function openRealClmmPoolPosition(params: {
+  poolId: string;
+  targetUsd: number;
+  rangeWidthPct: number;
+  solPriceUsd?: number;
+}): Promise<{
+  poolId: string;
+  poolName: string;
+  nftMint: string;
+  txId: string;
+  swapTxId?: string;
+  tickLower: number;
+  tickUpper: number;
+  injectedSummary: string;
+}> {
+  if (!BACKEND_KEYPAIR) {
+    throw new Error('后台 .env 未配置有效 PRIVATE_KEY');
+  }
+  const { poolId, targetUsd, rangeWidthPct, solPriceUsd = latestSolPriceUsd || 85 } = params;
+  const safeRangePct = Math.max(3, Math.min(25, rangeWidthPct));
+  const ownerPk = BACKEND_KEYPAIR.publicKey;
+
+  const raydium = await Raydium.load({
+    owner: BACKEND_KEYPAIR,
+    connection: solanaConnection,
+    cluster: 'mainnet',
+    disableFeatureCheck: true,
+    disableLoadToken: true,
+  });
+
+  try {
+    const { poolInfo, poolKeys } = await raydium.clmm.getPoolInfoFromRpc(poolId);
+    const mintA = poolInfo.mintA.address;
+    const mintB = poolInfo.mintB.address;
+    const decA = poolInfo.mintA.decimals;
+    const decB = poolInfo.mintB.decimals;
+    const symA = poolInfo.mintA.symbol || (mintA === SOL_MINT_ADDR ? 'WSOL' : mintA === USDC_MINT_ADDR ? 'USDC' : 'TOKENA');
+    const symB = poolInfo.mintB.symbol || (mintB === USDC_MINT_ADDR ? 'USDC' : mintB === SOL_MINT_ADDR ? 'WSOL' : 'TOKENB');
+
+    const isSolA = mintA === SOL_MINT_ADDR;
+    const isSolB = mintB === SOL_MINT_ADDR;
+    const isUsdcA = mintA === USDC_MINT_ADDR;
+    const isUsdcB = mintB === USDC_MINT_ADDR;
+
+    if (!isSolA && !isSolB && !isUsdcA && !isUsdcB) {
+      throw new Error(`池子 ${symA}/${symB} 不含 SOL 或 USDC 基础资产，暂跳过`);
+    }
+
+    const balances = await getWalletBalances(ownerPk);
+    const minSolReserve = 0.026; // NFT rent ~0.018 + gas fees
+    const availSol = Math.max(0, balances.solBalance - minSolReserve);
+    if (balances.solBalance < minSolReserve) {
+      throw new Error(`可用 SOL 仅 ${balances.solBalance.toFixed(4)}，低于 ${minSolReserve} SOL 仓位租金与手续费门槛`);
+    }
+
+    const availSolUsd = availSol * solPriceUsd;
+    const availUsdcUsd = balances.usdcBalance;
+    const cappedTotalUsd = Math.min(Math.max(targetUsd, 2), (availSolUsd + availUsdcUsd) * 0.92);
+    const halfUsd = cappedTotalUsd * 0.48;
+    let swapTxId: string | undefined;
+
+    // Step 1: Ensure we hold ~halfUsd worth of the non-USDC / non-SOL side (or balance WSOL/USDC)
+    if ((isSolA && isUsdcB) || (isUsdcA && isSolB)) {
+      // WSOL <-> USDC pair: balance only if one side is much smaller than halfUsd
+      if (availUsdcUsd < halfUsd * 0.72 && availSolUsd > halfUsd * 1.15) {
+        const swapUsd = Math.min(halfUsd - availUsdcUsd, availSolUsd * 0.55);
+        const swapLamports = Math.floor((swapUsd / solPriceUsd) * 1e9);
+        if (swapLamports >= 2_000_000) {
+          const sw = await executeJupiterTokenSwap({
+            inputMint: SOL_MINT_ADDR,
+            outputMint: USDC_MINT_ADDR,
+            amountAtomic: swapLamports,
+          });
+          swapTxId = sw.txId;
+          await sleep(1800);
+        }
+      } else if (availSolUsd < halfUsd * 0.72 && availUsdcUsd > halfUsd * 1.15) {
+        const swapUsd = Math.min(halfUsd - availSolUsd, availUsdcUsd * 0.55);
+        const swapUsdcAtomic = Math.floor(swapUsd * 1e6);
+        if (swapUsdcAtomic >= 300_000) {
+          const sw = await executeJupiterTokenSwap({
+            inputMint: USDC_MINT_ADDR,
+            outputMint: SOL_MINT_ADDR,
+            amountAtomic: swapUsdcAtomic,
+          });
+          swapTxId = sw.txId;
+          await sleep(1800);
+        }
+      }
+    } else {
+      // One side is TokenX, the other side is USDC or WSOL
+      const tokenXMint = isUsdcA || isSolA ? mintB : mintA;
+      const otherIsUsdc = isUsdcA || isUsdcB;
+      const balX = await getSplTokenUiBalance(ownerPk, tokenXMint);
+      const tokenXDecimals = balX.decimals;
+      // Estimate TokenX price in USD
+      const currentPoolPrice = Number(poolInfo.price || 0);
+      let priceXUsd = 1;
+      if (isUsdcB) priceXUsd = currentPoolPrice;
+      else if (isUsdcA) priceXUsd = currentPoolPrice > 0 ? 1 / currentPoolPrice : 1;
+      else if (isSolA) priceXUsd = currentPoolPrice > 0 ? solPriceUsd / currentPoolPrice : 1;
+      else if (isSolB) priceXUsd = currentPoolPrice * solPriceUsd;
+
+      const existingXUsd = balX.uiAmount * priceXUsd;
+      const needSwapUsd = Math.max(0, halfUsd - existingXUsd);
+
+      if (needSwapUsd >= 0.5) {
+        if (otherIsUsdc) {
+          // Reserve ~halfUsd in USDC for the USDC side; fund TokenX swap from excess USDC or excess SOL
+          const excessUsdc = Math.max(0, availUsdcUsd - halfUsd);
+          if (excessUsdc >= needSwapUsd * 0.9) {
+            const amtAtomic = Math.floor(Math.min(needSwapUsd, excessUsdc * 0.96) * 1e6);
+            const sw = await executeJupiterTokenSwap({
+              inputMint: USDC_MINT_ADDR,
+              outputMint: tokenXMint,
+              amountAtomic: amtAtomic,
+            });
+            swapTxId = sw.txId;
+            await sleep(2200);
+          } else if (availSolUsd >= needSwapUsd * 0.95) {
+            const amtLamports = Math.floor((Math.min(needSwapUsd, availSolUsd * 0.92) / solPriceUsd) * 1e9);
+            const sw = await executeJupiterTokenSwap({
+              inputMint: SOL_MINT_ADDR,
+              outputMint: tokenXMint,
+              amountAtomic: amtLamports,
+            });
+            swapTxId = sw.txId;
+            await sleep(2200);
+          } else if (availUsdcUsd >= needSwapUsd * 1.1) {
+            const amtAtomic = Math.floor((availUsdcUsd * 0.48) * 1e6);
+            const sw = await executeJupiterTokenSwap({
+              inputMint: USDC_MINT_ADDR,
+              outputMint: tokenXMint,
+              amountAtomic: amtAtomic,
+            });
+            swapTxId = sw.txId;
+            await sleep(2200);
+          }
+        } else {
+          // WSOL / TokenX pool
+          const excessSolUsd = Math.max(0, availSolUsd - halfUsd);
+          if (availUsdcUsd >= needSwapUsd * 0.9) {
+            const amtAtomic = Math.floor(Math.min(needSwapUsd, availUsdcUsd * 0.96) * 1e6);
+            const sw = await executeJupiterTokenSwap({
+              inputMint: USDC_MINT_ADDR,
+              outputMint: tokenXMint,
+              amountAtomic: amtAtomic,
+            });
+            swapTxId = sw.txId;
+            await sleep(2200);
+          } else if (excessSolUsd >= needSwapUsd * 0.9) {
+            const amtLamports = Math.floor((Math.min(needSwapUsd, excessSolUsd * 0.92) / solPriceUsd) * 1e9);
+            const sw = await executeJupiterTokenSwap({
+              inputMint: SOL_MINT_ADDR,
+              outputMint: tokenXMint,
+              amountAtomic: amtLamports,
+            });
+            swapTxId = sw.txId;
+            await sleep(2200);
+          }
+        }
+
+        // Wait up to 4s until TokenX balance settles
+        const deadline = Date.now() + 4000;
+        let settled = await getSplTokenUiBalance(ownerPk, tokenXMint);
+        while (settled.atomic === 0n && Date.now() < deadline) {
+          await sleep(600);
+          settled = await getSplTokenUiBalance(ownerPk, tokenXMint);
+        }
+        if (settled.atomic === 0n && tokenXDecimals >= 0) {
+          throw new Error(`兑换 ${symA}/${symB} 后链上代币尚未到账，下一轮巡检将继续建仓`);
+        }
+      }
+    }
+
+    await raydium.account.fetchWalletTokenAccounts({
+      forceUpdate: true,
+      commitment: 'confirmed',
+    });
+
+    const latestBalA = await getSplTokenUiBalance(ownerPk, mintA);
+    const latestBalB = await getSplTokenUiBalance(ownerPk, mintB);
+    const availAAtomic =
+      mintA === SOL_MINT_ADDR
+        ? BigInt(Math.max(0, Number(latestBalA.atomic) - Math.floor(minSolReserve * 1e9)))
+        : latestBalA.atomic;
+    const availBAtomic =
+      mintB === SOL_MINT_ADDR
+        ? BigInt(Math.max(0, Number(latestBalB.atomic) - Math.floor(minSolReserve * 1e9)))
+        : latestBalB.atomic;
+
+    if (availAAtomic <= 0n || availBAtomic <= 0n) {
+      throw new Error(`开仓所需双边代币余额不足 (${symA}=${latestBalA.uiAmount.toFixed(4)}, ${symB}=${latestBalB.uiAmount.toFixed(4)})`);
+    }
+
+    const currentPrice = new Decimal(poolInfo.price);
+    const lowerPrice = currentPrice.mul(1 - safeRangePct / 100);
+    const upperPrice = currentPrice.mul(1 + safeRangePct / 100);
+    const lowerRes = TickUtil.getPriceAndTick({
+      price: lowerPrice,
+      mintADecimals: decA,
+      mintBDecimals: decB,
+      zeroForOne: true,
+      tickSpacing: poolInfo.config.tickSpacing,
+    });
+    const upperRes = TickUtil.getPriceAndTick({
+      price: upperPrice,
+      mintADecimals: decA,
+      mintBDecimals: decB,
+      zeroForOne: true,
+      tickSpacing: poolInfo.config.tickSpacing,
+    });
+
+    const tickLower = Math.min(lowerRes.tick, upperRes.tick);
+    const tickUpper =
+      Math.max(lowerRes.tick, upperRes.tick) <= tickLower
+        ? tickLower + poolInfo.config.tickSpacing * 2
+        : Math.max(lowerRes.tick, upperRes.tick);
+
+    const epochInfo = await solanaConnection.getEpochInfo('confirmed');
+
+    // Choose non-SOL/non-USDC side as base when present; otherwise MintB (USDC) capped to halfUsd
+    let base: 'MintA' | 'MintB' = !isSolA && !isUsdcA ? 'MintA' : !isSolB && !isUsdcB ? 'MintB' : isUsdcA ? 'MintA' : 'MintB';
+    let targetBaseAtomic: bigint;
+
+    if (base === 'MintA') {
+      const capByUsd =
+        isUsdcA
+          ? BigInt(Math.floor(halfUsd * 10 ** decA))
+          : isSolA
+          ? BigInt(Math.floor((halfUsd / solPriceUsd) * 10 ** decA))
+          : availAAtomic;
+      const capped = capByUsd < availAAtomic ? capByUsd : availAAtomic;
+      targetBaseAtomic = (capped * 92n) / 100n;
+    } else {
+      const capByUsd =
+        isUsdcB
+          ? BigInt(Math.floor(halfUsd * 10 ** decB))
+          : isSolB
+          ? BigInt(Math.floor((halfUsd / solPriceUsd) * 10 ** decB))
+          : availBAtomic;
+      const capped = capByUsd < availBAtomic ? capByUsd : availBAtomic;
+      targetBaseAtomic = (capped * 92n) / 100n;
+    }
+
+    if (targetBaseAtomic <= 0n) {
+      throw new Error(`测算开仓基础数量为 0 (${symA}/${symB})`);
+    }
+
+    let baseAmount = new BN(targetBaseAtomic.toString());
+    let liqRes = await PoolUtils.getLiquidityAmountOutFromAmountIn({
+      poolInfo,
+      inputA: base === 'MintA',
+      tickLower,
+      tickUpper,
+      amount: baseAmount,
+      slippage: 0.08,
+      add: true,
+      epochInfo,
+      amountHasFee: true,
+    });
+
+    let expectedOther = base === 'MintA' ? liqRes.amountB.amount : liqRes.amountA.amount;
+    let sdkSlippageOther =
+      base === 'MintA' ? liqRes.amountSlippageB.amount : liqRes.amountSlippageA.amount;
+    let otherAmountMaxStr = computeSafeClmmOtherAmountMax(
+      expectedOther.toString(),
+      sdkSlippageOther.toString(),
+      25
+    );
+    const availOtherAtomic = base === 'MintA' ? availBAtomic : availAAtomic;
+
+    // Auto-scale base down proportionally if otherAmountMax exceeds wallet's available balance
+    if (BigInt(otherAmountMaxStr) > (availOtherAtomic * 94n) / 100n) {
+      const maxAllowedOther = (availOtherAtomic * 90n) / 100n;
+      const scaledBase = (targetBaseAtomic * maxAllowedOther) / BigInt(otherAmountMaxStr);
+      if (scaledBase <= 0n) {
+        throw new Error(`对向代币余额不足以配比开仓 (${symA}/${symB})`);
+      }
+      baseAmount = new BN(scaledBase.toString());
+      liqRes = await PoolUtils.getLiquidityAmountOutFromAmountIn({
+        poolInfo,
+        inputA: base === 'MintA',
+        tickLower,
+        tickUpper,
+        amount: baseAmount,
+        slippage: 0.08,
+        add: true,
+        epochInfo,
+        amountHasFee: true,
+      });
+      expectedOther = base === 'MintA' ? liqRes.amountB.amount : liqRes.amountA.amount;
+      sdkSlippageOther =
+        base === 'MintA' ? liqRes.amountSlippageB.amount : liqRes.amountSlippageA.amount;
+      otherAmountMaxStr = computeSafeClmmOtherAmountMax(
+        expectedOther.toString(),
+        sdkSlippageOther.toString(),
+        25
+      );
+    }
+
+    const otherAmountMax = new BN(otherAmountMaxStr);
+    const { transaction, extInfo } = await raydium.clmm.openPositionFromBase({
+      poolInfo,
+      poolKeys,
+      tickLower,
+      tickUpper,
+      base,
+      ownerInfo: { useSOLBalance: true },
+      baseAmount,
+      otherAmountMax,
+      nft2022: true,
+      withMetadata: 'no-create',
+      txVersion: TxVersion.V0,
+      computeBudgetConfig: { units: 600_000, microLamports: 150_000 },
+    });
+
+    const sig = bs58.encode(transaction.signatures[0]);
+    const currentHeight = await solanaConnection.getBlockHeight('confirmed');
+    const txId = await sendAndConfirmRawWithRebroadcast(transaction, sig, currentHeight + 145);
+
+    const nftMint = extInfo.nftMint.toBase58();
+    lastLiveTestPosition = { poolId, nftMint };
+    await getWalletBalances(ownerPk);
+    await fetchActivePositions(true);
+
+    const amtAStr = (
+      Number((base === 'MintA' ? baseAmount : expectedOther).toString()) /
+      10 ** decA
+    ).toFixed(4);
+    const amtBStr = (
+      Number((base === 'MintB' ? baseAmount : expectedOther).toString()) /
+      10 ** decB
+    ).toFixed(4);
+
+    return {
+      poolId,
+      poolName: `${symA} / ${symB}`,
+      nftMint,
+      txId,
+      swapTxId,
+      tickLower,
+      tickUpper,
+      injectedSummary: `${amtAStr} ${symA} + ${amtBStr} ${symB} (±${safeRangePct}%)`,
+    };
+  } finally {
+    raydium.account.clearAccountChangeCkb();
+  }
+}
+
 async function runAddLpPipelineTest(mode: PipelineRunMode): Promise<PipelineStepResult> {
   const started = Date.now();
   let raydium: Raydium | null = null;
@@ -1174,7 +1731,7 @@ async function runAddLpPipelineTest(mode: PipelineRunMode): Promise<PipelineStep
     }
 
     const balances = await waitForUsdcVisibility(BACKEND_KEYPAIR.publicKey, 2500);
-    const rangePct = Math.max(strategyConfig.rangeWidthPct, 6);
+    const rangePct = Math.max(strategyConfig.rangeWidthPct, 4);
 
     if (balances.usdcBalance < 0.05) {
       return {
@@ -1237,7 +1794,7 @@ async function runAddLpPipelineTest(mode: PipelineRunMode): Promise<PipelineStep
     }
 
     const base: 'MintA' | 'MintB' = isMintAUsdc ? 'MintA' : 'MintB';
-    // Use up to 0.1 USDC (keeping a small safety buffer inside wallet USDC balance)
+    // Micro-test explicitly uses 0.1 USDC so test stays low-cost
     const usdcDepositUi = Math.max(
       0.05,
       Math.min(0.1, Number((balances.usdcBalance * 0.85).toFixed(4)))
@@ -1269,7 +1826,7 @@ async function runAddLpPipelineTest(mode: PipelineRunMode): Promise<PipelineStep
     const otherAmountMax = new BN(otherAmountMaxStr);
 
     const requiredSolForLp = Number(otherAmountMax.toString()) / 1e9;
-    const minNeededSol = requiredSolForLp + 0.02; // NFT rent (~0.018 SOL) + fee reserve
+    const minNeededSol = requiredSolForLp + 0.02;
     if (balances.solBalance < minNeededSol) {
       return {
         step: 'addLp',
@@ -1317,7 +1874,7 @@ async function runAddLpPipelineTest(mode: PipelineRunMode): Promise<PipelineStep
       txId,
       explorerUrl: `https://solscan.io/tx/${txId}`,
       positionNftMint: nftMint,
-      summary: `真实加池开仓成功！已向 ${symA}/${symB} 注入 ${depositLabel} + 约 ${(
+      summary: `真实小额测试开仓成功！已向 ${symA}/${symB} 注入 ${depositLabel} + 约 ${(
         Number(expectedOther.toString()) / 1e9
       ).toFixed(4)} SOL（±${rangePct}%）`,
       details: `Position NFT: ${maskSolanaAddress(nftMint)} · Tick [${tickLower}, ${tickUpper}] · TX: ${txId}`,
@@ -1732,6 +2289,176 @@ app.post('/api/ai/analyze', async (req, res) => {
   }
 });
 
+async function executeFullPortfolioDeployment(forceConsolidateDust = true): Promise<{
+  success: boolean;
+  dryRunBlocked?: boolean;
+  message: string;
+  closedDustCount: number;
+  openedPositions: Array<{ poolName: string; poolId: string; nftMint: string; txId: string; summary: string }>;
+  errors: string[];
+  portfolioPlan: AutoPortfolioPlan;
+}> {
+  const isDryRun = process.env.DRY_RUN !== 'false';
+  const targetWallet =
+    BACKEND_KEYPAIR?.publicKey ||
+    (isValidSolanaAddress(EFFECTIVE_WALLET_ADDRESS)
+      ? new PublicKey(EFFECTIVE_WALLET_ADDRESS)
+      : null);
+
+  const [balances, positions, poolsRes, solQuote] = await Promise.all([
+    targetWallet
+      ? getWalletBalances(targetWallet)
+      : Promise.resolve({ solBalance: 0, usdcBalance: 0, usdtBalance: 0, tokenAccountCount: 0 }),
+    fetchActivePositions(true),
+    fetchRealPools(),
+    fetchJupiterQuoteMetrics(0.1).catch(() => null),
+  ]);
+
+  if (solQuote) {
+    latestSolPriceUsd = Number((solQuote.outAmountUsdc * 10).toFixed(2));
+  }
+  const ranked = rankPools(poolsRes.pools, strategyConfig);
+
+  let portfolioPlan = calculateAutoPortfolioPlan({
+    solBalance: balances.solBalance,
+    usdcBalance: balances.usdcBalance,
+    solPriceUsd: latestSolPriceUsd,
+    activePositions: positions,
+    rankedPools: ranked,
+    config: strategyConfig,
+  });
+
+  if (!BACKEND_KEYPAIR) {
+    return {
+      success: false,
+      message: '后台 .env 尚未配置有效 PRIVATE_KEY，无法签名并广播建仓交易。',
+      closedDustCount: 0,
+      openedPositions: [],
+      errors: ['Missing PRIVATE_KEY'],
+      portfolioPlan,
+    };
+  }
+
+  if (isDryRun) {
+    return {
+      success: false,
+      dryRunBlocked: true,
+      message:
+        '当前服务器 .env 仍为 DRY_RUN=true 安全演练模式，已拦截真实资金动账。请先确认 DRY_RUN=false 后重启 pm2。',
+      closedDustCount: 0,
+      openedPositions: [],
+      errors: [],
+      portfolioPlan,
+    };
+  }
+
+  let closedDustCount = 0;
+  const openedPositions: Array<{ poolName: string; poolId: string; nftMint: string; txId: string; summary: string }> = [];
+  const errors: string[] = [];
+
+  // Step 1: Close <$1.50 test micro-positions if significant idle capital is sitting in wallet
+  let currentPositions = positions;
+  if (forceConsolidateDust && portfolioPlan.hasDustPositionToConsolidate) {
+    const dustList = currentPositions.filter((p) => p.injectedValueUsd > 0 && p.injectedValueUsd < 1.5);
+    for (const dust of dustList) {
+      try {
+        pushLog('info', `[全额资金激活] 正在平掉 $${dust.injectedValueUsd.toFixed(2)} 测试微仓（${dust.poolName}）并回收 ~0.018 SOL 租金...`);
+        const closed = await closeClmmPositionByNft(dust.nftMint);
+        closedDustCount += 1;
+        pushLog('success', `[微仓回收成功] 已注销测试仓位 NFT ${maskSolanaAddress(closed.closedNftMint)}，TX: ${closed.txId}`);
+        await sleep(1800);
+      } catch (err: any) {
+        const msg = formatChainError(err);
+        errors.push(`回收微仓失败: ${msg}`);
+        pushLog('error', `[微仓回收失败] ${msg}`);
+      }
+    }
+    if (closedDustCount > 0) {
+      const updatedBal = await getWalletBalances(BACKEND_KEYPAIR.publicKey);
+      currentPositions = await fetchActivePositions(true);
+      portfolioPlan = calculateAutoPortfolioPlan({
+        solBalance: updatedBal.solBalance,
+        usdcBalance: updatedBal.usdcBalance,
+        solPriceUsd: latestSolPriceUsd,
+        activePositions: currentPositions,
+        rankedPools: ranked,
+        config: strategyConfig,
+      });
+    }
+  }
+
+  // Step 2: Deploy into all planned slots not currently held
+  for (const slot of portfolioPlan.slotPlans) {
+    const alreadyHeld = currentPositions.some((p) => p.poolId === slot.poolId && p.injectedValueUsd >= 1.5);
+    if (alreadyHeld) continue;
+
+    // Recompute remaining available capital dynamically before opening slot 2
+    const balNow = await getWalletBalances(BACKEND_KEYPAIR.publicKey);
+    const availNowUsd = Math.max(0, balNow.solBalance - 0.028) * latestSolPriceUsd + balNow.usdcBalance;
+    const budgetForSlot = Math.min(slot.targetUsd, availNowUsd * 0.88);
+    if (budgetForSlot < 3) {
+      continue;
+    }
+
+    try {
+      pushLog(
+        'info',
+        `[多池全额建仓 #${slot.slotIndex}] 正在向【${slot.poolName}】(APR +${slot.apr}%) 注入 ~$${budgetForSlot.toFixed(2)}（±${slot.rangeWidthPct}% 集中区间）...`
+      );
+      const resOpen = await openRealClmmPoolPosition({
+        poolId: slot.poolId,
+        targetUsd: budgetForSlot,
+        rangeWidthPct: slot.rangeWidthPct,
+        solPriceUsd: latestSolPriceUsd,
+      });
+      openedPositions.push({
+        poolName: resOpen.poolName,
+        poolId: resOpen.poolId,
+        nftMint: resOpen.nftMint,
+        txId: resOpen.txId,
+        summary: resOpen.injectedSummary,
+      });
+      pushLog(
+        'success',
+        `[建仓成功 #${slot.slotIndex}] 已接入【${resOpen.poolName}】${resOpen.injectedSummary} · TX: ${resOpen.txId}`
+      );
+      await sleep(1800);
+    } catch (err: any) {
+      const msg = formatChainError(err);
+      errors.push(`${slot.poolName}: ${msg}`);
+      poolActionCooldownMs.set(slot.poolId, Date.now());
+      pushLog('error', `[建仓失败 #${slot.slotIndex}] ${slot.poolName}: ${msg}`);
+    }
+  }
+
+  const finalPositions = await fetchActivePositions(true);
+  const finalBalances = await getWalletBalances(BACKEND_KEYPAIR.publicKey);
+  const finalPlan = calculateAutoPortfolioPlan({
+    solBalance: finalBalances.solBalance,
+    usdcBalance: finalBalances.usdcBalance,
+    solPriceUsd: latestSolPriceUsd,
+    activePositions: finalPositions,
+    rankedPools: ranked,
+    config: strategyConfig,
+  });
+
+  const message =
+    openedPositions.length > 0
+      ? `已完成全额并发建仓！${closedDustCount > 0 ? `已清理 ${closedDustCount} 个 $0.20 微仓并` : ''}新开 ${openedPositions.length} 个实盘仓位（${openedPositions.map((o) => o.poolName).join(' + ')}），当前总在池资金 $${finalPlan.activeInjectedUsd.toFixed(2)}（利用率 ${finalPlan.utilizationPct}%）。`
+      : errors.length > 0
+      ? `执行建仓遇到异常: ${errors.join(' | ')}`
+      : `当前钱包已有活跃满额仓位 $${finalPlan.activeInjectedUsd.toFixed(2)}（利用率 ${finalPlan.utilizationPct}%），无需重复开仓。`;
+
+  return {
+    success: openedPositions.length > 0 || errors.length === 0,
+    message,
+    closedDustCount,
+    openedPositions,
+    errors,
+    portfolioPlan: finalPlan,
+  };
+}
+
 async function runAutoStrategyTick(): Promise<{
   success: boolean;
   conclusion: string;
@@ -1751,17 +2478,28 @@ async function runAutoStrategyTick(): Promise<{
   try {
     const isDryRun = process.env.DRY_RUN !== 'false';
     const hasKey = Boolean(BACKEND_KEYPAIR);
-    const activePositions = await fetchActivePositions(false);
+    const walletPk =
+      BACKEND_KEYPAIR?.publicKey ||
+      (isValidSolanaAddress(EFFECTIVE_WALLET_ADDRESS)
+        ? new PublicKey(EFFECTIVE_WALLET_ADDRESS)
+        : null);
 
-    const [{ pools }, solQuote] = await Promise.all([
+    const [activePositionsInitial, balancesInitial, poolsRes, solQuote] = await Promise.all([
+      fetchActivePositions(false),
+      walletPk
+        ? getWalletBalances(walletPk)
+        : Promise.resolve({ solBalance: 0, usdcBalance: 0, usdtBalance: 0, tokenAccountCount: 0 }),
       fetchRealPools(),
       fetchJupiterQuoteMetrics(0.1).catch(() => null),
     ]);
-    const jupiterImpactBps = solQuote ? Math.round(solQuote.priceImpactPct * 10000) : null;
-    const solPriceUsd = solQuote ? Number((solQuote.outAmountUsdc * 10).toFixed(2)) : null;
 
-    const ranked = rankPools(pools, strategyConfig);
-    recordSelectionRound(ranked, jupiterImpactBps, solPriceUsd);
+    const jupiterImpactBps = solQuote ? Math.round(solQuote.priceImpactPct * 10000) : null;
+    if (solQuote) {
+      latestSolPriceUsd = Number((solQuote.outAmountUsdc * 10).toFixed(2));
+    }
+
+    const ranked = rankPools(poolsRes.pools, strategyConfig);
+    recordSelectionRound(ranked, jupiterImpactBps, latestSolPriceUsd);
 
     const eligiblePools = ranked.filter((p) => p.eligibleFor200U);
     const bluechipFallback = ranked.find((p) => p.isBluechip && p.tvl >= 500_000);
@@ -1772,62 +2510,135 @@ async function runAutoStrategyTick(): Promise<{
       .slice(0, 4)
       .map((p) => `${p.name}: ${p.selectionReason || '风控淘汰'}`);
 
+    let activePositions = activePositionsInitial;
+    let portfolioPlan = calculateAutoPortfolioPlan({
+      solBalance: balancesInitial.solBalance,
+      usdcBalance: balancesInitial.usdcBalance,
+      solPriceUsd: latestSolPriceUsd,
+      activePositions,
+      rankedPools: ranked,
+      config: strategyConfig,
+    });
+
     let conclusion = '';
     let actionTaken = 'IDLE';
 
-    if (activePositions.length > 0) {
-      const pos = activePositions[0];
-      conclusion = `当前持仓做市中：【${pos.poolName}】（已注资 $${pos.injectedValueUsd.toFixed(2)}，浮盈亏 ${pos.unrealizedPnlPct}%，待领手续费 $${pos.uncollectedFeeUsd.toFixed(2)}）。`;
-
+    // Stop-loss monitoring across ALL active positions
+    for (const pos of activePositions) {
       if (pos.unrealizedPnlPct <= -Math.abs(strategyConfig.stopLossPercentage)) {
-        conclusion += ` 回撤触及 -${strategyConfig.stopLossPercentage}% 止损线！`;
         if (isDryRun) {
           actionTaken = 'DRY_RUN_STOP_LOSS';
-          pushLog('warning', `[演练止损] 仓位 ${pos.poolName} 浮亏达 ${pos.unrealizedPnlPct}%，触及 -${strategyConfig.stopLossPercentage}% 止损线（DRY_RUN 模式已模拟拦截）。`);
-        } else {
+          conclusion = `[演练止损] 仓位 ${pos.poolName} 浮亏达 ${pos.unrealizedPnlPct}%，触及 -${strategyConfig.stopLossPercentage}% 止损线（DRY_RUN 模式已模拟拦截）。`;
+          pushLog('warning', conclusion);
+        } else if (hasKey) {
           actionTaken = 'LIVE_STOP_LOSS';
           pushLog('warning', `[实盘止损] 仓位 ${pos.poolName} 触发 -${strategyConfig.stopLossPercentage}% 止损线，正在自动执行撤池关仓退租...`);
-          await runRemoveLpPipelineTest('live');
+          await closeClmmPositionByNft(pos.nftMint).catch((e) =>
+            pushLog('error', `[实盘止损撤池失败] ${formatChainError(e)}`)
+          );
+          activePositions = await fetchActivePositions(true);
         }
-      } else if (pos.uncollectedFeeUsd >= strategyConfig.harvestMinUsd) {
-        conclusion += ` 待领手续费已达到 $${strategyConfig.harvestMinUsd} 经济收割线。`;
-        actionTaken = 'HARVEST_PENDING';
-      } else {
-        actionTaken = 'HOLD_EARNING_FEES';
       }
-    } else {
-      // 0 active positions
+    }
+
+    if (actionTaken === 'IDLE') {
       if (!hasKey) {
         conclusion = '当前为纯策略观察模式（服务器后台 .env 未注入有效 PRIVATE_KEY），系统持续进行只读风控巡检，不生成虚假开仓。';
         actionTaken = 'READONLY_INSPECTION';
       } else if (isDryRun) {
-        conclusion = `【安全演练保护中】DRY_RUN=true 阻止了真实资金开仓。后台已成功锁定最优矿池【${topCandidate?.name || 'WSOL/USDC'}】（年化 +${topCandidate?.apr || 0}%），所有风控检查通过；系统已安全拦截真实扣款。若要实盘开仓，请在服务器 .env 中设 DRY_RUN=false 并执行 pm2 restart all。`;
+        conclusion = `【安全演练保护中】DRY_RUN=true 阻止了真实资金动账。${portfolioPlan.diagnosisNote}`;
         actionTaken = 'DRY_RUN_ENTRY_SIMULATED';
       } else {
-        // DRY_RUN === false & hasKey
-        const balances = await getWalletBalances(BACKEND_KEYPAIR!.publicKey);
-        if (balances.solBalance < 0.025) {
-          conclusion = `钱包可用 SOL 不足：当前仅 ${balances.solBalance.toFixed(4)} SOL，无法支付开仓临时 NFT 租金（~0.018 SOL，退仓时全额退回）与 Gas 费。`;
-          actionTaken = 'INSUFFICIENT_SOL';
-          pushLog('warning', `[自动加池拦截] 可用 SOL 仅 ${balances.solBalance.toFixed(4)}，不足 0.025 SOL 租金门槛。`);
-        } else {
-          // If USDC balance < 0.05, auto-swap 0.01 SOL to USDC via Jupiter first!
-          if (balances.usdcBalance < 0.05 && balances.solBalance >= 0.035) {
-            pushLog('info', `[自动流动性配平] 钱包持有 ${balances.solBalance.toFixed(4)} SOL 但缺少 USDC，正在通过 Jupiter 自动将 0.01 SOL 换为 USDC...`);
-            await runSwapPipelineTest('live', 'SOL');
-            await new Promise((r) => setTimeout(r, 2500));
+        // LIVE mode (DRY_RUN=false & hasKey)
+        const dustPositions = activePositions.filter(
+          (p) => p.injectedValueUsd > 0 && p.injectedValueUsd < 1.5
+        );
+        const needConsolidate = portfolioPlan.hasDustPositionToConsolidate && dustPositions.length > 0;
+        const missingSlot = portfolioPlan.slotPlans.find(
+          (slot) => !activePositions.some((p) => p.poolId === slot.poolId && p.injectedValueUsd >= 1.5)
+        );
+        const nowMs = Date.now();
+        const cooldownOk = (key: string) => nowMs - (poolActionCooldownMs.get(key) || 0) >= 90_000;
+
+        if ((needConsolidate || missingSlot) && balancesInitial.solBalance >= 0.028) {
+          if (needConsolidate && cooldownOk('dust-consolidate')) {
+            poolActionCooldownMs.set('dust-consolidate', nowMs);
+            for (const dust of dustPositions) {
+              try {
+                pushLog('info', `[自动清理测试微仓] 检测到 $${dust.injectedValueUsd.toFixed(2)} 微仓而钱包闲置 $${portfolioPlan.idleDeployableUsd.toFixed(2)}，正在回收微仓与 0.018 SOL 租金...`);
+                await closeClmmPositionByNft(dust.nftMint);
+                await sleep(1600);
+              } catch (err: any) {
+                pushLog('error', `[微仓回收失败] ${formatChainError(err)}`);
+              }
+            }
+            activePositions = await fetchActivePositions(true);
+            const balAfter = await getWalletBalances(BACKEND_KEYPAIR!.publicKey);
+            portfolioPlan = calculateAutoPortfolioPlan({
+              solBalance: balAfter.solBalance,
+              usdcBalance: balAfter.usdcBalance,
+              solPriceUsd: latestSolPriceUsd,
+              activePositions,
+              rankedPools: ranked,
+              config: strategyConfig,
+            });
           }
-          pushLog('info', `[自动策略开仓] 条件全部满足，正在向【${topCandidate?.name || 'WSOL/USDC'}】注入集中做市流动性...`);
-          const lpResult = await runAddLpPipelineTest('live');
-          if (lpResult.status === 'passed') {
-            conclusion = `实盘自动加池开仓成功！已接入【${topCandidate?.name}】，仓位 NFT: ${maskSolanaAddress(lpResult.positionNftMint || '')}。`;
+
+          // Open any unallocated slot with real capital (respecting 90s cooldown per pool)
+          let openedAny = false;
+          for (const slot of portfolioPlan.slotPlans) {
+            const held = activePositions.some((p) => p.poolId === slot.poolId && p.injectedValueUsd >= 1.5);
+            if (held || !cooldownOk(slot.poolId)) continue;
+
+            const balNow = await getWalletBalances(BACKEND_KEYPAIR!.publicKey);
+            const availNowUsd = Math.max(0, balNow.solBalance - 0.028) * latestSolPriceUsd + balNow.usdcBalance;
+            const slotBudget = Math.min(slot.targetUsd, availNowUsd * 0.88);
+            if (slotBudget < 4) continue;
+
+            poolActionCooldownMs.set(slot.poolId, Date.now());
+            try {
+              pushLog('info', `[自动全额多池建仓 #${slot.slotIndex}] 正在接入【${slot.poolName}】(APR +${slot.apr}%)，目标投入 ~$${slotBudget.toFixed(2)} (±${slot.rangeWidthPct}%)...`);
+              const opened = await openRealClmmPoolPosition({
+                poolId: slot.poolId,
+                targetUsd: slotBudget,
+                rangeWidthPct: slot.rangeWidthPct,
+                solPriceUsd: latestSolPriceUsd,
+              });
+              openedAny = true;
+              pushLog('success', `[自动建仓完成] ${opened.poolName} (${opened.injectedSummary}) · TX: ${opened.txId}`);
+              await sleep(1500);
+            } catch (err: any) {
+              pushLog('error', `[自动建仓失败] ${slot.poolName}: ${formatChainError(err)}`);
+            }
+          }
+
+          if (openedAny) {
+            activePositions = await fetchActivePositions(true);
+            const finalBal = await getWalletBalances(BACKEND_KEYPAIR!.publicKey);
+            portfolioPlan = calculateAutoPortfolioPlan({
+              solBalance: finalBal.solBalance,
+              usdcBalance: finalBal.usdcBalance,
+              solPriceUsd: latestSolPriceUsd,
+              activePositions,
+              rankedPools: ranked,
+              config: strategyConfig,
+            });
             actionTaken = 'LIVE_OPENED';
-            pushLog('success', `[自动加池完成] TX: ${lpResult.txId || 'confirmed'}`);
+            conclusion = `实盘自动全额建仓完成！当前在池 ${activePositions.length} 个仓位，合计注入 $${portfolioPlan.activeInjectedUsd.toFixed(2)}（资金利用率 ${portfolioPlan.utilizationPct}%）。`;
           } else {
-            conclusion = `实盘自动加池未完成：${lpResult.summary}`;
-            actionTaken = 'LIVE_OPEN_FAILED';
-            pushLog('error', `[自动加池失败] ${lpResult.summary}`);
+            actionTaken = activePositions.length > 0 ? 'HOLD_EARNING_FEES' : 'LIVE_OPEN_COOLDOWN';
+            conclusion = portfolioPlan.diagnosisNote;
           }
+        } else if (activePositions.length > 0) {
+          const totalFeeUsd = activePositions.reduce((s, p) => s + p.uncollectedFeeUsd, 0);
+          actionTaken = totalFeeUsd >= strategyConfig.harvestMinUsd ? 'HARVEST_PENDING' : 'HOLD_EARNING_FEES';
+          conclusion = `正在做市中：共 ${activePositions.length} 个仓位合计注入 $${portfolioPlan.activeInjectedUsd.toFixed(2)}（资金利用率 ${portfolioPlan.utilizationPct}%），待领手续费 $${totalFeeUsd.toFixed(2)}。`;
+        } else if (balancesInitial.solBalance < 0.028) {
+          actionTaken = 'INSUFFICIENT_SOL';
+          conclusion = `钱包可用 SOL 仅 ${balancesInitial.solBalance.toFixed(4)}，不足 0.028 SOL 开仓租金与 Gas 门槛。`;
+        } else {
+          actionTaken = 'WAIT_CAPITAL';
+          conclusion = portfolioPlan.diagnosisNote;
         }
       }
     }
@@ -1838,6 +2649,10 @@ async function runAutoStrategyTick(): Promise<{
       walletAddress: BACKEND_KEYPAIR ? BACKEND_KEYPAIR.publicKey.toBase58() : EFFECTIVE_WALLET_ADDRESS,
       recipientAddress: BACKEND_RECIPIENT_RAW,
       activePositionsCount: activePositions.length,
+      walletUsdcBalance: Number(balancesInitial.usdcBalance.toFixed(4)),
+      walletSolBalance: balancesInitial.solBalance,
+      solPriceUsd: latestSolPriceUsd,
+      portfolioPlan,
       bestCandidatePool: topCandidate
         ? {
             name: topCandidate.name,
@@ -1901,10 +2716,43 @@ app.post('/api/strategy/auto-tick', async (_req, res) => {
   });
 });
 
+app.post('/api/strategy/deploy-full', async (req, res) => {
+  try {
+    const requestedProfile = req.body?.riskProfile as RiskProfileKey | undefined;
+    if (
+      requestedProfile === 'ultra-safe' ||
+      requestedProfile === 'balanced-steady' ||
+      requestedProfile === 'active-yield' ||
+      requestedProfile === 'turbo-high-yield'
+    ) {
+      strategyConfig = buildPresetForCapital(strategyConfig.capitalUsdt, requestedProfile);
+      pushLog('info', `已切换为【${requestedProfile === 'turbo-high-yield' ? '极速高收益突击型 ±4% 双仓' : requestedProfile}】并发起全额多池建仓。`);
+    }
+
+    const deployRes = await executeFullPortfolioDeployment(true);
+    await runAutoStrategyTick();
+
+    res.json({
+      ...deployRes,
+      strategyConfig,
+      backendStatus: getLiveBackendStatus(),
+      activePositions: cachedActivePositions,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: formatChainError(err) });
+  }
+});
+
 app.post('/api/strategy/preset-optimize', async (req, res) => {
   try {
     const { target } = req.body || {};
-    if (target === 'bluechip-optimized') {
+    if (target === 'turbo-high-yield') {
+      strategyConfig = buildPresetForCapital(strategyConfig.capitalUsdt, 'turbo-high-yield');
+      pushLog(
+        'success',
+        '已一键升级【极速高收益突击型】：45% ±4% 蓝筹窄区间 + 55% 全网第一高 APR 卫星池 · $0.5 极速复利。'
+      );
+    } else if (target === 'bluechip-optimized') {
       strategyConfig = {
         ...strategyConfig,
         minAPR: 35,

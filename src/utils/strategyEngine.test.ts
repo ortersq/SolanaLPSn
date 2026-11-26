@@ -5,6 +5,7 @@ import {
   assessLiveTestWalletReadiness,
   buildPresetForCapital,
   buildSelectionRoundFromPools,
+  calculateAutoPortfolioPlan,
   calculateImpermanentLossPct,
   calculateLpDepositAmounts,
   calculatePositionMetrics,
@@ -313,4 +314,99 @@ test('buildSelectionRoundFromPools creates a comprehensive round record with win
   assert.equal(round.candidateCount, 2);
   assert.ok(round.rejectedSamples.some((r) => r.name === 'MEME / SOL'));
   assert.ok(round.strategyAction.includes('WSOL / USDC'));
+});
+
+test('calculatePositionMetrics accurately prices Token/USDC non-SOL pairs', () => {
+  const cardsUsdc = calculatePositionMetrics({
+    currentPrice: 0.25, // $0.25 USDC per CARDS
+    priceLower: 0.23,
+    priceUpper: 0.27,
+    amountA: 40, // 40 CARDS = $10
+    amountB: 10, // 10 USDC = $10
+    tokenASymbol: 'CARDS',
+    tokenBSymbol: 'USDC',
+    uncollectedFeeUsd: 0.42,
+  });
+  assert.equal(cardsUsdc.inRange, true);
+  assert.equal(cardsUsdc.injectedValueUsd, 20);
+  assert.equal(cardsUsdc.unrealizedPnlUsd, 0.42);
+  assert.equal(cardsUsdc.unrealizedPnlPct, 2.1);
+});
+
+test('turbo-high-yield unlocks high-APR pools and calculateAutoPortfolioPlan detects $0.20 dust vs idle wallet equity', () => {
+  const turboCfg = buildPresetForCapital(200, 'turbo-high-yield');
+  assert.equal(turboCfg.rangeWidthPct, 4);
+  assert.equal(turboCfg.minTVL, 300_000);
+  assert.equal(turboCfg.harvestMinUsd, 0.5);
+
+  const pools: PoolMetrics[] = [
+    {
+      id: '3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv',
+      name: 'WSOL / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: '3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv',
+      tvl: 5_648_896,
+      volume24h: 21_068_801,
+      apr: 54.5,
+      feeTier: '0.04%',
+      priceUsd: '68.0',
+      safetyScore: 96,
+      ilRisk: '低',
+    },
+    {
+      id: 'FjuBy7jjf9DXj9d3R7cHpvcnoFW2iQxf7F7P3vqx4Jza',
+      name: 'SPCX / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'FjuBy7jjf9DXj9d3R7cHpvcnoFW2iQxf7F7P3vqx4Jza',
+      tvl: 2_223_318,
+      volume24h: 4_212_853,
+      apr: 173.1,
+      feeTier: '0.25%',
+      priceUsd: '1.25',
+      safetyScore: 92,
+      ilRisk: '中',
+    },
+    {
+      id: 'HnhpJPJgBG2KwniMTNW8cVBHvk1hFog3RC3kjnyc23tD',
+      name: 'CARDS / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'HnhpJPJgBG2KwniMTNW8cVBHvk1hFog3RC3kjnyc23tD',
+      tvl: 3_286_414,
+      volume24h: 2_294_344,
+      apr: 101.9,
+      feeTier: '0.40%',
+      priceUsd: '0.25',
+      safetyScore: 92,
+      ilRisk: '中',
+    },
+  ];
+
+  const ranked = rankPools(pools, turboCfg);
+  assert.ok(ranked.every((p) => p.eligibleFor200U));
+
+  const plan = calculateAutoPortfolioPlan({
+    solBalance: 0.218551,
+    usdcBalance: 16.2,
+    solPriceUsd: 68,
+    activePositions: [
+      {
+        poolId: '3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv',
+        poolName: 'WSOL / USDC',
+        injectedValueUsd: 0.2,
+        inRange: true,
+      },
+    ],
+    rankedPools: ranked,
+    config: turboCfg,
+  });
+
+  assert.equal(plan.hasDustPositionToConsolidate, true);
+  assert.equal(plan.dustPositionUsd, 0.2);
+  assert.ok(plan.idleDeployableUsd > 25);
+  assert.ok(plan.utilizationPct < 2);
+  assert.equal(plan.slotPlans.length, 2);
+  assert.equal(plan.slotPlans[0].poolName, 'WSOL / USDC');
+  assert.equal(plan.slotPlans[1].poolName, 'SPCX / USDC');
+  assert.ok(plan.slotPlans[0].targetUsd > 10);
+  assert.ok(plan.slotPlans[1].targetUsd > 10);
 });

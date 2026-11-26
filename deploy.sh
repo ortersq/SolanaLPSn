@@ -93,7 +93,8 @@ if [ "$OVERWRITE_ENV" = "y" ]; then
   fi
 
   read -r -p "请输入前端概览脱敏展示的观测钱包公钥（可选，直接回车跳过）: " INPUT_WATCH < /dev/tty || INPUT_WATCH=""
-  read -r -p "请输入投入资金策略档位 [1=稳健平衡型(默认) / 2=极稳保守型 / 3=进取增效型]: " PROFILE_CHOICE < /dev/tty || PROFILE_CHOICE="1"
+  read -r -p "请输入投入资金策略档位 [1=稳健平衡型(默认) / 2=极稳保守型 / 3=进取增效型 / 4=极速高收益突击型]: " PROFILE_CHOICE < /dev/tty || PROFILE_CHOICE="1"
+  HARVEST_MIN_USD="2.5"
 
   case "${PROFILE_CHOICE}" in
     2)
@@ -109,8 +110,18 @@ if [ "$OVERWRITE_ENV" = "y" ]; then
       MIN_TVL_USD="500000"
       MIN_APR="60"
       RANGE_WIDTH_PCT="6"
+      HARVEST_MIN_USD="2.0"
       STOP_LOSS_PCT="8"
       SLIPPAGE_BPS="60"
+      ;;
+    4)
+      RISK_PROFILE="turbo-high-yield"
+      MIN_TVL_USD="300000"
+      MIN_APR="45"
+      RANGE_WIDTH_PCT="4"
+      HARVEST_MIN_USD="0.5"
+      STOP_LOSS_PCT="10"
+      SLIPPAGE_BPS="80"
       ;;
     *)
       RISK_PROFILE="balanced-steady"
@@ -132,7 +143,7 @@ CAPITAL_USDT=200
 MIN_TVL_USD=${MIN_TVL_USD}
 MIN_APR=${MIN_APR}
 RANGE_WIDTH_PCT=${RANGE_WIDTH_PCT}
-HARVEST_MIN_USD=2.5
+HARVEST_MIN_USD=${HARVEST_MIN_USD}
 STOP_LOSS_PCT=${STOP_LOSS_PCT}
 SLIPPAGE_BPS=${SLIPPAGE_BPS}
 DRY_RUN=true

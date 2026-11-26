@@ -23,6 +23,7 @@ import {
 import {
   ActiveLpPosition,
   ApiKeyRequirement,
+  AutoPortfolioPlan,
   PipelineRunMode,
   PipelineStepKey,
   PipelineStepResult,
@@ -64,6 +65,10 @@ export interface StrategyDiagnostic {
   walletAddress: string;
   recipientAddress: string;
   activePositionsCount: number;
+  walletUsdcBalance?: number;
+  walletSolBalance?: number;
+  solPriceUsd?: number;
+  portfolioPlan?: AutoPortfolioPlan;
   bestCandidatePool: {
     name: string;
     dex: string;
@@ -120,6 +125,7 @@ interface OverviewProps {
   onRunRiskScan: () => Promise<void>;
   onRefreshPositions?: () => Promise<void>;
   onUpdateBackendStatus: (status: BackendStatus) => void;
+  onUpdateStrategyConfig?: (config: StrategyConfig) => void;
   onGoToStrategy: () => void;
   onGoToPools: () => void;
 }
@@ -223,6 +229,7 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
   onRunRiskScan,
   onRefreshPositions,
   onUpdateBackendStatus,
+  onUpdateStrategyConfig,
   onGoToStrategy,
   onGoToPools,
 }) => {
@@ -231,25 +238,31 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
   const [roundFilter, setRoundFilter] = useState<'all' | 'winner-only' | 'rejected-only'>('all');
   const [refreshingPositions, setRefreshingPositions] = useState(false);
   const [optimizingPreset, setOptimizingPreset] = useState(false);
+  const [deployingFull, setDeployingFull] = useState(false);
   const [triggeringAutoTick, setTriggeringAutoTick] = useState(false);
   const [optimizeMessage, setOptimizeMessage] = useState('');
 
-  const handleOptimizePreset = async () => {
+  const handleOptimizePreset = async (target: 'bluechip-optimized' | 'turbo-high-yield' = 'turbo-high-yield') => {
     setOptimizingPreset(true);
     setOptimizeMessage('');
     try {
       const res = await fetch('/api/strategy/preset-optimize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: 'bluechip-optimized' }),
+        body: JSON.stringify({ target }),
       });
       const data = await res.json();
       if (data.success) {
+        if (data.strategyConfig && onUpdateStrategyConfig) {
+          onUpdateStrategyConfig(data.strategyConfig);
+        }
         if (data.backendStatus) {
           onUpdateBackendStatus(data.backendStatus);
         }
         setOptimizeMessage(
-          '已一键放宽并适配为【蓝筹稳健参数】(MIN_APR=35% · TVL≥$1.0M · 区间±8%)！'
+          target === 'turbo-high-yield'
+            ? '已升级【极速高收益突击型】(±4%超窄区间 · 45%核心 + 55%全网第一高APR卫星池 · $0.5 极速复利)！'
+            : '已一键放宽并适配为【蓝筹稳健参数】(MIN_APR=35% · TVL≥$1.0M · 区间±8%)！'
         );
         if (onRefreshPositions) await onRefreshPositions();
       }
@@ -257,6 +270,39 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
       setOptimizeMessage(`优化失败: ${e.message}`);
     } finally {
       setOptimizingPreset(false);
+    }
+  };
+
+  const handleDeployFullCapital = async () => {
+    setDeployingFull(true);
+    setOptimizeMessage('');
+    try {
+      const res = await fetch('/api/strategy/deploy-full', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ riskProfile: 'turbo-high-yield' }),
+      });
+      const data = await res.json();
+      if (data.strategyConfig && onUpdateStrategyConfig) {
+        onUpdateStrategyConfig(data.strategyConfig);
+      }
+      if (data.backendStatus) {
+        onUpdateBackendStatus(data.backendStatus);
+      }
+      if (data.dryRunBlocked) {
+        setOptimizeMessage(
+          '当前服务器仍处于 DRY_RUN=true 演练模式：已生成双池全额方案，请确认 .env 中 DRY_RUN=false 并执行 pm2 restart all --update-env 即可自动实盘建仓。'
+        );
+      } else if (data.message) {
+        setOptimizeMessage(data.message);
+      } else if (!data.success && data.error) {
+        setOptimizeMessage(`建仓提示: ${data.error}`);
+      }
+      if (onRefreshPositions) await onRefreshPositions();
+    } catch (e: any) {
+      setOptimizeMessage(`全额建仓请求异常: ${e.message}`);
+    } finally {
+      setDeployingFull(false);
     }
   };
 
@@ -580,24 +626,34 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
                 type="button"
                 disabled={triggeringAutoTick}
                 onClick={handleTriggerAutoTick}
-                className="px-3 py-1 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md transition-colors cursor-pointer flex items-center gap-1.5"
+                className="px-3 py-1.5 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md transition-colors cursor-pointer flex items-center gap-1.5"
               >
                 <RefreshCw className={`w-3 h-3 ${triggeringAutoTick ? 'animate-spin text-emerald-400' : ''}`} />
-                <span>立即执行一次自动决策与巡检</span>
+                <span>立即巡检</span>
               </button>
 
               <button
                 type="button"
                 disabled={optimizingPreset}
-                onClick={handleOptimizePreset}
-                className="px-3 py-1 text-xs font-semibold text-slate-950 bg-emerald-400 hover:bg-emerald-300 rounded-md transition-colors cursor-pointer flex items-center gap-1.5"
+                onClick={() => handleOptimizePreset('turbo-high-yield')}
+                className="px-3 py-1.5 text-xs font-semibold text-amber-200 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 rounded-md transition-colors cursor-pointer flex items-center gap-1.5"
               >
-                {optimizingPreset ? (
+                <Sparkles className="w-3 h-3 text-amber-400" />
+                <span>切换极速高收益 (±4%双仓)</span>
+              </button>
+
+              <button
+                type="button"
+                disabled={deployingFull}
+                onClick={handleDeployFullCapital}
+                className="px-3 py-1.5 text-xs font-semibold text-slate-950 bg-emerald-400 hover:bg-emerald-300 rounded-md transition-colors cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
+              >
+                {deployingFull ? (
                   <RefreshCw className="w-3 h-3 animate-spin" />
                 ) : (
                   <Wrench className="w-3 h-3" />
                 )}
-                <span>一键优化为蓝筹稳健做市（放宽至 35% APR / $1.0M 深度）</span>
+                <span>{deployingFull ? '正在清理微仓并全额建仓...' : '一键清理微仓并全额多池建仓'}</span>
               </button>
             </div>
           </div>
@@ -624,7 +680,7 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
               <div className="p-2 rounded bg-slate-900/60 border border-slate-800/50">
                 <span className="text-slate-500 block">选池门槛:</span>
                 <span className="text-slate-200">
-                  MIN_APR ≥ {strategyConfig.minAPR}% · TVL ≥ ${(strategyConfig.minTVL / 1e6).toFixed(1)}M
+                  MIN_APR ≥ {strategyConfig.minAPR}% · TVL ≥ ${(strategyConfig.minTVL / 1e6).toFixed(2)}M
                 </span>
               </div>
               <div className="p-2 rounded bg-slate-900/60 border border-slate-800/50">
@@ -634,20 +690,52 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
                 </span>
               </div>
               <div className="p-2 rounded bg-slate-900/60 border border-slate-800/50">
-                <span className="text-slate-500 block">当前运行环境:</span>
-                <span className={((backendStatus.workerStatus?.dryRun ?? backendStatus.dryRunMode)) ? 'text-amber-400' : 'text-emerald-400'}>
-                  {((backendStatus.workerStatus?.dryRun ?? backendStatus.dryRunMode)) ? 'DRY_RUN=true 演练中' : '实盘自动运行中'}
+                <span className="text-slate-500 block">钱包总权益 & 闲置率:</span>
+                <span className="text-emerald-400">
+                  {backendStatus.strategyDiagnostic?.portfolioPlan
+                    ? `总资产 $${backendStatus.strategyDiagnostic.portfolioPlan.walletTotalUsd.toFixed(2)} · 利用率 ${backendStatus.strategyDiagnostic.portfolioPlan.utilizationPct}%`
+                    : ((backendStatus.workerStatus?.dryRun ?? backendStatus.dryRunMode) ? 'DRY_RUN=true 演练中' : '实盘自动运行中')}
                 </span>
               </div>
               <div className="p-2 rounded bg-slate-900/60 border border-slate-800/50">
                 <span className="text-slate-500 block">活跃仓位检测:</span>
                 <span className="text-slate-200">
                   {(backendStatus.activePositions && backendStatus.activePositions.length > 0)
-                    ? `${backendStatus.activePositions.length} 个活跃 CLMM 仓位`
+                    ? `${backendStatus.activePositions.length} 个活跃仓位 ($${backendStatus.activePositions.reduce((s, p) => s + p.injectedValueUsd, 0).toFixed(2)})`
                     : '0 活跃仓位（空仓待入）'}
                 </span>
               </div>
             </div>
+
+            {backendStatus.strategyDiagnostic?.portfolioPlan &&
+              backendStatus.strategyDiagnostic.portfolioPlan.idleDeployableUsd >= 6 &&
+              (backendStatus.strategyDiagnostic.portfolioPlan.hasDustPositionToConsolidate ||
+                (backendStatus.activePositions?.length || 0) <
+                  backendStatus.strategyDiagnostic.portfolioPlan.targetSlots) && (
+                <div className="p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs space-y-2">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="text-amber-200 font-medium flex items-center gap-1.5">
+                      <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                      <span>
+                        {backendStatus.strategyDiagnostic.portfolioPlan.diagnosisNote}
+                      </span>
+                    </div>
+                  </div>
+                  {backendStatus.strategyDiagnostic.portfolioPlan.slotPlans.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-slate-300">
+                      <span className="text-slate-400">规划并发双池方案:</span>
+                      {backendStatus.strategyDiagnostic.portfolioPlan.slotPlans.map((slot) => (
+                        <span
+                          key={slot.poolId}
+                          className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-emerald-300"
+                        >
+                          #{slot.slotIndex} {slot.poolName} (~${slot.targetUsd.toFixed(1)} · APR +{slot.apr}% · ±{slot.rangeWidthPct}%)
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
 
             {optimizeMessage && (
               <div className="p-2 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 flex items-center gap-2">
@@ -1355,6 +1443,8 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
                 ? '极稳保守型'
                 : strategyConfig.riskProfile === 'active-yield'
                 ? '进取增效型 · 双仓窄区间'
+                : strategyConfig.riskProfile === 'turbo-high-yield'
+                ? '极速高收益突击型 · ±4%双仓'
                 : '稳健平衡型'}
               ）
             </h2>
