@@ -496,6 +496,7 @@ let lastAutoOpenOrRotateAt = 0;
 const poolTvlBaselineMap = new Map<string, number>();
 let lastAutoRebalanceAt = 0;
 const poolDepletionStreakMap = new Map<string, number>();
+const poolOutOfRangeStreakMap = new Map<string, number>();
 let lastAutoSafeWithdrawAt = 0;
 let lastAutoCompoundAt = 0;
 let lastMultiHedgeAt = 0;
@@ -1846,11 +1847,18 @@ async function executeJupiterTokenSwap(params: {
   outputMint: string;
   amountAtomic: string | number | bigint;
   slippageBps?: number;
+  urgent?: boolean;
 }): Promise<{ txId: string; outAmountAtomic: string }> {
   if (!BACKEND_KEYPAIR) {
     throw new Error('后台 .env 未配置有效 PRIVATE_KEY');
   }
-  const { inputMint, outputMint, amountAtomic, slippageBps = Math.max(strategyConfig.slippageBps, 100) } = params;
+  const {
+    inputMint,
+    outputMint,
+    amountAtomic,
+    slippageBps = Math.max(strategyConfig.slippageBps, 100),
+    urgent = false,
+  } = params;
 
   const fetchPrepared = async () => {
     const qCtrl = new AbortController();
@@ -1874,8 +1882,8 @@ async function executeJupiterTokenSwap(params: {
         dynamicComputeUnitLimit: true,
         prioritizationFeeLamports: {
           priorityLevelWithMaxLamports: {
-            maxLamports: 350_000,
-            priorityLevel: 'high',
+            maxLamports: urgent ? 350_000 : 120_000,
+            priorityLevel: urgent ? 'high' : 'medium',
           },
         },
       }),
@@ -1965,7 +1973,7 @@ async function closeClmmPositionByNft(nftMintFilter?: string): Promise<{
         amountMinA: new BN(0),
         amountMinB: new BN(0),
         txVersion: TxVersion.V0,
-        computeBudgetConfig: { units: 500_000, microLamports: 150_000 },
+        computeBudgetConfig: { units: 500_000, microLamports: 45_000 },
       });
       const sig = bs58.encode(transaction.signatures[0]);
       const currentHeight = await solanaConnection.getBlockHeight('confirmed');
@@ -1976,7 +1984,7 @@ async function closeClmmPositionByNft(nftMintFilter?: string): Promise<{
         poolKeys,
         ownerPosition: targetPos,
         txVersion: TxVersion.V0,
-        computeBudgetConfig: { units: 300_000, microLamports: 150_000 },
+        computeBudgetConfig: { units: 300_000, microLamports: 45_000 },
       });
       const sig = bs58.encode(transaction.signatures[0]);
       const currentHeight = await solanaConnection.getBlockHeight('confirmed');
@@ -2130,6 +2138,7 @@ async function executeSafeWithdrawAndConvertToUsdc(
         outputMint: USDC_MINT_ADDR,
         amountAtomic,
         slippageBps: exitSlippageBps,
+        urgent: emergencyRug,
       });
     } catch (firstErr: any) {
       const msg = formatChainError(firstErr).toLowerCase();
@@ -2140,6 +2149,7 @@ async function executeSafeWithdrawAndConvertToUsdc(
           outputMint: USDC_MINT_ADDR,
           amountAtomic,
           slippageBps: 850,
+          urgent: true,
         });
       }
       throw firstErr;
@@ -2248,7 +2258,7 @@ async function executeAutoCompoundForPosition(target: {
       amountMinA: new BN(0),
       amountMinB: new BN(0),
       txVersion: TxVersion.V0,
-      computeBudgetConfig: { units: 400_000, microLamports: 150_000 },
+      computeBudgetConfig: { units: 400_000, microLamports: 40_000 },
     });
     const collectSig = bs58.encode(collectTx.signatures[0]);
     const h1 = await solanaConnection.getBlockHeight('confirmed');
@@ -2322,7 +2332,7 @@ async function executeAutoCompoundForPosition(target: {
             baseAmount: new BN(baseAtomic.toString()),
             otherAmountMax: new BN(safeOtherMaxStr),
             txVersion: TxVersion.V0,
-            computeBudgetConfig: { units: 450_000, microLamports: 150_000 },
+            computeBudgetConfig: { units: 450_000, microLamports: 40_000 },
           });
           const incSig = bs58.encode(incTx.signatures[0]);
           const h2 = await solanaConnection.getBlockHeight('confirmed');
@@ -2482,7 +2492,13 @@ async function increaseExistingClmmPosition(params: {
 
     const availSolUsd = Math.max(0, balances.solBalance - minSolReserve) * solPriceUsd;
     const availUsdcUsd = balances.usdcBalance;
-    const safeAddUsd = Math.min(Math.max(addUsd, 2), (availSolUsd + availUsdcUsd) * 0.92);
+    if (availSolUsd + availUsdcUsd < 3.2) {
+      throw new Error(`可用流动性仅 $${(availSolUsd + availUsdcUsd).toFixed(2)}，低于 $3.20 原仓加仓经济门槛（省 Gas），已拦截`);
+    }
+    const safeAddUsd = Math.min(Math.max(addUsd, 2.8), (availSolUsd + availUsdcUsd) * 0.9);
+    if (safeAddUsd < 2.8) {
+      throw new Error(`测算可加仓额度仅 $${safeAddUsd.toFixed(2)} (<$2.80)，为避免无效 Gas 浪费已拦截`);
+    }
 
     const currentPoolPrice = Number(poolInfo.price || 0);
     let priceAUsd = 1;
@@ -2501,7 +2517,7 @@ async function increaseExistingClmmPosition(params: {
       priceAUsd = Math.max(currentPoolPrice * solPriceUsd, 1e-6);
     }
 
-    // Measure exact MintA / MintB value ratio needed by this position's existing tick bounds
+    // Measure exact MintA / MintB value ratio needed by this position's existing tick bounds BEFORE swapping
     const epochInfo = await solanaConnection.getEpochInfo('confirmed');
     const probeUnitsA = Math.max(1000, Math.floor((1 / Math.max(priceAUsd, 0.01)) * 10 ** decA));
     const probeLiq = await PoolUtils.getLiquidityAmountOutFromAmountIn({
@@ -2525,7 +2541,36 @@ async function increaseExistingClmmPosition(params: {
     const targetUsdB = safeAddUsd * shareB;
     let swapTxId: string | undefined;
 
-    // Ensure non-USDC side has enough tokens (swap from excess USDC or excess SOL)
+    // Pre-flight check: do not execute any swap unless both sides can be funded cleanly above $1.20 min swap
+    const minSwapLamports = Math.max(12_000_000, Math.floor((1.2 / Math.max(solPriceUsd, 10)) * 1e9));
+    const minSwapUsdcAtomic = 1_200_000;
+
+    // Ensure USDC side AND non-USDC side have balanced tokens (handles SOL-only wallet funding USDC/TokenX top-ups)
+    const targetUsdcSideUsd = isUsdcA ? targetUsdA : isUsdcB ? targetUsdB : 0;
+    let currentUsdcUsd = availUsdcUsd;
+    let currentSolAvailUsd = availSolUsd;
+
+    if (targetUsdcSideUsd >= 1.2 && currentUsdcUsd < targetUsdcSideUsd * 0.85) {
+      const usdcNeedUsd = Math.max(0, targetUsdcSideUsd - currentUsdcUsd);
+      if (currentSolAvailUsd >= usdcNeedUsd * 1.08 && usdcNeedUsd >= 1.2) {
+        const amtLamports = Math.floor(
+          (Math.min(usdcNeedUsd, currentSolAvailUsd * 0.52) / solPriceUsd) * 1e9
+        );
+        if (amtLamports >= minSwapLamports) {
+          const swUsdc = await executeJupiterTokenSwap({
+            inputMint: SOL_MINT_ADDR,
+            outputMint: USDC_MINT_ADDR,
+            amountAtomic: amtLamports,
+          });
+          swapTxId = swUsdc.txId;
+          const swappedUsd = (amtLamports / 1e9) * solPriceUsd;
+          currentUsdcUsd += swappedUsd;
+          currentSolAvailUsd = Math.max(0, currentSolAvailUsd - swappedUsd);
+          await sleep(2000);
+        }
+      }
+    }
+
     const nonUsdcSide: Array<{ mint: string; sym: string; priceUsd: number; needUsd: number; isSol: boolean }> = [];
     if (!isUsdcA) nonUsdcSide.push({ mint: mintA, sym: symA, priceUsd: priceAUsd, needUsd: targetUsdA, isSol: isSolA });
     if (!isUsdcB) nonUsdcSide.push({ mint: mintB, sym: symB, priceUsd: priceBUsd, needUsd: targetUsdB, isSol: isSolB });
@@ -2536,40 +2581,42 @@ async function increaseExistingClmmPosition(params: {
         ? Math.max(0, balSide.uiAmount - minSolReserve) * solPriceUsd
         : balSide.uiAmount * side.priceUsd;
       const deficitUsd = Math.max(0, side.needUsd - existingUsd);
-      if (deficitUsd >= 0.6) {
-        const reservedUsdcForPool = isUsdcA ? targetUsdA : isUsdcB ? targetUsdB : 0;
-        const spendableUsdc = Math.max(0, availUsdcUsd - reservedUsdcForPool * 0.9);
+      if (deficitUsd >= 1.2) {
+        const spendableUsdc = Math.max(0, currentUsdcUsd - targetUsdcSideUsd * 0.9);
         if (!side.isSol && spendableUsdc >= deficitUsd * 0.85) {
           const amtAtomic = Math.floor(Math.min(deficitUsd, spendableUsdc * 0.96) * 1e6);
-          if (amtAtomic >= 400_000) {
+          if (amtAtomic >= minSwapUsdcAtomic) {
             const sw = await executeJupiterTokenSwap({
               inputMint: USDC_MINT_ADDR,
               outputMint: side.mint,
               amountAtomic: amtAtomic,
             });
             swapTxId = sw.txId;
+            currentUsdcUsd = Math.max(0, currentUsdcUsd - amtAtomic / 1e6);
             await sleep(2000);
           }
-        } else if (availUsdcUsd >= deficitUsd * 1.05) {
-          const amtAtomic = Math.floor(Math.min(deficitUsd, availUsdcUsd * 0.65) * 1e6);
-          if (amtAtomic >= 400_000) {
-            const sw = await executeJupiterTokenSwap({
-              inputMint: USDC_MINT_ADDR,
-              outputMint: side.mint,
-              amountAtomic: amtAtomic,
-            });
-            swapTxId = sw.txId;
-            await sleep(2000);
-          }
-        } else if (!side.isSol && availSolUsd >= deficitUsd * 1.05) {
-          const amtLamports = Math.floor((Math.min(deficitUsd, availSolUsd * 0.65) / solPriceUsd) * 1e9);
-          if (amtLamports >= 2_000_000) {
+        } else if (!side.isSol && currentSolAvailUsd >= deficitUsd * 1.08) {
+          const amtLamports = Math.floor((Math.min(deficitUsd, currentSolAvailUsd * 0.9) / solPriceUsd) * 1e9);
+          if (amtLamports >= minSwapLamports) {
             const sw = await executeJupiterTokenSwap({
               inputMint: SOL_MINT_ADDR,
               outputMint: side.mint,
               amountAtomic: amtLamports,
             });
             swapTxId = sw.txId;
+            currentSolAvailUsd = Math.max(0, currentSolAvailUsd - (amtLamports / 1e9) * solPriceUsd);
+            await sleep(2000);
+          }
+        } else if (currentUsdcUsd >= deficitUsd * 1.08) {
+          const amtAtomic = Math.floor(Math.min(deficitUsd, currentUsdcUsd * 0.65) * 1e6);
+          if (amtAtomic >= minSwapUsdcAtomic) {
+            const sw = await executeJupiterTokenSwap({
+              inputMint: USDC_MINT_ADDR,
+              outputMint: side.mint,
+              amountAtomic: amtAtomic,
+            });
+            swapTxId = sw.txId;
+            currentUsdcUsd = Math.max(0, currentUsdcUsd - amtAtomic / 1e6);
             await sleep(2000);
           }
         }
@@ -2661,6 +2708,17 @@ async function increaseExistingClmmPosition(params: {
       );
     }
 
+    const actualAmtA =
+      Number((base === 'MintA' ? baseAmount : expectedOther).toString()) / 10 ** decA;
+    const actualAmtB =
+      Number((base === 'MintB' ? baseAmount : expectedOther).toString()) / 10 ** decB;
+    const actualAddUsd = actualAmtA * priceAUsd + actualAmtB * priceBUsd;
+    if (actualAddUsd < 2.5) {
+      throw new Error(
+        `测算原仓追加价值仅 $${actualAddUsd.toFixed(2)}，低于 $2.50 最低经济加仓线（防发送零额度交易浪费 Gas），已拦截`
+      );
+    }
+
     const refreshedPositions = await raydium.clmm.getOwnerPositionInfo({
       programId: CLMM_PROGRAM_ID,
     });
@@ -2674,7 +2732,7 @@ async function increaseExistingClmmPosition(params: {
       baseAmount,
       otherAmountMax: new BN(otherAmountMaxStr),
       txVersion: TxVersion.V0,
-      computeBudgetConfig: { units: 450_000, microLamports: 150_000 },
+      computeBudgetConfig: { units: 450_000, microLamports: 45_000 },
     });
 
     const sig = bs58.encode(transaction.signatures[0]);
@@ -3314,17 +3372,25 @@ async function openRealClmmPoolPosition(params: {
 
     const availSolUsd = availSol * solPriceUsd;
     const availUsdcUsd = balances.usdcBalance;
-    const cappedTotalUsd = Math.min(Math.max(targetUsd, 2), (availSolUsd + availUsdcUsd) * 0.92);
+    if (availSolUsd + availUsdcUsd < 3.5) {
+      throw new Error(`可用流动性仅 $${(availSolUsd + availUsdcUsd).toFixed(2)}，低于 $3.50 最低建仓经济门槛（防无谓 Gas 浪费），已拦截`);
+    }
+    const cappedTotalUsd = Math.min(Math.max(targetUsd, 2.8), (availSolUsd + availUsdcUsd) * 0.9);
+    if (cappedTotalUsd < 2.8) {
+      throw new Error(`测算开仓额度仅 $${cappedTotalUsd.toFixed(2)} (<$2.80)，已拦截以节省 Gas`);
+    }
     const halfUsd = cappedTotalUsd * 0.48;
+    const minOpenSwapLamports = Math.max(12_000_000, Math.floor((1.2 / Math.max(solPriceUsd, 10)) * 1e9));
+    const minOpenSwapUsdcAtomic = 1_200_000;
     let swapTxId: string | undefined;
 
-    // Step 1: Ensure we hold ~halfUsd worth of the non-USDC / non-SOL side (or balance WSOL/USDC)
+    // Step 1: Ensure we hold ~halfUsd worth of the non-USDC / non-SOL side (or balance WSOL/USDC), skipping micro <$1.20 swaps
     if ((isSolA && isUsdcB) || (isUsdcA && isSolB)) {
       // WSOL <-> USDC pair: balance only if one side is much smaller than halfUsd
       if (availUsdcUsd < halfUsd * 0.72 && availSolUsd > halfUsd * 1.15) {
         const swapUsd = Math.min(halfUsd - availUsdcUsd, availSolUsd * 0.55);
         const swapLamports = Math.floor((swapUsd / solPriceUsd) * 1e9);
-        if (swapLamports >= 2_000_000) {
+        if (swapLamports >= minOpenSwapLamports) {
           const sw = await executeJupiterTokenSwap({
             inputMint: SOL_MINT_ADDR,
             outputMint: USDC_MINT_ADDR,
@@ -3336,7 +3402,7 @@ async function openRealClmmPoolPosition(params: {
       } else if (availSolUsd < halfUsd * 0.72 && availUsdcUsd > halfUsd * 1.15) {
         const swapUsd = Math.min(halfUsd - availSolUsd, availUsdcUsd * 0.55);
         const swapUsdcAtomic = Math.floor(swapUsd * 1e6);
-        if (swapUsdcAtomic >= 300_000) {
+        if (swapUsdcAtomic >= minOpenSwapUsdcAtomic) {
           const sw = await executeJupiterTokenSwap({
             inputMint: USDC_MINT_ADDR,
             outputMint: SOL_MINT_ADDR,
@@ -3363,46 +3429,52 @@ async function openRealClmmPoolPosition(params: {
       const existingXUsd = balX.uiAmount * priceXUsd;
       const needSwapUsd = Math.max(0, halfUsd - existingXUsd);
 
-      if (needSwapUsd >= 0.5) {
+      if (needSwapUsd >= 1.2) {
         if (otherIsUsdc) {
           // Reserve ~halfUsd in USDC for the USDC side; fund TokenX swap from excess USDC or excess SOL
           const excessUsdc = Math.max(0, availUsdcUsd - halfUsd);
           if (excessUsdc >= needSwapUsd * 0.9) {
             const amtAtomic = Math.floor(Math.min(needSwapUsd, excessUsdc * 0.96) * 1e6);
-            const sw = await executeJupiterTokenSwap({
-              inputMint: USDC_MINT_ADDR,
-              outputMint: tokenXMint,
-              amountAtomic: amtAtomic,
-            });
-            swapTxId = sw.txId;
-            await sleep(2200);
+            if (amtAtomic >= minOpenSwapUsdcAtomic) {
+              const sw = await executeJupiterTokenSwap({
+                inputMint: USDC_MINT_ADDR,
+                outputMint: tokenXMint,
+                amountAtomic: amtAtomic,
+              });
+              swapTxId = sw.txId;
+              await sleep(2200);
+            }
           } else if (availSolUsd >= needSwapUsd * 0.95) {
             const amtLamports = Math.floor((Math.min(needSwapUsd, availSolUsd * 0.92) / solPriceUsd) * 1e9);
-            const sw = await executeJupiterTokenSwap({
-              inputMint: SOL_MINT_ADDR,
-              outputMint: tokenXMint,
-              amountAtomic: amtLamports,
-            });
-            swapTxId = sw.txId;
-            await sleep(2200);
+            if (amtLamports >= minOpenSwapLamports) {
+              const sw = await executeJupiterTokenSwap({
+                inputMint: SOL_MINT_ADDR,
+                outputMint: tokenXMint,
+                amountAtomic: amtLamports,
+              });
+              swapTxId = sw.txId;
+              await sleep(2200);
+            }
           } else if (availUsdcUsd >= needSwapUsd * 1.1) {
             const amtAtomic = Math.floor((availUsdcUsd * 0.48) * 1e6);
-            const sw = await executeJupiterTokenSwap({
-              inputMint: USDC_MINT_ADDR,
-              outputMint: tokenXMint,
-              amountAtomic: amtAtomic,
-            });
-            swapTxId = sw.txId;
-            await sleep(2200);
+            if (amtAtomic >= minOpenSwapUsdcAtomic) {
+              const sw = await executeJupiterTokenSwap({
+                inputMint: USDC_MINT_ADDR,
+                outputMint: tokenXMint,
+                amountAtomic: amtAtomic,
+              });
+              swapTxId = sw.txId;
+              await sleep(2200);
+            }
           }
         } else {
           // WSOL / TokenX pool: ensure BOTH WSOL side and TokenX side have adequate balance
           const needSolSideUsd = Math.max(0, halfUsd - availSolUsd);
           let remainingUsdcForSwap = availUsdcUsd;
-          if (needSolSideUsd >= 0.5 && remainingUsdcForSwap >= needSolSideUsd * 0.9) {
+          if (needSolSideUsd >= 1.2 && remainingUsdcForSwap >= needSolSideUsd * 0.9) {
             const solSwapUsd = Math.min(needSolSideUsd, remainingUsdcForSwap * 0.48);
             const amtSolUsdcAtomic = Math.floor(solSwapUsd * 1e6);
-            if (amtSolUsdcAtomic >= 500_000) {
+            if (amtSolUsdcAtomic >= minOpenSwapUsdcAtomic) {
               const swSol = await executeJupiterTokenSwap({
                 inputMint: USDC_MINT_ADDR,
                 outputMint: SOL_MINT_ADDR,
@@ -3423,25 +3495,29 @@ async function openRealClmmPoolPosition(params: {
           const matchedHalfUsd = Math.min(halfUsd, effectiveSolSideUsd * 0.96);
           const cappedNeedTokenXUsd = Math.max(0, matchedHalfUsd - existingXUsd);
           const excessSolUsd = Math.max(0, effectiveSolSideUsd - matchedHalfUsd);
-          if (cappedNeedTokenXUsd >= 0.5) {
+          if (cappedNeedTokenXUsd >= 1.2) {
             if (remainingUsdcForSwap >= cappedNeedTokenXUsd * 0.85) {
               const amtAtomic = Math.floor(Math.min(cappedNeedTokenXUsd, remainingUsdcForSwap * 0.95) * 1e6);
-              const sw = await executeJupiterTokenSwap({
-                inputMint: USDC_MINT_ADDR,
-                outputMint: tokenXMint,
-                amountAtomic: amtAtomic,
-              });
-              swapTxId = sw.txId;
-              await sleep(2200);
+              if (amtAtomic >= minOpenSwapUsdcAtomic) {
+                const sw = await executeJupiterTokenSwap({
+                  inputMint: USDC_MINT_ADDR,
+                  outputMint: tokenXMint,
+                  amountAtomic: amtAtomic,
+                });
+                swapTxId = sw.txId;
+                await sleep(2200);
+              }
             } else if (excessSolUsd >= cappedNeedTokenXUsd * 0.85) {
               const amtLamports = Math.floor((Math.min(cappedNeedTokenXUsd, excessSolUsd * 0.92) / solPriceUsd) * 1e9);
-              const sw = await executeJupiterTokenSwap({
-                inputMint: SOL_MINT_ADDR,
-                outputMint: tokenXMint,
-                amountAtomic: amtLamports,
-              });
-              swapTxId = sw.txId;
-              await sleep(2200);
+              if (amtLamports >= minOpenSwapLamports) {
+                const sw = await executeJupiterTokenSwap({
+                  inputMint: SOL_MINT_ADDR,
+                  outputMint: tokenXMint,
+                  amountAtomic: amtLamports,
+                });
+                swapTxId = sw.txId;
+                await sleep(2200);
+              }
             }
           }
         }
@@ -3628,7 +3704,7 @@ async function openRealClmmPoolPosition(params: {
       nft2022: true,
       withMetadata: 'no-create',
       txVersion: TxVersion.V0,
-      computeBudgetConfig: { units: 600_000, microLamports: 150_000 },
+      computeBudgetConfig: { units: 600_000, microLamports: 45_000 },
     });
 
     const sig = bs58.encode(transaction.signatures[0]);
@@ -4599,7 +4675,7 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
     }
     const baselinePoolTvlsObj = Object.fromEntries(poolTvlBaselineMap.entries());
 
-    // Track persistent liquidity depletion streaks across active positions
+    // Track persistent liquidity depletion & sustained out-of-range streaks across active positions
     for (const pos of activePositions) {
       const matched = ranked.find((r) => r.id === pos.poolId);
       const baseTvl = baselinePoolTvlsObj[pos.poolId] || matched?.tvl || 0;
@@ -4611,7 +4687,6 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
         matched && matched.tvl > 0 ? matched.volume24h / matched.tvl : 0;
       const isDepletingNow =
         (matched && matched.tvl > 0 && tvlDropPct >= 25) ||
-        (matched && matched.tvl > 0 && matched.tvl < Math.min(strategyConfig.minTVL * 0.5, 250_000)) ||
         (matched && matched.tvl > 0 && matched.tvl < 50_000) ||
         (!matched && baseTvl > 0) ||
         (pos.inRange === false && Boolean(matched) && matched!.tvl > 0 && volTvl < 0.05);
@@ -4619,8 +4694,13 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
         pos.poolId,
         isDepletingNow ? (poolDepletionStreakMap.get(pos.poolId) || 0) + 1 : 0
       );
+      poolOutOfRangeStreakMap.set(
+        pos.poolId,
+        pos.inRange === false ? (poolOutOfRangeStreakMap.get(pos.poolId) || 0) + 1 : 0
+      );
     }
     const depletionStreaksObj = Object.fromEntries(poolDepletionStreakMap.entries());
+    const outOfRangeStreaksObj = Object.fromEntries(poolOutOfRangeStreakMap.entries());
 
     let highYieldRecommendation: AutonomousHighYieldRecommendation =
       evaluateAutonomousHighYieldSwitch({
@@ -4635,6 +4715,7 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
       activePositions,
       rankedPools: ranked,
       baselinePoolTvls: baselinePoolTvlsObj,
+      outOfRangeStreaks: outOfRangeStreaksObj,
       config: strategyConfig,
     });
 
@@ -4908,9 +4989,11 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
               topUpTarget &&
               balNow.solBalance >= 0.012 &&
               availNowUsd >= 5 &&
-              cooldownOk(`topup:${topUpTarget.nftMint}`)
+              cooldownOk(`topup:${topUpTarget.nftMint}`) &&
+              cooldownOk(topUpTarget.poolId)
             ) {
               poolActionCooldownMs.set(`topup:${topUpTarget.nftMint}`, Date.now());
+              poolActionCooldownMs.set(topUpTarget.poolId, Date.now());
               try {
                 const matchedTop = ranked.find((r) => r.id === topUpTarget.poolId);
                 const maxShare = getMaxPoolExposureShare(matchedTop);
@@ -4934,6 +5017,9 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
                   pushLog('success', `[原仓追加完成] ${topped.poolName} (${topped.injectedSummary}) · TX: ${topped.txId}`);
                 }
               } catch (err: any) {
+                // Cool down failed pool for 10 minutes to prevent repeated retry gas/RPC churn
+                poolActionCooldownMs.set(topUpTarget.poolId, Date.now() + 510_000);
+                poolActionCooldownMs.set(`topup:${topUpTarget.nftMint}`, Date.now() + 510_000);
                 pushLog('warning', `[原仓追加略过] ${formatChainError(err)}`);
               }
             } else if (
@@ -4943,10 +5029,12 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
               highYieldRecommendation.shouldAct &&
               highYieldRecommendation.decision === 'OPEN_NEW' &&
               highYieldRecommendation.targetPool &&
-              cooldownOk(`auto-yield:${highYieldRecommendation.targetPool.poolId}`)
+              cooldownOk(`auto-yield:${highYieldRecommendation.targetPool.poolId}`) &&
+              cooldownOk(highYieldRecommendation.targetPool.poolId)
             ) {
               const target = highYieldRecommendation.targetPool;
               poolActionCooldownMs.set(`auto-yield:${target.poolId}`, Date.now());
+              poolActionCooldownMs.set(target.poolId, Date.now());
               try {
                 const availOpenUsd = Math.max(0, balNow.solBalance - 0.028) * latestSolPriceUsd + balNow.usdcBalance;
                 const incBudget = Math.min(highYieldRecommendation.deployBudgetUsd, availOpenUsd * 0.88);
@@ -4966,6 +5054,8 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
                   pushLog('success', `[增量加仓完成] ${opened.poolName} (${opened.injectedSummary}) · TX: ${opened.txId}`);
                 }
               } catch (err: any) {
+                poolActionCooldownMs.set(target.poolId, Date.now() + 510_000);
+                poolActionCooldownMs.set(`auto-yield:${target.poolId}`, Date.now() + 510_000);
                 pushLog('error', `[智能增量加仓失败] ${formatChainError(err)}`);
               }
             }
@@ -5007,9 +5097,11 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
             autoAllocAllowed &&
             highYieldRecommendation.decision === 'OPEN_NEW' &&
             balPreAlloc.solBalance >= 0.028 &&
-            cooldownOk(`auto-yield:${highYieldRecommendation.targetPool.poolId}`)
+            cooldownOk(`auto-yield:${highYieldRecommendation.targetPool.poolId}`) &&
+            cooldownOk(highYieldRecommendation.targetPool.poolId)
           ) {
             poolActionCooldownMs.set(`auto-yield:${highYieldRecommendation.targetPool.poolId}`, nowMs);
+            poolActionCooldownMs.set(highYieldRecommendation.targetPool.poolId, nowMs);
             try {
               const target = highYieldRecommendation.targetPool;
               const balNow = await getWalletBalances(BACKEND_KEYPAIR!.publicKey);
@@ -5028,7 +5120,7 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
                   solPriceUsd: latestSolPriceUsd,
                 });
                 lastAutoOpenOrRotateAt = Date.now();
-                pushLog('success', `[高收益直开完成] ${opened.poolName} (${opened.injectedSummary}) · TX: ${opened.txId}`);
+                pushLog('success', `[高收益自主直开完成] ${opened.poolName} (${opened.injectedSummary}) · TX: ${opened.txId}`);
                 activePositions = await fetchActivePositions(true);
                 const balAfter = await getWalletBalances(BACKEND_KEYPAIR!.publicKey);
                 portfolioPlan = calculateAutoPortfolioPlan({
@@ -5050,13 +5142,26 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
                 conclusion = `自主决策直接新开高收益池【${opened.poolName}】，当前在池 $${portfolioPlan.activeInjectedUsd.toFixed(2)}。`;
               }
             } catch (err: any) {
+              const failPoolId = highYieldRecommendation.targetPool?.poolId;
+              if (failPoolId) {
+                poolActionCooldownMs.set(failPoolId, Date.now() + 510_000);
+                poolActionCooldownMs.set(`auto-yield:${failPoolId}`, Date.now() + 510_000);
+              }
               pushLog('error', `[高收益自主直开失败] ${formatChainError(err)}`);
             }
           } else if (
             highYieldRecommendation.decision === 'ROTATE_SWAP' &&
             highYieldRecommendation.sourcePositionToReplace?.nftMint &&
             balPreAlloc.solBalance >= 0.006 &&
-            nowMs - lastAutonomousRotateAt >= 600_000
+            nowMs - lastAutonomousRotateAt >= 1_800_000 &&
+            (() => {
+              const srcPos = activePositions.find(
+                (p) => p.nftMint === highYieldRecommendation.sourcePositionToReplace?.nftMint
+              );
+              const isHealthyNonLosing =
+                srcPos && srcPos.inRange !== false && (srcPos.unrealizedPnlPct ?? 0) >= -0.5;
+              return !isHealthyNonLosing || highYieldRecommendation.aprGainPct >= 80;
+            })()
           ) {
             lastAutonomousRotateAt = nowMs;
             const src = highYieldRecommendation.sourcePositionToReplace;
@@ -5118,6 +5223,7 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
                 activePositions,
                 rankedPools: ranked,
                 baselinePoolTvls: baselinePoolTvlsObj,
+                outOfRangeStreaks: outOfRangeStreaksObj,
                 config: strategyConfig,
               });
             } catch (err: any) {
@@ -5131,12 +5237,12 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
           activePositions,
           rankedPools: ranked,
           baselinePoolTvls: baselinePoolTvlsObj,
+          outOfRangeStreaks: outOfRangeStreaksObj,
           config: strategyConfig,
         });
 
         const rebalanceCooldownOk =
-          rebalancePlan.triggerType === 'DEPTH_DROP_REDUCE' ||
-          rebalancePlan.triggerType === 'OUT_OF_RANGE_RECENTER'
+          rebalancePlan.triggerType === 'DEPTH_DROP_REDUCE'
             ? nowMs - lastAutoRebalanceAt >= 300_000
             : nowMs - lastAutoRebalanceAt >= 900_000 && nowMs - lastAutoOpenOrRotateAt >= 900_000;
 
@@ -5280,9 +5386,11 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
               activePositions,
               rankedPools: ranked,
               baselinePoolTvls: baselinePoolTvlsObj,
+              outOfRangeStreaks: outOfRangeStreaksObj,
               config: strategyConfig,
             });
           } catch (err: any) {
+            lastAutoRebalanceAt = Date.now() + 300_000;
             pushLog('error', `[自动资产重平衡失败] ${formatChainError(err)}`);
           }
         }
@@ -5298,7 +5406,7 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
           actionTaken === 'IDLE' &&
           autoCompoundPlan.shouldCompound &&
           autoCompoundPlan.targets.length > 0 &&
-          nowMs - lastAutoCompoundAt >= 300_000 &&
+          nowMs - lastAutoCompoundAt >= 600_000 &&
           balancesInitial.solBalance >= 0.006
         ) {
           lastAutoCompoundAt = nowMs;
@@ -5328,6 +5436,7 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
               referenceAprPct: ranked[0]?.apr || 58,
             });
           } catch (compErr: any) {
+            lastAutoCompoundAt = Date.now() + 300_000;
             pushLog('error', `[自动复利失败] ${formatChainError(compErr)}`);
           }
         }

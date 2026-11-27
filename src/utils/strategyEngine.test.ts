@@ -1728,5 +1728,282 @@ test('evaluateAutonomousHighYieldSwitch never recommends topUpExistingPosition o
   assert.notEqual(rec.topUpExistingPosition?.poolId, 'vvv-shallow');
 });
 
+test('high-utilization >=$100 portfolio requires >=$15 idle before triggering incremental top-up', () => {
+  const turboCfg = buildPresetForCapital(200, 'turbo-high-yield');
+  const pools: PoolMetrics[] = [
+    {
+      id: 'wsol-hsol',
+      name: 'WSOL / hSOL',
+      dex: 'RAYDIUM CLMM',
+      address: '9m6cYJ8dd26Smzh35qDvFjkyqvMWYw1CwG5R5F7xWg9Q',
+      tvl: 2_270_000,
+      volume24h: 3_100_000,
+      vol7d: 20_000_000,
+      apr: 144,
+      apr7d: 120,
+      apr30d: 110,
+      feeTier: '0.01%',
+      priceUsd: '73',
+      safetyScore: 98,
+      ilRisk: '低',
+      isBluechip: true,
+    },
+    {
+      id: 'vvv-shallow',
+      name: 'VVV / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'BJcSKhxWzJPs6H3pi7LddVa6PryM8NH2T1hZAeFEHeDU',
+      tvl: 122_000,
+      volume24h: 360_000,
+      vol7d: 2_800_000,
+      apr: 1113,
+      apr7d: 758,
+      apr30d: 447,
+      feeTier: '0.25%',
+      priceUsd: '4.1',
+      safetyScore: 86,
+      ilRisk: '中',
+    },
+    {
+      id: 'nflx-rwa',
+      name: 'NFLX / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'E3muPLAM111111111111111111111111111111111111',
+      tvl: 190_000,
+      volume24h: 350_000,
+      vol7d: 2_000_000,
+      apr: 470,
+      apr7d: 320,
+      apr30d: 280,
+      feeTier: '0.25%',
+      priceUsd: '88',
+      safetyScore: 90,
+      ilRisk: '中',
+      isRwaOrVerified: true,
+    },
+  ];
+  const ranked = rankPools(pools, turboCfg);
+
+  const activePositions = [
+    { poolId: 'wsol-hsol', poolName: 'WSOL / hSOL', nftMint: 'nft-hsol', injectedValueUsd: 89.75, inRange: true },
+    { poolId: 'vvv-shallow', poolName: 'VVV / USDC', nftMint: 'nft-vvv', injectedValueUsd: 95.47, inRange: true },
+    { poolId: 'nflx-rwa', poolName: 'NFLX / USDC', nftMint: 'nft-nflx', injectedValueUsd: 75.85, inRange: true },
+  ];
+
+  // With $261.07 active LP and 0.1815 SOL (~$9.75 deployable after 0.048 SOL reserve), should NOT churn gas
+  const lowSparePlan = calculateAutoPortfolioPlan({
+    solBalance: 0.1815,
+    usdcBalance: 0,
+    solPriceUsd: 73.06,
+    activePositions,
+    rankedPools: ranked,
+    config: turboCfg,
+  });
+  assert.equal(lowSparePlan.incrementalTriggerActive, false);
+  assert.equal(lowSparePlan.utilizationStatusLabel, '资金高利用率做市中');
+
+  const lowSpareRec = evaluateAutonomousHighYieldSwitch({
+    rankedPools: ranked,
+    activePositions,
+    idleDeployableUsd: lowSparePlan.idleDeployableUsd,
+    usdcBalance: 0,
+    config: turboCfg,
+  });
+  assert.equal(lowSpareRec.decision, 'HOLD_OPTIMAL');
+  assert.equal(lowSpareRec.shouldAct, false);
+
+  // With $18+ idle deployable funds, incremental deployment triggers normally
+  const highSparePlan = calculateAutoPortfolioPlan({
+    solBalance: 0.3,
+    usdcBalance: 0,
+    solPriceUsd: 73.06,
+    activePositions,
+    rankedPools: ranked,
+    config: turboCfg,
+  });
+  assert.equal(highSparePlan.incrementalTriggerActive, true);
+  assert.ok(highSparePlan.incrementalBudgetUsd >= 15);
+});
+
+test('non-losing healthy pools never trigger unnecessary close/rebalance/withdraw/compound gas waste', () => {
+  const turboCfg = buildPresetForCapital(200, 'turbo-high-yield');
+  const steadyCfg = buildPresetForCapital(200, 'balanced-steady'); // minTVL = 2M
+
+  const pools: PoolMetrics[] = [
+    {
+      id: 'wsol-hsol',
+      name: 'WSOL / hSOL',
+      dex: 'RAYDIUM CLMM',
+      address: '9m6cYJ8dd26Smzh35qDvFjkyqvMWYw1CwG5R5F7xWg9Q',
+      tvl: 2_270_000,
+      volume24h: 3_100_000,
+      vol7d: 20_000_000,
+      apr: 144,
+      apr7d: 120,
+      feeTier: '0.01%',
+      priceUsd: '73',
+      safetyScore: 98,
+      ilRisk: '低',
+      isBluechip: true,
+    },
+    {
+      id: 'vvv-usdc',
+      name: 'VVV / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'BJcSKhxWzJPs6H3pi7LddVa6PryM8NH2T1hZAeFEHeDU',
+      tvl: 122_000,
+      volume24h: 360_000,
+      vol7d: 2_800_000,
+      apr: 1042,
+      apr7d: 758,
+      feeTier: '0.25%',
+      priceUsd: '27',
+      safetyScore: 86,
+      ilRisk: '中',
+    },
+    {
+      id: 'nflx-usdc',
+      name: 'NFLX / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'E3mugzPiMhKGrDcfcz5ojo7HJBbYA6UMaJvSzbabPLAM',
+      tvl: 190_000,
+      volume24h: 350_000,
+      vol7d: 2_000_000,
+      apr: 470,
+      apr7d: 320,
+      feeTier: '0.25%',
+      priceUsd: '59',
+      safetyScore: 90,
+      ilRisk: '中',
+      isRwaOrVerified: true,
+    },
+  ];
+  const rankedSteady = rankPools(pools, steadyCfg);
+  const rankedTurbo = rankPools(pools, turboCfg);
+
+  // 1. Healthy $122K-$190K pools with 0% TVL drop must NOT falsely trigger DEPTH_DROP_REDUCE or LIQUIDITY_DEPLETION even under balanced-steady ($2M minTVL)
+  const steadyPositions = [
+    {
+      poolId: 'wsol-hsol',
+      poolName: 'WSOL / hSOL',
+      nftMint: 'nft1',
+      injectedValueUsd: 90,
+      priceCurrentUsd: 0.84,
+      priceLowerUsd: 0.82,
+      priceUpperUsd: 0.86,
+      unrealizedPnlPct: 0.3,
+      inRange: true,
+    },
+    {
+      poolId: 'vvv-usdc',
+      poolName: 'VVV / USDC',
+      nftMint: 'nft2',
+      injectedValueUsd: 95,
+      priceCurrentUsd: 33.5, // Moved UP +24% vs midpoint -> profitable in USD!
+      priceLowerUsd: 26,
+      priceUpperUsd: 28,
+      unrealizedPnlPct: 2.1,
+      inRange: true,
+    },
+    {
+      poolId: 'nflx-usdc',
+      poolName: 'NFLX / USDC',
+      nftMint: 'nft3',
+      injectedValueUsd: 76,
+      priceCurrentUsd: 59,
+      priceLowerUsd: 57,
+      priceUpperUsd: 61,
+      unrealizedPnlPct: 0.1,
+      inRange: true,
+    },
+  ];
+
+  const withdrawSteady = evaluateSafeWithdrawSafety({
+    activePositions: steadyPositions,
+    rankedPools: rankedSteady,
+    baselinePoolTvls: { 'wsol-hsol': 2_270_000, 'vvv-usdc': 122_000, 'nflx-usdc': 190_000 },
+    depletionStreaks: { 'wsol-hsol': 0, 'vvv-usdc': 0, 'nflx-usdc': 0 },
+    config: steadyCfg,
+  });
+  assert.equal(withdrawSteady.shouldAutoWithdraw, false);
+  assert.equal(withdrawSteady.triggerType, 'SAFE_HOLD');
+
+  // 2. Profitable non-losing pools with 20%+ weight difference (e.g. $95 / $55 / $30) must NOT tear down & re-open via SHARE_DRIFT_REBALANCE
+  const rebalanceNonLosing = evaluateAutoAssetRebalance({
+    activePositions: [
+      { poolId: 'vvv-usdc', poolName: 'VVV / USDC', nftMint: 'nft2', injectedValueUsd: 95, unrealizedPnlPct: 0.5, inRange: true },
+      { poolId: 'wsol-hsol', poolName: 'WSOL / hSOL', nftMint: 'nft1', injectedValueUsd: 55, unrealizedPnlPct: 0.2, inRange: true },
+      { poolId: 'nflx-usdc', poolName: 'NFLX / USDC', nftMint: 'nft3', injectedValueUsd: 30, unrealizedPnlPct: 0.1, inRange: true },
+    ],
+    rankedPools: rankedTurbo,
+    baselinePoolTvls: { 'wsol-hsol': 2_270_000, 'vvv-usdc': 122_000, 'nflx-usdc': 190_000 },
+    outOfRangeStreaks: { 'vvv-usdc': 0, 'wsol-hsol': 0, 'nflx-usdc': 0 },
+    config: turboCfg,
+  });
+  assert.equal(rebalanceNonLosing.shouldRebalance, false);
+
+  // 3. Brief 1-tick out-of-range wick on a non-losing pool must NOT immediately close & reopen (waits for streak >= 3)
+  const wickOutOfRange = evaluateAutoAssetRebalance({
+    activePositions: [
+      { poolId: 'wsol-hsol', poolName: 'WSOL / hSOL', nftMint: 'nft1', injectedValueUsd: 90, unrealizedPnlPct: 0.05, inRange: false },
+      { poolId: 'vvv-usdc', poolName: 'VVV / USDC', nftMint: 'nft2', injectedValueUsd: 95, unrealizedPnlPct: 0.2, inRange: true },
+    ],
+    rankedPools: rankedTurbo,
+    baselinePoolTvls: { 'wsol-hsol': 2_270_000, 'vvv-usdc': 122_000 },
+    outOfRangeStreaks: { 'wsol-hsol': 1, 'vvv-usdc': 0 },
+    config: turboCfg,
+  });
+  assert.equal(wickOutOfRange.shouldRebalance, false);
+
+  // 4. High-APR in-range pool (144%) must NOT rotate just because another pool has 190% APR (+46% isn't worth close+swap+open gas)
+  const smallGainPools = rankPools(
+    [
+      ...pools,
+      {
+        id: 'modest-new',
+        name: 'JLP / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: 'JLP1111111111111111111111111111111111111111',
+        tvl: 1_500_000,
+        volume24h: 2_000_000,
+        vol7d: 14_000_000,
+        apr: 195,
+        apr7d: 170,
+        feeTier: '0.25%',
+        priceUsd: '3.5',
+        safetyScore: 92,
+        ilRisk: '中',
+      },
+    ],
+    turboCfg
+  );
+  const noChurnRot = evaluateAutonomousHighYieldSwitch({
+    rankedPools: smallGainPools,
+    activePositions: [
+      { poolId: 'wsol-hsol', poolName: 'WSOL / hSOL', nftMint: 'nft1', injectedValueUsd: 90, inRange: true },
+      { poolId: 'vvv-usdc', poolName: 'VVV / USDC', nftMint: 'nft2', injectedValueUsd: 95, inRange: true },
+      { poolId: 'nflx-usdc', poolName: 'NFLX / USDC', nftMint: 'nft3', injectedValueUsd: 76, inRange: true },
+    ],
+    idleDeployableUsd: 2,
+    usdcBalance: 0,
+    config: turboCfg,
+  });
+  assert.equal(noChurnRot.decision, 'HOLD_OPTIMAL');
+  assert.equal(noChurnRot.shouldAct, false);
+
+  // 5. Three parallel positions with $0.15 each ($0.45 sum) must NOT trigger 6 harvest+compound TXs for dust fees
+  const dustCompound = evaluateAutoCompoundOpportunity({
+    activePositions: [
+      { poolId: 'wsol-hsol', poolName: 'WSOL / hSOL', nftMint: 'nft1', uncollectedFeeUsd: 0.15, injectedValueUsd: 90 },
+      { poolId: 'vvv-usdc', poolName: 'VVV / USDC', nftMint: 'nft2', uncollectedFeeUsd: 0.15, injectedValueUsd: 95 },
+      { poolId: 'nflx-usdc', poolName: 'NFLX / USDC', nftMint: 'nft3', uncollectedFeeUsd: 0.15, injectedValueUsd: 76 },
+    ],
+    config: turboCfg,
+    referenceAprPct: 200,
+  });
+  assert.equal(dustCompound.shouldCompound, false);
+  assert.equal(dustCompound.targets.length, 0);
+});
+
 
 

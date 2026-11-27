@@ -1263,8 +1263,9 @@ export function calculateAutoPortfolioPlan(params: {
       : 0;
 
   const usdcExceedsInjected = usdcBalance > activeInjectedUsd && usdcBalance >= 2;
+  const minIdleForIncrement = activeInjectedUsd >= 100 ? 15 : 5;
   const incrementalTriggerActive =
-    smartAllocEnabled && (idleDeployableUsd >= 5 || usdcExceedsInjected);
+    smartAllocEnabled && (idleDeployableUsd >= minIdleForIncrement || usdcExceedsInjected);
   const incrementalBudgetUsd = incrementalTriggerActive
     ? Number(Math.min(config.lpActiveUsdt, idleDeployableUsd * 0.88).toFixed(2))
     : 0;
@@ -1595,8 +1596,9 @@ export function evaluateAutonomousHighYieldSwitch(params: {
     (sum, p) => sum + Math.max(0, p.injectedValueUsd),
     0
   );
+  const minIdleForIncrement = activeInjectedTotal >= 100 ? 15 : 5;
   const hasIncrementalIdle =
-    idleDeployableUsd >= 5 || (usdcBalance > activeInjectedTotal && usdcBalance >= 2);
+    idleDeployableUsd >= minIdleForIncrement || (usdcBalance > activeInjectedTotal && usdcBalance >= 2);
 
   const maxAllowedApr =
     config.riskProfile === 'turbo-high-yield'
@@ -1841,7 +1843,8 @@ export function evaluateAutonomousHighYieldSwitch(params: {
       12
     ).toFixed(2)
   );
-  const worthRotating =
+  const isWeakestInRange = weakestActive.inRange !== false;
+  const baseWorthRotating =
     config.riskProfile === 'turbo-high-yield'
       ? aprGainPct >= 25 && bestCandidate.apr >= weakestActive.currentApr * 1.25
       : config.riskProfile === 'active-yield'
@@ -1849,6 +1852,14 @@ export function evaluateAutonomousHighYieldSwitch(params: {
         bestCandidate.apr >= weakestActive.currentApr * 1.35 &&
         bestCandidate.riskAdjustedScore >= weakestActive.riskAdjustedScore * 0.9
       : aprGainPct >= 20 && bestCandidate.riskAdjustedScore >= weakestActive.riskAdjustedScore * 1.12;
+  // Never burn close+swap+open gas on an in-range healthy pool unless position >= $8, net monthly lift >= $5, and gain strongly outweighs friction
+  const highAprInRangeBar =
+    !isWeakestInRange ||
+    (weakestActive.injectedValueUsd >= 8 &&
+      extraMonthlyUsd >= 5 &&
+      (weakestActive.currentApr < 80 ||
+        (aprGainPct >= 80 && bestCandidate.apr >= weakestActive.currentApr * 2.0)));
+  const worthRotating = baseWorthRotating && highAprInRangeBar;
 
   if (worthRotating) {
     return {
@@ -1942,13 +1953,15 @@ export function evaluateAutoAssetRebalance(params: {
     poolName: string;
     nftMint?: string;
     injectedValueUsd: number;
+    unrealizedPnlPct?: number;
     inRange?: boolean;
   }>;
   rankedPools: ScoredPool[];
   baselinePoolTvls?: Record<string, number>;
+  outOfRangeStreaks?: Record<string, number>;
   config: StrategyConfig;
 }): AutoRebalancePlan {
-  const { activePositions, rankedPools, baselinePoolTvls = {}, config } = params;
+  const { activePositions, rankedPools, baselinePoolTvls = {}, outOfRangeStreaks, config } = params;
   const enabled = config.autoAssetRebalance !== false;
   const driftThresholdPct = Math.max(8, Math.min(35, config.rebalanceDriftThresholdPct || 15));
   const depthDropThresholdPct = 25;
@@ -1969,7 +1982,7 @@ export function evaluateAutoAssetRebalance(params: {
   });
   const sumWeights = rawWeights.reduce((a, b) => a + b, 0) || 1;
 
-  const allocations: RebalancePositionAllocation[] = realPositions.map((pos, idx) => {
+  const allocations: Array<RebalancePositionAllocation & { unrealizedPnlPct?: number }> = realPositions.map((pos, idx) => {
     const matched = rankedPools.find((r) => r.id === pos.poolId);
     const poolTvlUsd = matched?.tvl ?? 0;
     const baselineTvlUsd = baselinePoolTvls[pos.poolId] || poolTvlUsd;
@@ -1982,9 +1995,10 @@ export function evaluateAutoAssetRebalance(params: {
     const targetSharePct = Number(((rawWeights[idx] / sumWeights) * 100).toFixed(1));
     const driftPct = Number((currentSharePct - targetSharePct).toFixed(1));
 
+    // Only flag genuine TVL shrinkage (>=25% drop) or true micro-TVL (<$50K), never healthy $80K-$249K pools
     const severeDepthDrop =
       (poolTvlUsd > 0 && tvlChangePct <= -depthDropThresholdPct) ||
-      (poolTvlUsd > 0 && poolTvlUsd < Math.min(config.minTVL * 0.6, 250_000));
+      (poolTvlUsd > 0 && poolTvlUsd < 50_000);
     const driftExceeded = realPositions.length >= 2 && Math.abs(driftPct) >= driftThresholdPct;
 
     let actionNote = '比例健康';
@@ -1993,10 +2007,10 @@ export function evaluateAutoAssetRebalance(params: {
     } else if (driftExceeded) {
       actionNote =
         driftPct > 0
-          ? `超配 +${driftPct}% · 待减仓配平`
+          ? `超配 +${driftPct}% · 新资金自动补平`
           : `低配 ${driftPct}% · 待增补配平`;
     } else if (pos.inRange === false) {
-      actionNote = '区间越界 · 待校准';
+      actionNote = '区间越界 · 观察确认中';
     }
 
     return {
@@ -2013,6 +2027,7 @@ export function evaluateAutoAssetRebalance(params: {
       inRange: pos.inRange !== false,
       needsAdjustment: severeDepthDrop || driftExceeded,
       actionNote,
+      unrealizedPnlPct: pos.unrealizedPnlPct,
     };
   });
 
@@ -2064,7 +2079,7 @@ export function evaluateAutoAssetRebalance(params: {
     .filter(
       (a) =>
         (a.poolTvlUsd > 0 && a.tvlChangePct <= -depthDropThresholdPct) ||
-        (a.poolTvlUsd > 0 && a.poolTvlUsd < Math.min(config.minTVL * 0.6, 250_000))
+        (a.poolTvlUsd > 0 && a.poolTvlUsd < 50_000)
     )
     .sort((a, b) => a.tvlChangePct - b.tvlChangePct)[0];
 
@@ -2112,9 +2127,14 @@ export function evaluateAutoAssetRebalance(params: {
     };
   }
 
-  // Priority 1.5: Out-of-range position in active/turbo mode earns $0 fees -> auto re-center / rotate into top yield
+  // Priority 1.5: Out-of-range position in active/turbo mode earns $0 fees -> require >=3 consecutive ticks (or negative PnL) so short wicks don't waste Gas
   if (config.riskProfile === 'turbo-high-yield' || config.riskProfile === 'active-yield') {
-    const outOfRangePos = allocations.find((a) => !a.inRange && a.currentUsd >= 3);
+    const outOfRangePos = allocations.find((a) => {
+      if (a.inRange || a.currentUsd < 5) return false;
+      const streak = outOfRangeStreaks ? (outOfRangeStreaks[a.poolId] || 0) : 3;
+      const isLosing = typeof a.unrealizedPnlPct === 'number' && a.unrealizedPnlPct <= -1.0;
+      return streak >= 3 || isLosing;
+    });
     if (outOfRangePos) {
       const topPool =
         rankedPools
@@ -2134,8 +2154,8 @@ export function evaluateAutoAssetRebalance(params: {
         depthDropThresholdPct,
         maxAbsDriftPct: Number(maxAbsDriftPct.toFixed(1)),
         maxDepthDropPct: Number(maxDepthDropPct.toFixed(1)),
-        headline: `仓位【${outOfRangePos.poolName}】已越界停费 → 自动收紧重开追高赚费`,
-        reason: `检测到【${outOfRangePos.poolName}】($${outOfRangePos.currentUsd.toFixed(2)}) 已偏离集中做市区间（当前手续费为 $0），为追求最大盈利，系统自动平旧仓并立即按现价重新锚定高收益池【${topPool.name}】。`,
+        headline: `仓位【${outOfRangePos.poolName}】持续越界停费 → 自动收紧重开追高赚费`,
+        reason: `检测到【${outOfRangePos.poolName}】($${outOfRangePos.currentUsd.toFixed(2)}) 已持续偏离集中做市区间（当前手续费停摆），系统自动平旧仓并立即按现价重新锚定高收益池【${topPool.name}】。`,
         sourcePositionToTrim: {
           poolId: outOfRangePos.poolId,
           poolName: outOfRangePos.poolName,
@@ -2154,17 +2174,23 @@ export function evaluateAutoAssetRebalance(params: {
     }
   }
 
-  // Priority 2: Parallel allocation share drift exceeds threshold (only rebalance when position size justifies swap/gas cost)
+  // Priority 2: Never close a healthy, in-range, non-losing pool purely for mild weight drift; only rebalance extreme (>=80% single-pool) concentration or losing positions
   if (realPositions.length >= 2 && totalActiveUsd >= 25) {
     const overweight = [...allocations].sort((a, b) => b.driftPct - a.driftPct)[0];
     const underweight = [...allocations].sort((a, b) => a.driftPct - b.driftPct)[0];
+    const isHealthyNonLosing =
+      overweight &&
+      overweight.inRange &&
+      (typeof overweight.unrealizedPnlPct !== 'number' || overweight.unrealizedPnlPct > -1.0) &&
+      overweight.currentSharePct < 80;
 
     if (
       overweight &&
       underweight &&
       overweight.poolId !== underweight.poolId &&
       overweight.driftPct >= driftThresholdPct &&
-      overweight.currentUsd >= 10
+      overweight.currentUsd >= 10 &&
+      !isHealthyNonLosing
     ) {
       const targetUsdForOverweight = Number(
         ((totalActiveUsd * overweight.targetSharePct) / 100).toFixed(2)
@@ -2337,14 +2363,19 @@ export function evaluateSafeWithdrawSafety(params: {
       isFlashRug ||
       vanishedFromScanner ||
       (poolTvlUsd > 0 && tvlDropPct >= depletionTvlDropPct) ||
-      (poolTvlUsd > 0 && poolTvlUsd < Math.min(config.minTVL * 0.5, 250_000)) ||
+      (poolTvlUsd > 0 && poolTvlUsd < absoluteFloorTvlUsd) ||
       (pos.inRange === false && poolTvlUsd > 0 && volTvlRatio < 0.05);
 
     const streakCount =
       depletionStreaks[pos.poolId] ?? (isLiquidityDepletingNow ? 1 : 0);
     const persistentDepletion =
       isFlashRug || (isLiquidityDepletingNow && streakCount >= persistentTicksRequired);
-    const ilExceeded = estimatedIlPct >= maxILTolerancePct;
+    // Do NOT emergency-close a profitable/non-losing pool due to theoretical upside price movement vs midpoint
+    const hasActualLossOrCrash =
+      typeof pos.unrealizedPnlPct !== 'number'
+        ? true
+        : pos.unrealizedPnlPct <= -1.0 || crashDrawdownPct >= maxILTolerancePct;
+    const ilExceeded = hasActualLossOrCrash && estimatedIlPct >= maxILTolerancePct;
 
     let breachType: SafeWithdrawPositionRisk['breachType'] = 'NONE';
     let shouldWithdraw = false;
@@ -2579,7 +2610,7 @@ export function evaluateAutoCompoundOpportunity(params: {
 }): AutoCompoundPlan {
   const { activePositions, config, referenceAprPct = 58 } = params;
   const enabled = config.autoCompound !== false;
-  const harvestMinUsd = Math.max(0.25, Number(config.harvestMinUsd || 1.5));
+  const harvestMinUsd = Math.max(0.75, Number(config.harvestMinUsd || 1.5));
   const realPositions = activePositions.filter((p) => p.injectedValueUsd > 0 && p.nftMint);
   const totalPendingYieldUsd = Number(
     realPositions.reduce((sum, p) => sum + Math.max(0, p.uncollectedFeeUsd || 0), 0).toFixed(3)
@@ -2605,6 +2636,7 @@ export function evaluateAutoCompoundOpportunity(params: {
     };
   }
 
+  // Only harvest & compound individual positions whose own pending fees beat Gas by a wide margin (never fan out TXs on $0.01-$0.30 dust)
   const readyTargets: AutoCompoundTarget[] = realPositions
     .filter((p) => (p.uncollectedFeeUsd || 0) >= harvestMinUsd)
     .map((p) => ({
@@ -2615,21 +2647,7 @@ export function evaluateAutoCompoundOpportunity(params: {
       injectedValueUsd: Number(p.injectedValueUsd.toFixed(2)),
     }));
 
-  // Also trigger portfolio-wide if combined pending yield across parallel positions exceeds threshold
-  const allActiveTargets: AutoCompoundTarget[] =
-    readyTargets.length > 0
-      ? readyTargets
-      : totalPendingYieldUsd >= harvestMinUsd
-      ? realPositions
-          .filter((p) => (p.uncollectedFeeUsd || 0) > 0)
-          .map((p) => ({
-            poolId: p.poolId,
-            poolName: p.poolName,
-            nftMint: p.nftMint!,
-            uncollectedFeeUsd: Number(p.uncollectedFeeUsd.toFixed(3)),
-            injectedValueUsd: Number(p.injectedValueUsd.toFixed(2)),
-          }))
-      : [];
+  const allActiveTargets: AutoCompoundTarget[] = readyTargets;
 
   if (allActiveTargets.length > 0) {
     return {
