@@ -16,6 +16,7 @@ import bs58 from 'bs58';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATUS_FILE_PATH = path.resolve(__dirname, '../.bot-runtime-status.json');
+const STRATEGY_CONFIG_FILE_PATH = path.resolve(__dirname, '../.strategy-config.json');
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 dotenv.config();
 
@@ -26,13 +27,74 @@ const PRIVATE_KEY = process.env.PRIVATE_KEY?.trim() || '';
 const RECIPIENT_ADDRESS = process.env.RECIPIENT_ADDRESS?.trim() || '';
 const DRY_RUN = process.env.DRY_RUN !== 'false';
 
-const RISK_PROFILE = process.env.RISK_PROFILE || 'balanced-steady';
+const ENV_PROFILE_RAW = process.env.RISK_PROFILE || '';
+const RISK_PROFILE = ENV_PROFILE_RAW || 'balanced-steady';
 const MIN_APR = Number(process.env.MIN_APR || 45);
 const MIN_TVL_USD = Number(process.env.MIN_TVL_USD || 2000000);
 const RANGE_WIDTH_PCT = Number(process.env.RANGE_WIDTH_PCT || 10);
 const HARVEST_MIN_USD = Number(process.env.HARVEST_MIN_USD || 2.5);
 const STOP_LOSS_PCT = Number(process.env.STOP_LOSS_PCT || 6);
 const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS || 50);
+
+function getDefaultSlippageBpsForProfile(profile) {
+  if (profile === 'turbo-high-yield') return 120;
+  if (profile === 'active-yield') return 85;
+  if (profile === 'ultra-safe') return 35;
+  return SLIPPAGE_BPS;
+}
+
+function loadDynamicStrategySettings() {
+  const base = {
+    riskProfile: RISK_PROFILE,
+    minApr: MIN_APR,
+    minTvlUsd: MIN_TVL_USD,
+    rangeWidthPct: RANGE_WIDTH_PCT,
+    harvestMinUsd: HARVEST_MIN_USD,
+    stopLossPct: STOP_LOSS_PCT,
+    slippageBps: getDefaultSlippageBpsForProfile(RISK_PROFILE),
+  };
+  try {
+    if (!fs.existsSync(STRATEGY_CONFIG_FILE_PATH)) {
+      return base;
+    }
+    const parsed = JSON.parse(fs.readFileSync(STRATEGY_CONFIG_FILE_PATH, 'utf-8'));
+    if (
+      typeof parsed?.envProfileSnapshot === 'string' &&
+      ENV_PROFILE_RAW &&
+      parsed.envProfileSnapshot !== ENV_PROFILE_RAW
+    ) {
+      return base;
+    }
+    const saved = parsed?.strategyConfig;
+    if (!saved || typeof saved !== 'object') {
+      return base;
+    }
+    const profile =
+      saved.riskProfile === 'ultra-safe' ||
+      saved.riskProfile === 'active-yield' ||
+      saved.riskProfile === 'turbo-high-yield' ||
+      saved.riskProfile === 'balanced-steady'
+        ? saved.riskProfile
+        : base.riskProfile;
+    return {
+      riskProfile: profile,
+      minApr: Number.isFinite(Number(saved.minAPR)) ? Number(saved.minAPR) : base.minApr,
+      minTvlUsd: Number.isFinite(Number(saved.minTVL)) ? Number(saved.minTVL) : base.minTvlUsd,
+      rangeWidthPct: Number.isFinite(Number(saved.rangeWidthPct))
+        ? Number(saved.rangeWidthPct)
+        : base.rangeWidthPct,
+      harvestMinUsd: Number.isFinite(Number(saved.harvestMinUsd))
+        ? Number(saved.harvestMinUsd)
+        : base.harvestMinUsd,
+      stopLossPct: Number.isFinite(Number(saved.stopLossPercentage))
+        ? Number(saved.stopLossPercentage)
+        : base.stopLossPct,
+      slippageBps: getDefaultSlippageBpsForProfile(profile),
+    };
+  } catch {
+    return base;
+  }
+}
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
@@ -55,7 +117,7 @@ function maskAddr(addr) {
   return addr.length > 10 ? `${addr.slice(0, 4)}...${addr.slice(-4)}` : '****';
 }
 
-function writeHeartbeat(payload) {
+function writeHeartbeat(payload, riskProfile = RISK_PROFILE) {
   try {
     fs.writeFileSync(
       STATUS_FILE_PATH,
@@ -65,7 +127,7 @@ function writeHeartbeat(payload) {
           startedAt,
           lastTickAt: new Date().toISOString(),
           dryRun: DRY_RUN,
-          riskProfile: RISK_PROFILE,
+          riskProfile,
           walletMasked: maskAddr(wallet.publicKey.toBase58()),
           recipientMasked: maskAddr(recipientPubkey.toBase58()),
           tickCount,
@@ -80,18 +142,23 @@ function writeHeartbeat(payload) {
   }
 }
 
+const startupCfg = loadDynamicStrategySettings();
+const startupTvlLabel =
+  startupCfg.minTvlUsd >= 1e6
+    ? `$${(startupCfg.minTvlUsd / 1e6).toFixed(1)}M`
+    : `$${Math.round(startupCfg.minTvlUsd / 1000)}K`;
 console.log('====================================================');
 console.log(' Solana LP 新加坡后台执行引擎已启动');
-console.log(' 策略档位:', RISK_PROFILE, '| 区间 ±' + RANGE_WIDTH_PCT + '%');
+console.log(' 策略档位:', startupCfg.riskProfile, '| 区间 ±' + startupCfg.rangeWidthPct + '%');
 console.log(' 执行钱包:', wallet.publicKey.toBase58());
 console.log(' 收款钱包:', recipientPubkey.toBase58());
-console.log(' 风控阈值: TVL >= $' + (MIN_TVL_USD / 1e6).toFixed(1) + 'M | 滑点上限 ' + SLIPPAGE_BPS + ' bps | 止损 -' + STOP_LOSS_PCT + '%');
-console.log(' 省Gas阈值: 待收手续费 >= $' + HARVEST_MIN_USD + ' 再收割');
+console.log(' 风控阈值: TVL >= ' + startupTvlLabel + ' | 滑点上限 ' + startupCfg.slippageBps + ' bps | 止损 -' + startupCfg.stopLossPct + '%');
+console.log(' 省Gas阈值: 待收手续费 >= $' + startupCfg.harvestMinUsd + ' 再收割');
 console.log(' 运行模式:', DRY_RUN ? 'DRY_RUN=true 安全演练模式' : '实盘自动运行模式');
 console.log('====================================================');
 
-async function checkExitSlippageGuard() {
-  const quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${SOL_MINT}&outputMint=${USDC_MINT}&amount=100000000&slippageBps=${SLIPPAGE_BPS}`;
+async function checkExitSlippageGuard(slippageBps = SLIPPAGE_BPS) {
+  const quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${SOL_MINT}&outputMint=${USDC_MINT}&amount=100000000&slippageBps=${slippageBps}`;
   const res = await fetch(quoteUrl);
   const quote = await res.json();
   if (!quote || quote.error) {
@@ -99,13 +166,13 @@ async function checkExitSlippageGuard() {
   }
   const impactBps = Math.abs(Number(quote.priceImpactPct || 0)) * 10000;
   const outUsdc = Number(quote.outAmount || 0) / 1e6;
-  if (impactBps > SLIPPAGE_BPS) {
-    console.warn(`[风险预警] 撤池滑点过高 (${impactBps.toFixed(2)} bps > ${SLIPPAGE_BPS} bps)，暂停大额换币！`);
+  if (impactBps > slippageBps) {
+    console.warn(`[风险预警] 撤池滑点过高 (${impactBps.toFixed(2)} bps > ${slippageBps} bps)，暂停大额换币！`);
   }
   return { outUsdc, impactBps };
 }
 
-async function scanLivePools() {
+async function scanLivePools(runtimeCfg = loadDynamicStrategySettings()) {
   const [feeSettled, volSettled] = await Promise.allSettled([
     fetch('https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=fee24h&sortType=desc&pageSize=40&page=1').then((r) => r.json()),
     fetch('https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=volume24h&sortType=desc&pageSize=40&page=1').then((r) => r.json()),
@@ -124,9 +191,9 @@ async function scanLivePools() {
   const core = [];
   const alerts = [];
   const maxSafeApr =
-    RISK_PROFILE === 'turbo-high-yield'
+    runtimeCfg.riskProfile === 'turbo-high-yield'
       ? 2200
-      : RISK_PROFILE === 'active-yield'
+      : runtimeCfg.riskProfile === 'active-yield'
       ? 1600
       : 220;
 
@@ -182,11 +249,11 @@ async function scanLivePools() {
       alerts.push(`Token 波动异常预警: ${symA}/${symB} 年化 +${apr.toFixed(1)}%，已拦截`);
       continue;
     }
-    if (tvl < MIN_TVL_USD) {
+    if (tvl < runtimeCfg.minTvlUsd) {
       alerts.push(`浅池高滑点预警: ${symA}/${symB} 深度仅 $${Math.round(tvl / 1000)}K`);
       continue;
     }
-    const minRequiredApr = isLowIl ? Math.min(25, MIN_APR) : MIN_APR;
+    const minRequiredApr = isLowIl ? Math.min(25, runtimeCfg.minApr) : runtimeCfg.minApr;
     if (apr >= minRequiredApr) {
       core.push({ pair: `${symA}/${symB}`, tvl, apr, isLowIl });
     }
@@ -234,8 +301,8 @@ export async function sweepProfitSol(amountSol) {
   console.log('[利润落袋成功] Signature:', sig);
 }
 
-export async function buildJupiterSwapTx(inputMint, outputMint, amountLamports) {
-  const quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${SLIPPAGE_BPS}`;
+export async function buildJupiterSwapTx(inputMint, outputMint, amountLamports, slippageBps = loadDynamicStrategySettings().slippageBps) {
+  const quoteUrl = `https://lite-api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${slippageBps}`;
   const quoteRes = await fetch(quoteUrl);
   const quote = await quoteRes.json();
   const swapRes = await fetch('https://lite-api.jup.ag/swap/v1/swap', {
@@ -256,12 +323,13 @@ export async function buildJupiterSwapTx(inputMint, outputMint, amountLamports) 
 
 async function tick() {
   tickCount += 1;
+  const runtimeCfg = loadDynamicStrategySettings();
   try {
     const lamports = await connection.getBalance(wallet.publicKey);
     const solBalance = Number((lamports / LAMPORTS_PER_SOL).toFixed(4));
     const [{ best, alerts }, { outUsdc, impactBps }] = await Promise.all([
-      scanLivePools(),
-      checkExitSlippageGuard(),
+      scanLivePools(runtimeCfg),
+      checkExitSlippageGuard(runtimeCfg.slippageBps),
     ]);
 
     // Connect with server auto-execution daemon
@@ -333,18 +401,21 @@ async function tick() {
           solPriceUsd: Number((outUsdc * 10).toFixed(2)),
         };
 
-    writeHeartbeat({
-      balanceSOL: solBalance,
-      bestPool: effectiveBest ? `${effectiveBest.pair} (+${effectiveBest.apr.toFixed(1)}%)` : '空仓避险中',
-      jupiterOutUsdc: Number(outUsdc.toFixed(4)),
-      impactBps: Number(impactBps.toFixed(2)),
-      lastError: null,
-      ...(roundRecord ? { latestRound: roundRecord } : {}),
-      diagnostic: autoDecision?.diagnostic || null,
-    });
+    writeHeartbeat(
+      {
+        balanceSOL: solBalance,
+        bestPool: effectiveBest ? `${effectiveBest.pair} (+${effectiveBest.apr.toFixed(1)}%)` : '空仓避险中',
+        jupiterOutUsdc: Number(outUsdc.toFixed(4)),
+        impactBps: Number(impactBps.toFixed(2)),
+        lastError: null,
+        ...(roundRecord ? { latestRound: roundRecord } : {}),
+        diagnostic: autoDecision?.diagnostic || null,
+      },
+      runtimeCfg.riskProfile
+    );
 
     console.log(
-      `[${new Date().toISOString()}] #${tickCount} 余额 ${solBalance} SOL | 0.1 SOL ≈ ${outUsdc.toFixed(4)} USDC (滑点 ${impactBps.toFixed(2)} bps)`
+      `[${new Date().toISOString()}] #${tickCount} [${runtimeCfg.riskProfile}] 余额 ${solBalance} SOL | 0.1 SOL ≈ ${outUsdc.toFixed(4)} USDC (滑点 ${impactBps.toFixed(2)} bps)`
     );
     if (best) {
       console.log(
@@ -358,7 +429,7 @@ async function tick() {
       console.warn(`  [风控拦截] ${msg}`);
     }
   } catch (err) {
-    writeHeartbeat({ lastError: err.message });
+    writeHeartbeat({ lastError: err.message }, runtimeCfg.riskProfile);
     console.error('[巡检异常]', err.message);
   }
 }

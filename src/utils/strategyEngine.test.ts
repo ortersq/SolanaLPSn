@@ -2005,5 +2005,88 @@ test('non-losing healthy pools never trigger unnecessary close/rebalance/withdra
   assert.equal(dustCompound.targets.length, 0);
 });
 
+test('evaluateLiveRiskAlerts aligns with turbo-high-yield eligibility and avoids false-critical block alerts on held pools', () => {
+  const turboCfg = buildPresetForCapital(200, 'turbo-high-yield');
+  const rankedTurbo = rankPools(
+    [
+      {
+        id: 'vvv-usdc',
+        name: 'VVV / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: 'BJcSKhxWzJPs6H3pi7LddVa6PryM8NH2T1hZAeFEHeDU',
+        tvl: 123_000,
+        volume24h: 360_000,
+        vol7d: 2_800_000,
+        apr: 943,
+        apr7d: 758,
+        feeTier: '0.25%',
+        priceUsd: '4.1',
+        safetyScore: 86,
+        ilRisk: '中',
+      },
+      {
+        id: 'nflx-usdc',
+        name: 'NFLX / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: 'E3mugzPiMhKGrDcfcz5ojo7HJBbYA6UMaJvSzbabPLAM',
+        tvl: 190_000,
+        volume24h: 350_000,
+        vol7d: 2_000_000,
+        apr: 470,
+        apr7d: 320,
+        feeTier: '0.25%',
+        priceUsd: '59',
+        safetyScore: 90,
+        ilRisk: '中',
+        isRwaOrVerified: true,
+      },
+      {
+        id: 'meme-rug',
+        name: 'SCAM / SOL',
+        dex: 'RAYDIUM CLMM',
+        address: '33333333333333333333333333333333',
+        tvl: 110_000,
+        volume24h: 2_500_000,
+        vol7d: 2_600_000,
+        apr: 1800,
+        apr7d: 0,
+        feeTier: '1.00%',
+        priceUsd: '0.01',
+        safetyScore: 60,
+        ilRisk: '高',
+      },
+    ],
+    turboCfg
+  );
 
+  const alerts = evaluateLiveRiskAlerts({
+    pools: rankedTurbo,
+    jupiterImpactBps: 0.42,
+    heliusLatencyMs: 95,
+    privateKeyConfigured: true,
+    config: turboCfg,
+    nowTime: '21:30:00',
+  });
+
+  // Eligible VVV/USDC and NFLX/USDC must NEVER be marked critical "自动风控已拦截入场"
+  assert.equal(
+    alerts.some(
+      (a) => (a.target === 'VVV / USDC' || a.target === 'NFLX / USDC') && a.severity === 'critical'
+    ),
+    false
+  );
+  // Eligible high-APR pools are transparently reported at info severity instead
+  assert.ok(
+    alerts.some(
+      (a) =>
+        a.target === 'VVV / USDC' &&
+        a.severity === 'info' &&
+        a.category === '高息卫星池风控监控'
+    )
+  );
+  // Genuinely rug-blocked pool still raises a critical alert
+  assert.ok(
+    alerts.some((a) => a.target === 'SCAM / SOL' && a.severity === 'critical')
+  );
+});
 

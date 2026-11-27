@@ -13,6 +13,7 @@ import {
   Search,
   ShieldAlert,
   Terminal,
+  Trash2,
   X,
   XCircle,
 } from 'lucide-react';
@@ -121,6 +122,8 @@ export const LogsView: React.FC<LogsViewProps> = ({
   const [newestFirst, setNewestFirst] = useState(true);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [loading, setLoading] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
   const [copied, setCopied] = useState(false);
   const [contextTab, setContextTab] = useState<'alerts' | 'rounds'>('alerts');
   const [apiData, setApiData] = useState<LogsApiResponse | null>(null);
@@ -212,6 +215,31 @@ export const LogsView: React.FC<LogsViewProps> = ({
     await Promise.all([fetchLogs(false), onRefreshStatus ? onRefreshStatus() : Promise.resolve()]);
   };
 
+  const handleClearLogs = async () => {
+    if (!confirmClear) {
+      setConfirmClear(true);
+      setTimeout(() => setConfirmClear(false), 3500);
+      return;
+    }
+    setClearing(true);
+    setConfirmClear(false);
+    try {
+      const res = await fetch('/api/logs/clear', { method: 'POST' });
+      if (res.ok) {
+        const data: LogsApiResponse = await res.json();
+        if (data.success) {
+          setApiData(data);
+          setLastFetchedAt(new Date().toLocaleTimeString('zh-CN', { hour12: false }));
+          if (onRefreshStatus) await onRefreshStatus();
+        }
+      }
+    } catch {
+      // ignore network error
+    } finally {
+      setClearing(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Header Banner */}
@@ -271,6 +299,20 @@ export const LogsView: React.FC<LogsViewProps> = ({
                 <Copy className="w-3.5 h-3.5" />
               )}
               <span>{copied ? '已复制' : '复制当前日志'}</span>
+            </button>
+
+            <button
+              type="button"
+              disabled={clearing}
+              onClick={handleClearLogs}
+              className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors cursor-pointer inline-flex items-center gap-1.5 disabled:opacity-50 ${
+                confirmClear
+                  ? 'bg-rose-500/20 text-rose-300 border-rose-500/50 hover:bg-rose-500/30'
+                  : 'text-slate-300 bg-[#090d16] border-slate-700 hover:text-rose-300 hover:border-rose-500/40'
+              }`}
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>{clearing ? '清空中...' : confirmClear ? '确认清空历史日志?' : '清空历史日志'}</span>
             </button>
 
             <a

@@ -488,6 +488,7 @@ let selectionRoundCounter = 0;
 let selectionRounds: PoolSelectionRound[] = [];
 let isAutoTicking = false;
 let lastCompletedAutoTickAt = 0;
+let lastHealthyHeartbeatLogAt = Date.now();
 let lastAutoTickDiagnostic: any = null;
 let latestSolPriceUsd = 85;
 const poolActionCooldownMs = new Map<string, number>();
@@ -1308,6 +1309,55 @@ app.get('/api/logs/export', (_req, res) => {
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.setHeader('Content-Disposition', 'attachment; filename="solana-lp-logs.txt"');
   res.send(lines.join('\n'));
+});
+
+app.post('/api/logs/clear', (_req, res) => {
+  lastLoggedWorkerError = '';
+  backendStatus.logs = [
+    {
+      id: Date.now(),
+      time: nowTime(),
+      dateTime: nowDateTime(),
+      timestamp: Date.now(),
+      type: 'info',
+      source: 'system',
+      message: '已清空历史运行日志，当前继续实时监控链上仓位、风控拦截与交易状态。',
+    },
+  ];
+  try {
+    fs.writeFileSync(LOG_HISTORY_FILE_PATH, JSON.stringify(backendStatus.logs));
+  } catch {
+    // ignore read-only fs
+  }
+  const workerStatus = readWorkerHeartbeat();
+  res.json({
+    success: true,
+    logs: backendStatus.logs,
+    totalCount: backendStatus.logs.length,
+    countsByLevel: {
+      all: backendStatus.logs.length,
+      error: 0,
+      warning: 0,
+      success: 0,
+      info: backendStatus.logs.length,
+    },
+    countsBySource: {
+      all: backendStatus.logs.length,
+      tx: 0,
+      risk: 0,
+      strategy: 0,
+      worker: 0,
+      system: backendStatus.logs.length,
+    },
+    workerStatus,
+    heliusConnected: backendStatus.heliusConnected,
+    heliusLatencyMs: backendStatus.heliusLatencyMs,
+    dryRunMode: process.env.DRY_RUN !== 'false',
+    riskAlerts: backendStatus.riskAlerts,
+    selectionRounds: selectionRounds.slice(0, 20),
+    strategyDiagnostic: lastAutoTickDiagnostic,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 async function fetchJupiterQuoteMetrics(amountSol: number) {
@@ -5490,6 +5540,14 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
             const totalFeeUsd = activePositions.reduce((s, p) => s + p.uncollectedFeeUsd, 0);
             actionTaken = totalFeeUsd >= strategyConfig.harvestMinUsd ? 'HARVEST_PENDING' : 'HOLD_EARNING_FEES';
             conclusion = `正在做市中：共 ${activePositions.length} 个仓位合计注入 $${portfolioPlan.activeInjectedUsd.toFixed(2)}（资金利用率 ${portfolioPlan.utilizationPct}%），待领手续费 $${totalFeeUsd.toFixed(2)}。`;
+            if (Date.now() - lastHealthyHeartbeatLogAt >= 15 * 60 * 1000) {
+              lastHealthyHeartbeatLogAt = Date.now();
+              pushLog(
+                'success',
+                `[做市巡检正常] 连续运行无异常：${activePositions.length} 个仓位在池 $${portfolioPlan.activeInjectedUsd.toFixed(2)}（利用率 ${portfolioPlan.utilizationPct}%），待收手续费 $${totalFeeUsd.toFixed(2)}，钱包余额 ${balancesInitial.solBalance} SOL（零无效 Gas 损耗）。`,
+                'system'
+              );
+            }
           } else if (balancesInitial.solBalance < 0.028) {
             actionTaken = 'INSUFFICIENT_SOL';
             conclusion = `钱包可用 SOL 仅 ${balancesInitial.solBalance.toFixed(4)}，不足 0.028 SOL 开仓租金与 Gas 门槛。`;
@@ -6350,6 +6408,12 @@ if (process.env.NODE_ENV !== 'production') {
 const port = 3000;
 app.listen(port, '0.0.0.0', () => {
   console.log(`Solana 200U 稳定盈利控制台运行中：http://localhost:${port}`);
+  lastHealthyHeartbeatLogAt = Date.now();
+  pushLog(
+    'info',
+    `[系统启动] 服务已上线（档位: ${strategyConfig.riskProfile} · ${process.env.DRY_RUN !== 'false' ? 'DRY_RUN 演练' : '实盘自动运行'}），历史记录仅作归档参考，当前已开始新一轮实时状态监控。`,
+    'system'
+  );
   setTimeout(() => {
     runAutoStrategyTick().catch(() => {});
     setInterval(() => {

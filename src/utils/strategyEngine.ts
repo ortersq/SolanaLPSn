@@ -709,7 +709,7 @@ export function evaluateLiveRiskAlerts(input: LiveRiskScanInput): RiskLogEntry[]
   if (jupiterImpactBps !== null) {
     if (jupiterImpactBps > config.slippageBps) {
       alerts.push({
-        id: `slip-breach-${Date.now()}`,
+        id: 'slip-breach',
         time: nowTime,
         severity: 'critical',
         category: '撤池滑点过高预警',
@@ -718,7 +718,7 @@ export function evaluateLiveRiskAlerts(input: LiveRiskScanInput): RiskLogEntry[]
       });
     } else {
       alerts.push({
-        id: `slip-ok-${Date.now()}`,
+        id: 'slip-ok',
         time: nowTime,
         severity: 'safe',
         category: '撤池滑点实测正常',
@@ -742,12 +742,34 @@ export function evaluateLiveRiskAlerts(input: LiveRiskScanInput): RiskLogEntry[]
     });
   }
 
-  // 3. Live Raydium pools: abnormal price/APR volatility traps
-  const volatilePools = pools.filter(
-    (p) =>
-      !assessPoolAntiRugRisk(p).blocked &&
-      (p.ilRisk === '高' || p.apr > 180 || Math.abs(p.priceChange24h || 0) >= 8)
-  );
+  // 3. Live Raydium pools: abnormal price/APR volatility traps vs eligible high-APR satellites
+  const isAggressiveMode =
+    config.riskProfile === 'turbo-high-yield' || config.riskProfile === 'active-yield';
+  const maxSafeApr =
+    config.riskProfile === 'turbo-high-yield'
+      ? 2200
+      : config.riskProfile === 'active-yield'
+      ? 1600
+      : 180;
+  const maxSafePriceSwing24h = isAggressiveMode ? 15 : 8;
+
+  const volatilePools = pools.filter((p) => {
+    if (assessPoolAntiRugRisk(p).blocked) return false;
+    const priceSwing = Math.abs(p.priceChange24h || 0);
+    if (typeof p.eligibleFor200U === 'boolean') {
+      if (p.eligibleFor200U && priceSwing < maxSafePriceSwing24h) {
+        return false;
+      }
+      if (!p.eligibleFor200U && (p.ilRisk === '高' || p.apr > maxSafeApr || priceSwing >= maxSafePriceSwing24h)) {
+        return true;
+      }
+    }
+    if (!isAggressiveMode) {
+      return p.ilRisk === '高' || p.apr > maxSafeApr || priceSwing >= maxSafePriceSwing24h;
+    }
+    return p.apr > maxSafeApr || priceSwing >= maxSafePriceSwing24h || (p.ilRisk === '高' && p.apr > 2200);
+  });
+
   for (const pool of volatilePools.slice(0, 3)) {
     const tvlLabel =
       pool.tvl >= 1_000_000
@@ -763,7 +785,36 @@ export function evaluateLiveRiskAlerts(input: LiveRiskScanInput): RiskLogEntry[]
     });
   }
 
+  // For aggressive high-yield profiles, log eligible high-APR pools transparently as info-level monitoring (not false critical blocks)
+  if (isAggressiveMode) {
+    const monitoredSatellites = pools.filter(
+      (p) =>
+        !assessPoolAntiRugRisk(p).blocked &&
+        p.eligibleFor200U &&
+        p.apr > 180 &&
+        !volatilePools.some((v) => v.id === p.id)
+    );
+    for (const pool of monitoredSatellites.slice(0, 2)) {
+      const tvlLabel =
+        pool.tvl >= 1_000_000
+          ? `$${(pool.tvl / 1_000_000).toFixed(2)}M`
+          : `$${Math.round(pool.tvl / 1000)}K`;
+      alerts.push({
+        id: `sat-${pool.id}`,
+        time: nowTime,
+        severity: 'info',
+        category: '高息卫星池风控监控',
+        target: pool.name,
+        detail: `高收益模式已放行 ${pool.name}（年化 +${pool.apr}% · 深度 ${tvlLabel}），已通过防撤池与 7 日持续性校验并受单池 ≤38% 限仓保护。`,
+      });
+    }
+  }
+
   // 4. Live Raydium pools: shallow liquidity -> withdraw slippage risk
+  const minTvlLabel =
+    config.minTVL >= 1_000_000
+      ? `$${(config.minTVL / 1_000_000).toFixed(1)}M`
+      : `$${Math.round(config.minTVL / 1000)}K`;
   const shallowPools = pools.filter(
     (p) =>
       !assessPoolAntiRugRisk(p).blocked &&
@@ -777,14 +828,14 @@ export function evaluateLiveRiskAlerts(input: LiveRiskScanInput): RiskLogEntry[]
       severity: 'warning',
       category: '浅池撤池高滑点预警',
       target: pool.name,
-      detail: `当前 TVL 仅 $${Math.round(pool.tvl / 1000)}K（低于 $${(config.minTVL / 1_000_000).toFixed(1)}M 安全门槛），若遇踩踏撤池将产生高额滑点，已自动过滤。`,
+      detail: `当前 TVL 仅 $${Math.round(pool.tvl / 1000)}K（低于 ${minTvlLabel} 安全门槛），若遇踩踏撤池将产生高额滑点，已自动过滤。`,
     });
   }
 
-  // 4. Helius RPC latency guard
+  // 5. Helius RPC latency guard
   if (heliusLatencyMs !== null && heliusLatencyMs > 600) {
     alerts.push({
-      id: `rpc-lat-${Date.now()}`,
+      id: 'rpc-lat',
       time: nowTime,
       severity: 'warning',
       category: 'RPC 节点延迟波动',
@@ -793,10 +844,10 @@ export function evaluateLiveRiskAlerts(input: LiveRiskScanInput): RiskLogEntry[]
     });
   }
 
-  // 5. Backend key guard (never fake positions)
+  // 6. Backend key guard (never fake positions)
   if (!privateKeyConfigured) {
     alerts.push({
-      id: `guard-env-${Date.now()}`,
+      id: 'guard-env',
       time: nowTime,
       severity: 'info',
       category: '后台密钥隔离护栏',
