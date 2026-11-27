@@ -1084,14 +1084,33 @@ export function calculateAutoPortfolioPlan(params: {
     (deployableSol * safeSolPrice + deployableUsdc).toFixed(2)
   );
 
+  const positionsByPool = new Map<string, Array<{ poolId: string; poolName: string; injectedValueUsd: number }>>();
+  for (const p of activePositions) {
+    if (p.injectedValueUsd <= 0) continue;
+    const list = positionsByPool.get(p.poolId) || [];
+    list.push(p);
+    positionsByPool.set(p.poolId, list);
+  }
+  const duplicateSmallerSet = new Set<(typeof activePositions)[number]>();
+  for (const list of positionsByPool.values()) {
+    if (list.length > 1) {
+      const sorted = [...list].sort((a, b) => b.injectedValueUsd - a.injectedValueUsd);
+      for (let i = 1; i < sorted.length; i++) {
+        if (sorted[i].injectedValueUsd < 5) {
+          duplicateSmallerSet.add(sorted[i]);
+        }
+      }
+    }
+  }
+
   const dustPositions = activePositions.filter(
-    (p) => p.injectedValueUsd > 0 && p.injectedValueUsd < 1.5
+    (p) => (p.injectedValueUsd > 0 && p.injectedValueUsd < 1.5) || duplicateSmallerSet.has(p)
   );
   const dustPositionUsd = Number(
     dustPositions.reduce((acc, p) => acc + p.injectedValueUsd, 0).toFixed(2)
   );
-  const hasDustPositionToConsolidate =
-    dustPositions.length > 0 && (idleDeployableUsd >= 6 || deployableUsdc >= 6);
+  // Closing a <$1.50 dust NFT or duplicate <$5 NFT always refunds ~0.018 SOL (~$1.3+) rent, even when idle USDC < $6
+  const hasDustPositionToConsolidate = dustPositions.length > 0;
 
   const effectiveCapitalBase = activeInjectedUsd + idleDeployableUsd;
   const utilizationPct =
@@ -1472,7 +1491,9 @@ export function evaluateAutonomousHighYieldSwitch(params: {
     .sort((a, b) => a.currentApr - b.currentApr);
 
   const weakestActive = activeDetails[0] || null;
-  const realActiveCount = activeDetails.filter((a) => a.injectedValueUsd >= 1.5).length;
+  const realActiveCount = new Set(
+    activeDetails.filter((a) => a.injectedValueUsd >= 1.5).map((a) => a.poolId)
+  ).size;
   const totalEquityUsd = activeInjectedTotal + Math.max(idleDeployableUsd, usdcBalance);
   const slotCap = parallelEnabled ? (totalEquityUsd >= 60 ? 3 : 2) : 1;
 

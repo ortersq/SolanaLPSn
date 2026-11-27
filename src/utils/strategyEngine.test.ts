@@ -1311,3 +1311,75 @@ test('yield optimizations: correlated narrow range, 7d APR stability, <$60 2-slo
   assert.equal(topUpRec.topUpExistingPosition?.nftMint, 'nft-hsol');
   assert.equal(topUpRec.topUpExistingPosition?.poolId, 'sustained-lst');
 });
+
+test('calculateAutoPortfolioPlan flags duplicate smaller same-pool NFTs and dust even when idle USDC < $6', () => {
+  const activeCfg = buildPresetForCapital(30, 'active-yield');
+  const pools: PoolMetrics[] = [
+    {
+      id: 'hsol-pool',
+      name: 'WSOL / hSOL',
+      dex: 'RAYDIUM CLMM',
+      address: 'hsol-pool',
+      feeTier: '1.00%',
+      priceUsd: '$0.84',
+      apr: 168,
+      apr7d: 134,
+      tvl: 2_270_000,
+      volume24h: 1_040_000,
+      fee24hUsd: 10_400,
+      safetyScore: 95,
+      ilRisk: '低',
+      isBluechip: true,
+    },
+    {
+      id: 'spcx-pool',
+      name: 'SPCX / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'spcx-pool',
+      feeTier: '0.25%',
+      priceUsd: '$133.00',
+      apr: 142,
+      apr7d: 78,
+      tvl: 2_380_000,
+      volume24h: 3_500_000,
+      fee24hUsd: 8_750,
+      safetyScore: 84,
+      ilRisk: '中',
+      isBluechip: false,
+    },
+  ];
+  const ranked = rankPools(pools, activeCfg);
+
+  // Live duplicate case: $14.09 WSOL/hSOL + $0.64 WSOL/hSOL + $10.77 SPCX/USDC with only $3.25 USDC idle
+  const plan = calculateAutoPortfolioPlan({
+    solBalance: 0.020168,
+    usdcBalance: 3.2496,
+    solPriceUsd: 73.11,
+    activePositions: [
+      { poolId: 'hsol-pool', poolName: 'WSOL / hSOL', injectedValueUsd: 14.09, inRange: true },
+      { poolId: 'hsol-pool', poolName: 'WSOL / hSOL', injectedValueUsd: 0.64, inRange: true },
+      { poolId: 'spcx-pool', poolName: 'SPCX / USDC', injectedValueUsd: 10.77, inRange: true },
+    ],
+    rankedPools: ranked,
+    config: activeCfg,
+  });
+
+  assert.equal(plan.hasDustPositionToConsolidate, true);
+  assert.equal(plan.dustPositionUsd, 0.64);
+
+  // Also flag smaller duplicate NFT (< $5) even if >= $1.50
+  const dupPlan = calculateAutoPortfolioPlan({
+    solBalance: 0.025,
+    usdcBalance: 2,
+    solPriceUsd: 73,
+    activePositions: [
+      { poolId: 'hsol-pool', poolName: 'WSOL / hSOL', injectedValueUsd: 14.09, inRange: true },
+      { poolId: 'hsol-pool', poolName: 'WSOL / hSOL', injectedValueUsd: 3.2, inRange: true },
+    ],
+    rankedPools: ranked,
+    config: activeCfg,
+  });
+  assert.equal(dupPlan.hasDustPositionToConsolidate, true);
+  assert.equal(dupPlan.dustPositionUsd, 3.2);
+});
+

@@ -407,6 +407,42 @@ let lastAutoSafeWithdrawAt = 0;
 let lastAutoCompoundAt = 0;
 let lastMultiHedgeAt = 0;
 let lastAutoGasTopUpAt = 0;
+let clmmWriteInFlight = false;
+async function acquireClmmWriteLock(): Promise<() => void> {
+  const deadline = Date.now() + 45_000;
+  while (clmmWriteInFlight && Date.now() < deadline) {
+    await sleep(300);
+  }
+  clmmWriteInFlight = true;
+  return () => {
+    clmmWriteInFlight = false;
+  };
+}
+
+function getPositionsToConsolidate(positions: ActiveLpPosition[]): ActiveLpPosition[] {
+  const byPool = new Map<string, ActiveLpPosition[]>();
+  for (const p of positions) {
+    if (p.injectedValueUsd <= 0) continue;
+    const arr = byPool.get(p.poolId) || [];
+    arr.push(p);
+    byPool.set(p.poolId, arr);
+  }
+  const duplicateSmallerMints = new Set<string>();
+  for (const list of byPool.values()) {
+    if (list.length > 1) {
+      const sorted = [...list].sort((a, b) => b.injectedValueUsd - a.injectedValueUsd);
+      for (let i = 1; i < sorted.length; i++) {
+        if (sorted[i].injectedValueUsd < 5) {
+          duplicateSmallerMints.add(sorted[i].nftMint);
+        }
+      }
+    }
+  }
+  return positions.filter(
+    (p) => (p.injectedValueUsd > 0 && p.injectedValueUsd < 1.5) || duplicateSmallerMints.has(p.nftMint)
+  );
+}
+
 let cachedLendingReserves: SolanaLendingReserve[] = [];
 let lastLendingReservesFetchTime = 0;
 const mintSymbolCache = new Map<string, string>([
@@ -2763,6 +2799,7 @@ async function openRealClmmPoolPosition(params: {
   targetUsd: number;
   rangeWidthPct: number;
   solPriceUsd?: number;
+  allowDuplicatePool?: boolean;
 }): Promise<{
   poolId: string;
   poolName: string;
@@ -2776,9 +2813,48 @@ async function openRealClmmPoolPosition(params: {
   if (!BACKEND_KEYPAIR) {
     throw new Error('后台 .env 未配置有效 PRIVATE_KEY');
   }
-  const { poolId, targetUsd, rangeWidthPct, solPriceUsd = latestSolPriceUsd || 85 } = params;
+  const {
+    poolId,
+    targetUsd,
+    rangeWidthPct,
+    solPriceUsd = latestSolPriceUsd || 85,
+    allowDuplicatePool = false,
+  } = params;
   const safeRangePct = Math.max(1, Math.min(25, rangeWidthPct));
   const ownerPk = BACKEND_KEYPAIR.publicKey;
+
+  if (!allowDuplicatePool) {
+    const livePositions = await fetchActivePositions(true).catch(() => cachedActivePositions);
+    const existingSamePool = livePositions.find(
+      (p) => p.poolId === poolId && p.injectedValueUsd >= 1.5
+    );
+    if (existingSamePool) {
+      if (existingSamePool.inRange && existingSamePool.nftMint) {
+        pushLog(
+          'info',
+          `[同池防重复保护] 检测到【${existingSamePool.poolName}】已有在区间活跃仓位 (${maskSolanaAddress(existingSamePool.nftMint)}, $${existingSamePool.injectedValueUsd.toFixed(2)})，自动改为原仓追加，禁止重复铸造 NFT！`
+        );
+        const topped = await increaseExistingClmmPosition({
+          nftMint: existingSamePool.nftMint,
+          poolId,
+          addUsd: targetUsd,
+          solPriceUsd,
+        });
+        return {
+          poolId,
+          poolName: topped.poolName,
+          nftMint: topped.nftMint,
+          txId: topped.txId,
+          tickLower: existingSamePool.tickLower,
+          tickUpper: existingSamePool.tickUpper,
+          injectedSummary: `${topped.injectedSummary} (原仓合并追加，免重复开NFT)`,
+        };
+      }
+      throw new Error(
+        `同池【${existingSamePool.poolName}】已存在越界旧仓 (${maskSolanaAddress(existingSamePool.nftMint)})，请先平旧仓再重建，禁止重复开池`
+      );
+    }
+  }
 
   const raydium = await Raydium.load({
     owner: BACKEND_KEYPAIR,
@@ -3055,6 +3131,36 @@ async function openRealClmmPoolPosition(params: {
         expectedOther.toString(),
         sdkSlippageOther.toString(),
         25
+      );
+    }
+
+    const poolNumPrice = Number(poolInfo.price || 0);
+    const priceAUsdEst = isUsdcA
+      ? 1
+      : isSolA
+      ? solPriceUsd
+      : isUsdcB
+      ? poolNumPrice
+      : isSolB
+      ? poolNumPrice * solPriceUsd
+      : 0;
+    const priceBUsdEst = isUsdcB
+      ? 1
+      : isSolB
+      ? solPriceUsd
+      : isUsdcA && poolNumPrice > 0
+      ? 1 / poolNumPrice
+      : isSolA && poolNumPrice > 0
+      ? solPriceUsd / poolNumPrice
+      : 0;
+    const actualAmtA =
+      Number((base === 'MintA' ? baseAmount : expectedOther).toString()) / 10 ** decA;
+    const actualAmtB =
+      Number((base === 'MintB' ? baseAmount : expectedOther).toString()) / 10 ** decB;
+    const actualDepositUsd = actualAmtA * priceAUsdEst + actualAmtB * priceBUsdEst;
+    if (actualDepositUsd < 2.5) {
+      throw new Error(
+        `测算实际入池价值仅 $${actualDepositUsd.toFixed(2)}，低于 $2.50 最低经济建仓线（防生成锁租金尘埃微仓），已拦截`
       );
     }
 
@@ -3783,40 +3889,42 @@ async function executeFullPortfolioDeployment(forceConsolidateDust = true): Prom
     };
   }
 
-  let closedDustCount = 0;
-  const openedPositions: Array<{ poolName: string; poolId: string; nftMint: string; txId: string; summary: string }> = [];
-  const errors: string[] = [];
+  const releaseLock = await acquireClmmWriteLock();
+  try {
+    let closedDustCount = 0;
+    const openedPositions: Array<{ poolName: string; poolId: string; nftMint: string; txId: string; summary: string }> = [];
+    const errors: string[] = [];
 
-  // Step 1: Close <$1.50 test micro-positions if significant idle capital is sitting in wallet
-  let currentPositions = positions;
-  if (forceConsolidateDust && portfolioPlan.hasDustPositionToConsolidate) {
-    const dustList = currentPositions.filter((p) => p.injectedValueUsd > 0 && p.injectedValueUsd < 1.5);
-    for (const dust of dustList) {
-      try {
-        pushLog('info', `[全额资金激活] 正在平掉 $${dust.injectedValueUsd.toFixed(2)} 测试微仓（${dust.poolName}）并回收 ~0.018 SOL 租金...`);
-        const closed = await closeClmmPositionByNft(dust.nftMint);
-        closedDustCount += 1;
-        pushLog('success', `[微仓回收成功] 已注销测试仓位 NFT ${maskSolanaAddress(closed.closedNftMint)}，TX: ${closed.txId}`);
-        await sleep(1800);
-      } catch (err: any) {
-        const msg = formatChainError(err);
-        errors.push(`回收微仓失败: ${msg}`);
-        pushLog('error', `[微仓回收失败] ${msg}`);
+    // Step 1: Close <$1.50 dust positions & smaller duplicate same-pool NFTs to reclaim ~0.018 SOL rent each
+    let currentPositions = positions;
+    const dustList = getPositionsToConsolidate(currentPositions);
+    if (forceConsolidateDust && dustList.length > 0) {
+      for (const dust of dustList) {
+        try {
+          pushLog('info', `[全额资金激活] 正在平掉 $${dust.injectedValueUsd.toFixed(2)} 微仓/重复仓位（${dust.poolName}）并回收 ~0.018 SOL 租金...`);
+          const closed = await closeClmmPositionByNft(dust.nftMint);
+          closedDustCount += 1;
+          pushLog('success', `[微仓/重复仓回收成功] 已注销仓位 NFT ${maskSolanaAddress(closed.closedNftMint)}，TX: ${closed.txId}`);
+          await sleep(1800);
+        } catch (err: any) {
+          const msg = formatChainError(err);
+          errors.push(`回收微仓失败: ${msg}`);
+          pushLog('error', `[微仓回收失败] ${msg}`);
+        }
+      }
+      if (closedDustCount > 0) {
+        const updatedBal = await getWalletBalances(BACKEND_KEYPAIR.publicKey);
+        currentPositions = await fetchActivePositions(true);
+        portfolioPlan = calculateAutoPortfolioPlan({
+          solBalance: updatedBal.solBalance,
+          usdcBalance: updatedBal.usdcBalance,
+          solPriceUsd: latestSolPriceUsd,
+          activePositions: currentPositions,
+          rankedPools: ranked,
+          config: strategyConfig,
+        });
       }
     }
-    if (closedDustCount > 0) {
-      const updatedBal = await getWalletBalances(BACKEND_KEYPAIR.publicKey);
-      currentPositions = await fetchActivePositions(true);
-      portfolioPlan = calculateAutoPortfolioPlan({
-        solBalance: updatedBal.solBalance,
-        usdcBalance: updatedBal.usdcBalance,
-        solPriceUsd: latestSolPriceUsd,
-        activePositions: currentPositions,
-        rankedPools: ranked,
-        config: strategyConfig,
-      });
-    }
-  }
 
   // Ensure minimum SOL gas/rent reserve via idle USDC before slot opening
   try {
@@ -3936,6 +4044,9 @@ async function executeFullPortfolioDeployment(forceConsolidateDust = true): Prom
     errors,
     portfolioPlan: finalPlan,
   };
+  } finally {
+    releaseLock();
+  }
 }
 
 async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Promise<{
@@ -3972,7 +4083,7 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
         : null);
 
     const [activePositionsInitial, balancesInitial, poolsRes, solQuote] = await Promise.all([
-      fetchActivePositions(false),
+      fetchActivePositions(hasKey && !isDryRun),
       walletPk
         ? getWalletBalances(walletPk)
         : Promise.resolve({ solBalance: 0, usdcBalance: 0, usdtBalance: 0, tokenAccountCount: 0 }),
@@ -4168,10 +4279,10 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
         actionTaken = 'DRY_RUN_ENTRY_SIMULATED';
       } else {
         // LIVE mode (DRY_RUN=false & hasKey)
-        const dustPositions = activePositions.filter(
-          (p) => p.injectedValueUsd > 0 && p.injectedValueUsd < 1.5
-        );
-        const needConsolidate = portfolioPlan.hasDustPositionToConsolidate && dustPositions.length > 0;
+        const releaseLiveLock = await acquireClmmWriteLock();
+        try {
+        const dustPositions = getPositionsToConsolidate(activePositions);
+        const needConsolidate = dustPositions.length > 0;
         const missingSlot = portfolioPlan.slotPlans.find(
           (slot) => !activePositions.some((p) => p.poolId === slot.poolId && p.injectedValueUsd >= 1.5)
         );
@@ -4179,21 +4290,20 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
         const cooldownOk = (key: string) => nowMs - (poolActionCooldownMs.get(key) || 0) >= 90_000;
 
         const autoAllocAllowed = strategyConfig.smartCapitalAllocation !== false;
-        // Step A: Reclaim <$1.50 dust positions FIRST (requires only >= 0.006 SOL upfront; refunds ~0.018 SOL rent)
+        // Step A: Reclaim <$1.50 dust positions & smaller duplicate same-pool NFTs FIRST (requires only >= 0.004 SOL upfront; refunds ~0.018 SOL rent)
         if (
-          autoAllocAllowed &&
           needConsolidate &&
-          balancesInitial.solBalance >= 0.006 &&
+          balancesInitial.solBalance >= 0.004 &&
           cooldownOk('dust-consolidate')
         ) {
           poolActionCooldownMs.set('dust-consolidate', nowMs);
           for (const dust of dustPositions) {
             try {
-              pushLog('info', `[自动清理测试微仓] 检测到 $${dust.injectedValueUsd.toFixed(2)} 微仓而钱包闲置 $${portfolioPlan.idleDeployableUsd.toFixed(2)}，正在回收微仓与 0.018 SOL 租金...`);
+              pushLog('info', `[自动清理微仓/重复仓] 检测到 ${dust.poolName} 存在 $${dust.injectedValueUsd.toFixed(2)} 微仓或同池重复 NFT，正在平仓并回收 ~0.018 SOL 租金...`);
               await closeClmmPositionByNft(dust.nftMint);
               await sleep(1600);
             } catch (err: any) {
-              pushLog('error', `[微仓回收失败] ${formatChainError(err)}`);
+              pushLog('error', `[微仓/重复仓回收失败] ${formatChainError(err)}`);
             }
           }
           activePositions = await fetchActivePositions(true);
@@ -4559,7 +4669,23 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
 
             if (trim.closeFull) {
               const boostBudget = Math.min(Math.max(targetBoost.boostUsd, availAfterUsd * 0.8), availAfterUsd * 0.9);
-              if (balAfterClose.solBalance >= 0.026 && boostBudget >= 3) {
+              const existingBoostTarget = activePositions.find(
+                (p) => p.poolId === targetBoost.poolId && p.inRange && p.nftMint && p.injectedValueUsd >= 1.5
+              );
+              if (existingBoostTarget && boostBudget >= 3) {
+                const topped = await increaseExistingClmmPosition({
+                  nftMint: existingBoostTarget.nftMint,
+                  poolId: targetBoost.poolId,
+                  addUsd: boostBudget,
+                  solPriceUsd: latestSolPriceUsd,
+                });
+                pushLog(
+                  'success',
+                  `[自动资产重平衡完成] 已将异常池资金原仓合并至【${topped.poolName}】(${topped.injectedSummary}) · TX: ${topped.txId}`
+                );
+                actionTaken = 'LIVE_REBALANCED';
+                conclusion = `自动重平衡完成：${trim.poolName} 深度异常，已自动并仓增配至 ${topped.poolName}。`;
+              } else if (balAfterClose.solBalance >= 0.026 && boostBudget >= 3) {
                 const opened = await openRealClmmPoolPosition({
                   poolId: targetBoost.poolId,
                   targetUsd: boostBudget,
@@ -4575,17 +4701,33 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
               }
             } else {
               const boostBudget = Math.min(targetBoost.boostUsd, availAfterUsd * 0.65);
+              const existingBoostTarget = activePositions.find(
+                (p) => p.poolId === targetBoost.poolId && p.inRange && p.nftMint && p.injectedValueUsd >= 1.5
+              );
               if (boostBudget >= 3) {
-                const boosted = await openRealClmmPoolPosition({
-                  poolId: targetBoost.poolId,
-                  targetUsd: boostBudget,
-                  rangeWidthPct: getOptimalRangeWidthForPool(targetBoost.poolName, strategyConfig),
-                  solPriceUsd: latestSolPriceUsd,
-                });
-                pushLog(
-                  'success',
-                  `[重平衡 · 补足低配池] ${boosted.poolName} (${boosted.injectedSummary}) · TX: ${boosted.txId}`
-                );
+                if (existingBoostTarget) {
+                  const topped = await increaseExistingClmmPosition({
+                    nftMint: existingBoostTarget.nftMint,
+                    poolId: targetBoost.poolId,
+                    addUsd: boostBudget,
+                    solPriceUsd: latestSolPriceUsd,
+                  });
+                  pushLog(
+                    'success',
+                    `[重平衡 · 原仓补足低配池] ${topped.poolName} (${topped.injectedSummary}) · TX: ${topped.txId}`
+                  );
+                } else {
+                  const boosted = await openRealClmmPoolPosition({
+                    poolId: targetBoost.poolId,
+                    targetUsd: boostBudget,
+                    rangeWidthPct: getOptimalRangeWidthForPool(targetBoost.poolName, strategyConfig),
+                    solPriceUsd: latestSolPriceUsd,
+                  });
+                  pushLog(
+                    'success',
+                    `[重平衡 · 补足低配池] ${boosted.poolName} (${boosted.injectedSummary}) · TX: ${boosted.txId}`
+                  );
+                }
                 await sleep(1500);
               }
               const balForCore = await getWalletBalances(BACKEND_KEYPAIR!.publicKey);
@@ -4737,6 +4879,9 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
             actionTaken = 'WAIT_CAPITAL';
             conclusion = portfolioPlan.diagnosisNote;
           }
+        }
+        } finally {
+          releaseLiveLock();
         }
       }
     }
@@ -5382,64 +5527,122 @@ app.post('/api/strategy/auto-yield-switch', async (_req, res) => {
       });
     }
 
-    let closedTxId: string | undefined;
-    if (
-      recommendation.decision === 'OPEN_NEW' &&
-      recommendation.sourcePositionToReplace &&
-      recommendation.sourcePositionToReplace.injectedValueUsd < 1.5 &&
-      recommendation.sourcePositionToReplace.nftMint
-    ) {
-      pushLog(
-        'info',
-        `[一键切换高收益池] 回收微仓 ${recommendation.sourcePositionToReplace.poolName} 租金后直开高收益池...`
-      );
-      const closed = await closeClmmPositionByNft(recommendation.sourcePositionToReplace.nftMint);
-      closedTxId = closed.txId;
-      await sleep(1800);
-    } else if (
-      recommendation.decision === 'ROTATE_SWAP' &&
-      recommendation.sourcePositionToReplace?.nftMint
-    ) {
-      const src = recommendation.sourcePositionToReplace;
-      pushLog(
-        'warning',
-        `[一键切换高收益池 · 自动换仓] 钱包无闲置资金，正在先平掉【${src.poolName}】(+${src.currentApr}%) 准备换入【${recommendation.targetPool.poolName}】(+${recommendation.targetPool.apr}%)...`
-      );
-      const closed = await closeClmmPositionByNft(src.nftMint);
-      closedTxId = closed.txId;
-      lastAutonomousRotateAt = Date.now();
-      await sleep(2200);
+    let topUpCompletedPayload: any = null;
+    let openedPayload: any = null;
+    let blockedPayload: any = null;
+    const releaseAutoSwitchLock = await acquireClmmWriteLock();
+    try {
+      let closedTxId: string | undefined;
+      if (
+        recommendation.decision === 'OPEN_NEW' &&
+        recommendation.sourcePositionToReplace &&
+        recommendation.sourcePositionToReplace.injectedValueUsd < 1.5 &&
+        recommendation.sourcePositionToReplace.nftMint
+      ) {
+        pushLog(
+          'info',
+          `[一键切换高收益池] 回收微仓 ${recommendation.sourcePositionToReplace.poolName} 租金后直开高收益池...`
+        );
+        const closed = await closeClmmPositionByNft(recommendation.sourcePositionToReplace.nftMint);
+        closedTxId = closed.txId;
+        await sleep(1800);
+      } else if (
+        recommendation.decision === 'ROTATE_SWAP' &&
+        recommendation.sourcePositionToReplace?.nftMint
+      ) {
+        const src = recommendation.sourcePositionToReplace;
+        pushLog(
+          'warning',
+          `[一键切换高收益池 · 自动换仓] 钱包无闲置资金，正在先平掉【${src.poolName}】(+${src.currentApr}%) 准备换入【${recommendation.targetPool.poolName}】(+${recommendation.targetPool.apr}%)...`
+        );
+        const closed = await closeClmmPositionByNft(src.nftMint);
+        closedTxId = closed.txId;
+        lastAutonomousRotateAt = Date.now();
+        await sleep(2200);
+      }
+
+      const topUpTarget = recommendation.topUpExistingPosition;
+      if (topUpTarget?.nftMint) {
+        const balNow = await getWalletBalances(BACKEND_KEYPAIR.publicKey);
+        const availForTopUp = Math.max(0, balNow.solBalance - 0.015) * latestSolPriceUsd + balNow.usdcBalance;
+        const topUpBudget = Math.min(recommendation.deployBudgetUsd, availForTopUp * 0.85);
+        if (topUpBudget < 2) {
+          blockedPayload = {
+            success: false,
+            decision: recommendation.decision,
+            message: `可用流动资金仅 $${availForTopUp.toFixed(2)}，暂不足以向原仓追加流动性。`,
+            recommendation,
+            closedTxId,
+            backendStatus: getLiveBackendStatus(),
+            activePositions: cachedActivePositions,
+          };
+        } else {
+          const topped = await increaseExistingClmmPosition({
+            nftMint: topUpTarget.nftMint,
+            poolId: topUpTarget.poolId,
+            addUsd: topUpBudget,
+            solPriceUsd: latestSolPriceUsd,
+          });
+          pushLog(
+            'success',
+            `[一键原仓追加完成] 已向【${topped.poolName}】直接追加流动性 (${topped.injectedSummary}) · TX: ${topped.txId}`
+          );
+          await fetchActivePositions(true);
+          await getWalletBalances(BACKEND_KEYPAIR.publicKey);
+          topUpCompletedPayload = { topped, closedTxId };
+        }
+      } else {
+        await ensureSolGasReserveFromUsdc(latestSolPriceUsd).catch(() => {});
+
+        const balNow = await getWalletBalances(BACKEND_KEYPAIR.publicKey);
+        const availNowUsd = Math.max(0, balNow.solBalance - 0.028) * latestSolPriceUsd + balNow.usdcBalance;
+        const targetBudget =
+          recommendation.decision === 'ROTATE_SWAP'
+            ? Math.min(Math.max(recommendation.deployBudgetUsd, availNowUsd * 0.85), availNowUsd * 0.9)
+            : Math.min(recommendation.deployBudgetUsd, availNowUsd * 0.88);
+
+        if (targetBudget < 2) {
+          blockedPayload = {
+            success: false,
+            decision: recommendation.decision,
+            message: `可用流动资金仅 $${availNowUsd.toFixed(2)}（需保留约 0.028 SOL 租金与 Gas），暂不足以安全建仓。`,
+            recommendation,
+            closedTxId,
+            backendStatus: getLiveBackendStatus(),
+            activePositions: cachedActivePositions,
+          };
+        } else {
+          const optimalRange = getOptimalRangeWidthForPool(recommendation.targetPool.poolName, strategyConfig);
+          const opened = await openRealClmmPoolPosition({
+            poolId: recommendation.targetPool.poolId,
+            targetUsd: targetBudget,
+            rangeWidthPct: optimalRange,
+            solPriceUsd: latestSolPriceUsd,
+          });
+
+          const actionVerb = recommendation.decision === 'ROTATE_SWAP' ? '自动平旧换新' : '保留原仓直接新开';
+          pushLog(
+            'success',
+            `[一键高收益执行完成 · ${actionVerb}] 已接入【${opened.poolName}】(${opened.injectedSummary}) · TX: ${opened.txId}`
+          );
+
+          await fetchActivePositions(true);
+          await getWalletBalances(BACKEND_KEYPAIR.publicKey);
+          openedPayload = { opened, closedTxId, actionVerb };
+        }
+      }
+    } finally {
+      releaseAutoSwitchLock();
     }
 
-    const topUpTarget = recommendation.topUpExistingPosition;
-    if (topUpTarget?.nftMint) {
-      const balNow = await getWalletBalances(BACKEND_KEYPAIR.publicKey);
-      const availForTopUp = Math.max(0, balNow.solBalance - 0.015) * latestSolPriceUsd + balNow.usdcBalance;
-      const topUpBudget = Math.min(recommendation.deployBudgetUsd, availForTopUp * 0.85);
-      if (topUpBudget < 2) {
-        return res.json({
-          success: false,
-          decision: recommendation.decision,
-          message: `可用流动资金仅 $${availForTopUp.toFixed(2)}，暂不足以向原仓追加流动性。`,
-          recommendation,
-          closedTxId,
-          backendStatus: getLiveBackendStatus(),
-          activePositions: cachedActivePositions,
-        });
-      }
-      const topped = await increaseExistingClmmPosition({
-        nftMint: topUpTarget.nftMint,
-        poolId: topUpTarget.poolId,
-        addUsd: topUpBudget,
-        solPriceUsd: latestSolPriceUsd,
-      });
-      pushLog(
-        'success',
-        `[一键原仓追加完成] 已向【${topped.poolName}】直接追加流动性 (${topped.injectedSummary}) · TX: ${topped.txId}`
-      );
-      await fetchActivePositions(true);
-      await getWalletBalances(BACKEND_KEYPAIR.publicKey);
-      await runAutoStrategyTick();
+    if (blockedPayload) {
+      return res.json(blockedPayload);
+    }
+
+    await runAutoStrategyTick({ allowRapid: true });
+
+    if (topUpCompletedPayload) {
+      const { topped, closedTxId } = topUpCompletedPayload;
       return res.json({
         success: true,
         decision: recommendation.decision,
@@ -5452,45 +5655,7 @@ app.post('/api/strategy/auto-yield-switch', async (_req, res) => {
       });
     }
 
-    await ensureSolGasReserveFromUsdc(latestSolPriceUsd).catch(() => {});
-
-    const balNow = await getWalletBalances(BACKEND_KEYPAIR.publicKey);
-    const availNowUsd = Math.max(0, balNow.solBalance - 0.028) * latestSolPriceUsd + balNow.usdcBalance;
-    const targetBudget =
-      recommendation.decision === 'ROTATE_SWAP'
-        ? Math.min(Math.max(recommendation.deployBudgetUsd, availNowUsd * 0.85), availNowUsd * 0.9)
-        : Math.min(recommendation.deployBudgetUsd, availNowUsd * 0.88);
-
-    if (targetBudget < 2) {
-      return res.json({
-        success: false,
-        decision: recommendation.decision,
-        message: `可用流动资金仅 $${availNowUsd.toFixed(2)}（需保留约 0.028 SOL 租金与 Gas），暂不足以安全建仓。`,
-        recommendation,
-        closedTxId,
-        backendStatus: getLiveBackendStatus(),
-        activePositions: cachedActivePositions,
-      });
-    }
-
-    const optimalRange = getOptimalRangeWidthForPool(recommendation.targetPool.poolName, strategyConfig);
-    const opened = await openRealClmmPoolPosition({
-      poolId: recommendation.targetPool.poolId,
-      targetUsd: targetBudget,
-      rangeWidthPct: optimalRange,
-      solPriceUsd: latestSolPriceUsd,
-    });
-
-    const actionVerb = recommendation.decision === 'ROTATE_SWAP' ? '自动平旧换新' : '保留原仓直接新开';
-    pushLog(
-      'success',
-      `[一键高收益执行完成 · ${actionVerb}] 已接入【${opened.poolName}】(${opened.injectedSummary}) · TX: ${opened.txId}`
-    );
-
-    await fetchActivePositions(true);
-    await getWalletBalances(BACKEND_KEYPAIR.publicKey);
-    await runAutoStrategyTick();
-
+    const { opened, closedTxId, actionVerb } = openedPayload;
     res.json({
       success: true,
       decision: recommendation.decision,
