@@ -954,7 +954,7 @@ export function calculatePositionMetrics(params: {
   }
 
   const injectedValueUsd = Number((valA + valB).toFixed(2));
-  const unrealizedPnlUsd = Number(uncollectedFeeUsd.toFixed(2));
+  const unrealizedPnlUsd = Number(uncollectedFeeUsd.toFixed(3));
   const unrealizedPnlPct =
     injectedValueUsd > 0 ? Number(((unrealizedPnlUsd / injectedValueUsd) * 100).toFixed(2)) : 0;
 
@@ -1082,15 +1082,31 @@ export function calculateAutoPortfolioPlan(params: {
     const hasUsdcOrSol = upperName.includes('USDC') || upperName.includes('WSOL') || upperName.includes('SOL');
     return hasUsdcOrSol && p.tvl >= 250_000;
   });
+  const strictlyEligible = eligibleOrFallback.filter((p) => p.eligibleFor200U);
+  const preferPureYieldCore =
+    config.riskProfile === 'turbo-high-yield' || config.riskProfile === 'active-yield';
+  const highAprEligible = preferPureYieldCore
+    ? strictlyEligible.filter((p) => p.apr >= config.minAPR)
+    : strictlyEligible;
+  const poolSource =
+    highAprEligible.length > 0
+      ? highAprEligible
+      : strictlyEligible.length > 0
+      ? strictlyEligible
+      : eligibleOrFallback;
 
-  const corePool =
-    eligibleOrFallback.find((p) => p.poolRole === 'core' || p.name.includes('WSOL / USDC')) ||
-    eligibleOrFallback[0];
+  const corePool = preferPureYieldCore
+    ? poolSource.find((p) => p.poolRole === 'core' && p.apr >= config.minAPR) ||
+      poolSource[0] ||
+      eligibleOrFallback[0]
+    : poolSource.find((p) => p.poolRole === 'core' || p.name.includes('WSOL / USDC')) ||
+      poolSource[0] ||
+      eligibleOrFallback[0];
 
-  // Distinct high-APR satellite pools sorted by risk-adjusted APR
-  const satelliteCandidates = eligibleOrFallback
+  // Distinct high-APR satellite pools prioritized from eligible candidates so low-APR rejected pools are skipped
+  const satelliteCandidates = poolSource
     .filter((p) => p.id !== corePool?.id && p.apr <= 420)
-    .sort((a, b) => b.apr - a.apr);
+    .sort((a, b) => b.alphaScore - a.alphaScore || b.apr - a.apr);
 
   const satellitePool1 = satelliteCandidates[0];
   const satellitePool2 = satelliteCandidates[1];
@@ -1742,8 +1758,8 @@ export function evaluateAutoAssetRebalance(params: {
     };
   }
 
-  // Priority 2: Parallel allocation share drift exceeds threshold
-  if (realPositions.length >= 2) {
+  // Priority 2: Parallel allocation share drift exceeds threshold (only rebalance when position size justifies swap/gas cost)
+  if (realPositions.length >= 2 && totalActiveUsd >= 25) {
     const overweight = [...allocations].sort((a, b) => b.driftPct - a.driftPct)[0];
     const underweight = [...allocations].sort((a, b) => a.driftPct - b.driftPct)[0];
 
@@ -1752,37 +1768,40 @@ export function evaluateAutoAssetRebalance(params: {
       underweight &&
       overweight.poolId !== underweight.poolId &&
       overweight.driftPct >= driftThresholdPct &&
-      overweight.currentUsd >= 8
+      overweight.currentUsd >= 10
     ) {
       const targetUsdForOverweight = Number(
         ((totalActiveUsd * overweight.targetSharePct) / 100).toFixed(2)
       );
-      const reduceUsd = Number(Math.max(3, overweight.currentUsd - targetUsdForOverweight).toFixed(2));
-      return {
-        enabled: true,
-        shouldRebalance: true,
-        triggerType: 'SHARE_DRIFT_REBALANCE',
-        driftThresholdPct,
-        depthDropThresholdPct,
-        maxAbsDriftPct: Number(maxAbsDriftPct.toFixed(1)),
-        maxDepthDropPct: Number(maxDepthDropPct.toFixed(1)),
-        headline: `并行仓位占比偏离达 ${overweight.driftPct}% → 自动重平衡资金比例`,
-        reason: `【${overweight.poolName}】当前占总仓位 ${overweight.currentSharePct}%（超出目标 ${overweight.targetSharePct}% 阈值 ±${driftThresholdPct}%），而【${underweight.poolName}】仅占 ${underweight.currentSharePct}%，系统自动调出约 $${reduceUsd.toFixed(2)} 补足低配仓位以恢复最优平衡比例。`,
-        sourcePositionToTrim: {
-          poolId: overweight.poolId,
-          poolName: overweight.poolName,
-          nftMint: overweight.nftMint,
-          currentUsd: overweight.currentUsd,
-          reduceUsd,
-          closeFull: false,
-        },
-        targetPoolToBoost: {
-          poolId: underweight.poolId,
-          poolName: underweight.poolName,
-          boostUsd: Number((reduceUsd * 0.96).toFixed(2)),
-        },
-        allocations,
-      };
+      const rawReduceUsd = Number((overweight.currentUsd - targetUsdForOverweight).toFixed(2));
+      if (rawReduceUsd >= 6) {
+        const reduceUsd = rawReduceUsd;
+        return {
+          enabled: true,
+          shouldRebalance: true,
+          triggerType: 'SHARE_DRIFT_REBALANCE',
+          driftThresholdPct,
+          depthDropThresholdPct,
+          maxAbsDriftPct: Number(maxAbsDriftPct.toFixed(1)),
+          maxDepthDropPct: Number(maxDepthDropPct.toFixed(1)),
+          headline: `并行仓位占比偏离达 ${overweight.driftPct}% → 自动重平衡资金比例`,
+          reason: `【${overweight.poolName}】当前占总仓位 ${overweight.currentSharePct}%（超出目标 ${overweight.targetSharePct}% 阈值 ±${driftThresholdPct}%），而【${underweight.poolName}】仅占 ${underweight.currentSharePct}%，系统自动调出约 $${reduceUsd.toFixed(2)} 补足低配仓位以恢复最优平衡比例。`,
+          sourcePositionToTrim: {
+            poolId: overweight.poolId,
+            poolName: overweight.poolName,
+            nftMint: overweight.nftMint,
+            currentUsd: overweight.currentUsd,
+            reduceUsd,
+            closeFull: false,
+          },
+          targetPoolToBoost: {
+            poolId: underweight.poolId,
+            poolName: underweight.poolName,
+            boostUsd: Number((reduceUsd * 0.96).toFixed(2)),
+          },
+          allocations,
+        };
+      }
     }
   }
 

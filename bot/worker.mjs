@@ -226,46 +226,69 @@ async function tick() {
       // web server still warming up
     }
 
-    const roundRecord = {
-      round: tickCount,
-      time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
-      timestamp: Date.now(),
-      candidateCount: 20,
-      chosenPool: best
-        ? {
-            name: best.pair,
-            dex: 'Raydium CLMM',
-            apr: Number(best.apr.toFixed(1)),
-            tvlUsd: best.tvl,
-            role: best.isLowIl ? 'core' : 'satellite',
-            selectionReason: best.isLowIl
-              ? '核心蓝筹低无常做市池 · 深度充足'
-              : '高换手增效卫星池',
-          }
-        : null,
-      rejectedSamples: alerts.slice(0, 3).map((a) => {
-        const parts = a.split(':');
-        return {
-          name: parts[1]?.split('年化')[0]?.split('深度')[0]?.trim() || '风险池',
-          reason: a,
-          apr: 0,
-          tvlUsd: 0,
+    const serverBest = autoDecision?.diagnostic?.bestCandidatePool;
+    const effectiveBest = serverBest
+      ? {
+          pair: serverBest.name,
+          dex: serverBest.dex || 'Raydium CLMM',
+          apr: Number(serverBest.apr || 0),
+          tvl: Number(serverBest.tvl || 0),
+          isLowIl: false,
+          reason: serverBest.reason || '策略主引擎优选池',
+        }
+      : best
+      ? {
+          pair: best.pair,
+          dex: 'Raydium CLMM',
+          apr: Number(best.apr.toFixed(1)),
+          tvl: best.tvl,
+          isLowIl: best.isLowIl,
+          reason: best.isLowIl ? '核心蓝筹低无常做市池 · 深度充足' : '高换手增效卫星池',
+        }
+      : null;
+
+    const roundRecord = serverBest
+      ? null
+      : {
+          round: tickCount,
+          time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+          timestamp: Date.now(),
+          candidateCount: 20,
+          chosenPool: effectiveBest
+            ? {
+                name: effectiveBest.pair,
+                dex: effectiveBest.dex,
+                apr: Number(effectiveBest.apr.toFixed(1)),
+                tvlUsd: effectiveBest.tvl,
+                role: effectiveBest.isLowIl ? 'core' : 'satellite',
+                selectionReason: effectiveBest.reason,
+              }
+            : null,
+          rejectedSamples: alerts.slice(0, 3).map((a) => {
+            const parts = a.split(':');
+            return {
+              name: parts[1]?.split('年化')[0]?.split('深度')[0]?.trim() || '风险池',
+              reason: a,
+              apr: 0,
+              tvlUsd: 0,
+            };
+          }),
+          strategyAction:
+            autoDecision?.conclusion ||
+            (effectiveBest
+              ? `自动引擎选定【${effectiveBest.pair}】为当前做市主池`
+              : '全网暂无符合门槛的安全矿池，保持空仓防守'),
+          jupiterSlippageBps: Number(impactBps.toFixed(2)),
+          solPriceUsd: Number((outUsdc * 10).toFixed(2)),
         };
-      }),
-      strategyAction: autoDecision?.conclusion || (best
-        ? `自动引擎选定【${best.pair}】为当前做市主池`
-        : '全网暂无符合门槛的安全矿池，保持空仓防守'),
-      jupiterSlippageBps: Number(impactBps.toFixed(2)),
-      solPriceUsd: Number((outUsdc * 10).toFixed(2)),
-    };
 
     writeHeartbeat({
       balanceSOL: solBalance,
-      bestPool: best ? `${best.pair} (+${best.apr.toFixed(1)}%)` : '空仓避险中',
+      bestPool: effectiveBest ? `${effectiveBest.pair} (+${effectiveBest.apr.toFixed(1)}%)` : '空仓避险中',
       jupiterOutUsdc: Number(outUsdc.toFixed(4)),
       impactBps: Number(impactBps.toFixed(2)),
       lastError: null,
-      latestRound: roundRecord,
+      ...(roundRecord ? { latestRound: roundRecord } : {}),
       diagnostic: autoDecision?.diagnostic || null,
     });
 

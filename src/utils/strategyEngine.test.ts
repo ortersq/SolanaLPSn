@@ -1122,6 +1122,89 @@ test('evaluateMultiCurrencyHedgePlan computes delta-neutral short legs, safe LTV
   assert.equal(pausedPlan.ilEliminatedPct, 0);
 });
 
+test('turbo-high-yield skips below-minAPR core pool and small portfolios avoid gas-wasting share-drift rebalance churn', () => {
+  const turboCfg = buildPresetForCapital(200, 'turbo-high-yield'); // minAPR = 45
+  const ranked = rankPools(
+    [
+      {
+        id: 'wsol-usdc-low',
+        name: 'WSOL / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: 'wsol-usdc-low',
+        tvl: 5_550_000,
+        volume24h: 12_800_000,
+        apr: 33.7, // Below minAPR 45%
+        feeTier: '0.04%',
+        priceUsd: '72.3',
+        safetyScore: 96,
+        ilRisk: '低',
+      },
+      {
+        id: 'wsol-hsol-high',
+        name: 'WSOL / hSOL',
+        dex: 'RAYDIUM CLMM',
+        address: 'wsol-hsol-high',
+        tvl: 2_100_000,
+        volume24h: 1_300_000,
+        apr: 223.2,
+        feeTier: '0.01%',
+        priceUsd: '0.84',
+        safetyScore: 92,
+        ilRisk: '中',
+      },
+      {
+        id: 'spcx-usdc-high',
+        name: 'SPCX / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: 'spcx-usdc-high',
+        tvl: 2_370_000,
+        volume24h: 3_860_000,
+        apr: 148.9,
+        feeTier: '0.25%',
+        priceUsd: '132.3',
+        safetyScore: 92,
+        ilRisk: '中',
+      },
+    ],
+    turboCfg
+  );
 
+  const plan = calculateAutoPortfolioPlan({
+    solBalance: 0.35,
+    usdcBalance: 15,
+    solPriceUsd: 72.3,
+    activePositions: [],
+    rankedPools: ranked,
+    config: turboCfg,
+  });
 
+  // Slot 1 & 2 should select eligible high-APR pools rather than forcing 33.7% WSOL/USDC
+  assert.ok(plan.slotPlans.length >= 2);
+  assert.ok(plan.slotPlans.every((s) => s.poolId !== 'wsol-usdc-low'));
 
+  // Sub-cent fees (e.g. $0.0197) are preserved cleanly in calculatePositionMetrics
+  const subCentMetrics = calculatePositionMetrics({
+    currentPrice: 132.3,
+    priceLower: 120.7,
+    priceUpper: 136.1,
+    amountA: 0.0128,
+    amountB: 5.44,
+    tokenASymbol: 'SPCX',
+    tokenBSymbol: 'USDC',
+    uncollectedFeeUsd: 0.0197,
+  });
+  assert.equal(subCentMetrics.unrealizedPnlUsd, 0.02);
+
+  // Small $18 portfolio does not churn on SHARE_DRIFT_REBALANCE for tiny $3-$4 differences
+  const smallDriftPlan = evaluateAutoAssetRebalance({
+    activePositions: [
+      { poolId: 'spcx-usdc-high', poolName: 'SPCX / USDC', nftMint: 'n1', injectedValueUsd: 11, inRange: true },
+      { poolId: 'wsol-hsol-high', poolName: 'WSOL / hSOL', nftMint: 'n2', injectedValueUsd: 5, inRange: true },
+    ],
+    rankedPools: ranked,
+    baselinePoolTvls: { 'spcx-usdc-high': 2_370_000, 'wsol-hsol-high': 2_100_000 },
+    config: turboCfg,
+  });
+  assert.equal(smallDriftPlan.shouldRebalance, false);
+  assert.equal(smallDriftPlan.triggerType, 'BALANCED');
+});

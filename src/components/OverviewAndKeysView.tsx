@@ -1105,10 +1105,18 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
                         pos.unrealizedPnlUsd >= 0 ? 'text-emerald-400' : 'text-rose-400'
                       }`}
                     >
-                      {pos.unrealizedPnlUsd >= 0 ? '+' : ''}${pos.unrealizedPnlUsd.toFixed(2)} USD ({pos.unrealizedPnlPct >= 0 ? '+' : ''}{pos.unrealizedPnlPct.toFixed(2)}%)
+                      {pos.unrealizedPnlUsd >= 0 ? '+' : ''}$
+                      {Math.abs(pos.unrealizedPnlUsd) > 0 && Math.abs(pos.unrealizedPnlUsd) < 0.1
+                        ? pos.unrealizedPnlUsd.toFixed(3)
+                        : pos.unrealizedPnlUsd.toFixed(2)}{' '}
+                      USD ({pos.unrealizedPnlPct >= 0 ? '+' : ''}{pos.unrealizedPnlPct.toFixed(2)}%)
                     </div>
                     <div className="text-xs font-mono text-slate-400">
-                      待领手续费: +${pos.uncollectedFeeUsd.toFixed(2)} USD
+                      待领手续费: +$
+                      {pos.uncollectedFeeUsd > 0 && pos.uncollectedFeeUsd < 0.1
+                        ? pos.uncollectedFeeUsd.toFixed(3)
+                        : pos.uncollectedFeeUsd.toFixed(2)}{' '}
+                      USD
                     </div>
                   </div>
 

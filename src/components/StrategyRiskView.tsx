@@ -1509,7 +1509,15 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
             </p>
           </div>
           <div className="text-xs font-mono text-slate-400 shrink-0 tabular-nums">
-            累计浮盈: <span className="text-emerald-400 font-bold">${activePositions.reduce((s, p) => s + p.unrealizedPnlUsd, 0).toFixed(2)}</span>
+            {(() => {
+              const sumPnl = activePositions.reduce((s, p) => s + p.unrealizedPnlUsd, 0);
+              const fmtPnl = Math.abs(sumPnl) > 0 && Math.abs(sumPnl) < 0.1 ? sumPnl.toFixed(3) : sumPnl.toFixed(2);
+              return (
+                <>
+                  累计浮盈: <span className="text-emerald-400 font-bold">${fmtPnl}</span>
+                </>
+              );
+            })()}
           </div>
         </div>
 
@@ -1531,7 +1539,8 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
                 tick={{ fontSize: 11 }}
                 tickFormatter={(v) => {
                   const num = Number(v);
-                  return Math.abs(num) < 10 ? `$${num.toFixed(1)}` : `$${num.toFixed(0)}`;
+                  if (Math.abs(num) > 0 && Math.abs(num) < 1) return `$${num.toFixed(3)}`;
+                  return Math.abs(num) < 10 ? `$${num.toFixed(2)}` : `$${num.toFixed(0)}`;
                 }}
               />
               <YAxis
