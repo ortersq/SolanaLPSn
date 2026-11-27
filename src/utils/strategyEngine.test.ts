@@ -20,6 +20,7 @@ import {
   evaluateRiskAction,
   evaluateSafeWithdrawSafety,
   formatChainError,
+  getOptimalRangeWidthForPool,
   isValidSolanaAddress,
   maskSolanaAddress,
   rankPools,
@@ -1207,4 +1208,106 @@ test('turbo-high-yield skips below-minAPR core pool and small portfolios avoid g
   });
   assert.equal(smallDriftPlan.shouldRebalance, false);
   assert.equal(smallDriftPlan.triggerType, 'BALANCED');
+});
+
+test('yield optimizations: correlated narrow range, 7d APR stability, <$60 2-slot cap + dust cleanup at low SOL, and rent-free top-up', () => {
+  const turboCfg = buildPresetForCapital(200, 'turbo-high-yield'); // rangeWidthPct = 4
+  const activeCfg = buildPresetForCapital(200, 'active-yield'); // rangeWidthPct = 6
+
+  // 1. Correlated LST & stable pairs get ultra-narrow optimal ranges while volatile pairs keep config rangeWidthPct
+  assert.equal(getOptimalRangeWidthForPool('WSOL / hSOL', activeCfg), 2);
+  assert.equal(getOptimalRangeWidthForPool('WSOL / JitoSOL', turboCfg), 2);
+  assert.equal(getOptimalRangeWidthForPool('USDC / USDT', activeCfg), 1);
+  assert.equal(getOptimalRangeWidthForPool('SPCX / USDC', activeCfg), 6);
+
+  // 2. 7d sustained APR beats flash-spike 1-day APR with weak 7d follow-through
+  const rankedSustained = rankPools(
+    [
+      {
+        id: 'flash-spike',
+        name: 'SPIKE / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: 'flash-spike',
+        tvl: 1_500_000,
+        volume24h: 2_000_000,
+        apr: 145,
+        apr7d: 8, // 1-day spike trap
+        fee24hUsd: 4000,
+        feeTier: '0.25%',
+        priceUsd: '1.0',
+        safetyScore: 84,
+        ilRisk: '中',
+      },
+      {
+        id: 'sustained-lst',
+        name: 'WSOL / hSOL',
+        dex: 'RAYDIUM CLMM',
+        address: 'sustained-lst',
+        tvl: 2_250_000,
+        volume24h: 1_100_000,
+        apr: 173,
+        apr7d: 134, // strong 7d fee yield
+        fee24hUsd: 10_784,
+        feeTier: '1.00%',
+        priceUsd: '0.84',
+        safetyScore: 92,
+        ilRisk: '低',
+      },
+      {
+        id: 'spcx-usdc',
+        name: 'SPCX / USDC',
+        dex: 'RAYDIUM CLMM',
+        address: 'spcx-usdc',
+        tvl: 2_380_000,
+        volume24h: 3_740_000,
+        apr: 143,
+        apr7d: 78,
+        fee24hUsd: 9_375,
+        feeTier: '0.25%',
+        priceUsd: '132.0',
+        safetyScore: 92,
+        ilRisk: '中',
+      },
+    ],
+    activeCfg
+  );
+  assert.equal(rankedSustained[0].id, 'sustained-lst');
+  assert.ok(
+    rankedSustained.findIndex((p) => p.id === 'sustained-lst') <
+      rankedSustained.findIndex((p) => p.id === 'flash-spike')
+  );
+
+  // 3. Low-SOL ($0.021) + $17.61 USDC + $0.22 dust still triggers dust consolidation & caps <$60 equity at 2 slots with ±2% LST range
+  const liveSnapshotPlan = calculateAutoPortfolioPlan({
+    solBalance: 0.021063,
+    usdcBalance: 17.6144,
+    solPriceUsd: 73,
+    activePositions: [
+      { poolId: 'spcx-usdc', poolName: 'SPCX / USDC', injectedValueUsd: 10.82, inRange: true },
+      { poolId: 'sustained-lst', poolName: 'WSOL / hSOL', injectedValueUsd: 0.22, inRange: true },
+    ],
+    rankedPools: rankedSustained,
+    config: activeCfg,
+  });
+  assert.equal(liveSnapshotPlan.hasDustPositionToConsolidate, true);
+  assert.equal(liveSnapshotPlan.targetSlots, 2);
+  assert.equal(liveSnapshotPlan.slotPlans.length, 2);
+  const hsolSlot = liveSnapshotPlan.slotPlans.find((s) => s.poolName === 'WSOL / hSOL');
+  assert.equal(hsolSlot?.rangeWidthPct, 2);
+
+  // 4. When both slots on <$60 equity are already held in-range and idle USDC arrives, recommend rent-free topUpExistingPosition
+  const topUpRec = evaluateAutonomousHighYieldSwitch({
+    rankedPools: rankedSustained,
+    activePositions: [
+      { poolId: 'sustained-lst', poolName: 'WSOL / hSOL', nftMint: 'nft-hsol', injectedValueUsd: 14, inRange: true },
+      { poolId: 'spcx-usdc', poolName: 'SPCX / USDC', nftMint: 'nft-spcx', injectedValueUsd: 11, inRange: true },
+    ],
+    idleDeployableUsd: 12,
+    usdcBalance: 12,
+    config: activeCfg,
+  });
+  assert.equal(topUpRec.decision, 'OPEN_NEW');
+  assert.equal(topUpRec.shouldAct, true);
+  assert.equal(topUpRec.topUpExistingPosition?.nftMint, 'nft-hsol');
+  assert.equal(topUpRec.topUpExistingPosition?.poolId, 'sustained-lst');
 });

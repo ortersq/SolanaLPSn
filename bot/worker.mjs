@@ -37,7 +37,8 @@ const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS || 50);
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const STABLES = new Set(['USDC', 'USDT', 'PYUSD', 'USDS', 'USD1']);
-const BLUECHIPS = new Set(['SOL', 'WSOL', 'MSOL', 'JITOSOL', 'BSOL', 'JUP']);
+const BLUECHIPS = new Set(['SOL', 'WSOL', 'MSOL', 'JITOSOL', 'BSOL', 'HSOL', 'JUP']);
+const SOL_LST_FAMILY = new Set(['SOL', 'WSOL', 'HSOL', 'MSOL', 'JITOSOL', 'BSOL', 'DSOL', 'JSOL']);
 
 if (!PRIVATE_KEY || !RECIPIENT_ADDRESS) {
   console.error('[启动中止] 服务器 .env 缺少 PRIVATE_KEY 或 RECIPIENT_ADDRESS。');
@@ -105,25 +106,35 @@ async function checkExitSlippageGuard() {
 }
 
 async function scanLivePools() {
-  const res = await fetch(
-    'https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=volume24h&sortType=desc&pageSize=30&page=1'
-  );
-  const json = await res.json();
-  const rows = json?.data?.data || [];
+  const [feeSettled, volSettled] = await Promise.allSettled([
+    fetch('https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=fee24h&sortType=desc&pageSize=25&page=1').then((r) => r.json()),
+    fetch('https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=volume24h&sortType=desc&pageSize=25&page=1').then((r) => r.json()),
+  ]);
+  const mergedMap = new Map();
+  for (const res of [feeSettled, volSettled]) {
+    if (res.status === 'fulfilled') {
+      const list = res.value?.data?.data || [];
+      for (const p of list) {
+        if (p?.id && !mergedMap.has(p.id)) mergedMap.set(p.id, p);
+      }
+    }
+  }
+  const rows = Array.from(mergedMap.values());
 
   const core = [];
   const alerts = [];
   const maxSafeApr = RISK_PROFILE === 'turbo-high-yield' ? 420 : 180;
 
   for (const p of rows) {
-    const symA = p.mintA?.symbol || '';
-    const symB = p.mintB?.symbol || '';
+    const symA = (p.mintA?.symbol || '').toUpperCase();
+    const symB = (p.mintB?.symbol || '').toUpperCase();
     const tvl = Number(p.tvl || 0);
     const apr = Number(p.day?.apr || 0);
     if (tvl < 100_000 || apr > 600) continue;
 
     const isLowIl =
       (STABLES.has(symA) && STABLES.has(symB)) ||
+      (SOL_LST_FAMILY.has(symA) && SOL_LST_FAMILY.has(symB)) ||
       (STABLES.has(symA) && BLUECHIPS.has(symB)) ||
       (STABLES.has(symB) && BLUECHIPS.has(symA));
 

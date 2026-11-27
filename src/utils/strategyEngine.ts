@@ -12,6 +12,8 @@ export interface PoolMetrics {
   tvl: number;
   volume24h: number;
   apr: number;
+  apr7d?: number;
+  fee24hUsd?: number;
   feeTier: string;
   priceUsd: string;
   priceChange24h?: number;
@@ -392,9 +394,25 @@ export function scorePoolForSteadyProfit(
       : config.riskProfile === 'active-yield'
       ? 240
       : 180;
-  const aprScore = Math.min((Math.max(pool.apr, 0) / aprCap) * 100, 100);
-  const activityScore = Math.min(volTvlRatio * 25, 100);
+  // Blend 24h APR with 7d sustained APR when available to avoid 1-day flash-spike traps
+  const hasApr7d = typeof pool.apr7d === 'number' && pool.apr7d > 0;
+  const effectiveAprForScore = hasApr7d
+    ? 0.65 * Math.max(pool.apr, 0) + 0.35 * Math.min(pool.apr7d!, Math.max(pool.apr, 0) * 1.4)
+    : Math.max(pool.apr, 0);
+  const aprScore = Math.min((effectiveAprForScore / aprCap) * 100, 100);
+  const feeEquivalentActivity =
+    typeof pool.fee24hUsd === 'number' && pool.fee24hUsd > 0
+      ? Math.min(((pool.fee24hUsd / safeTvl) / 0.0025) * 25, 100)
+      : 0;
+  const activityScore = Math.max(Math.min(volTvlRatio * 25, 100), feeEquivalentActivity);
   const safetyComponent = Math.min(Math.max(pool.safetyScore, 0), 100);
+  const sustainedBonus = hasApr7d
+    ? pool.apr7d! >= config.minAPR * 0.7
+      ? 5
+      : pool.apr7d! < 15
+      ? -6
+      : 0
+    : 0;
 
   // In turbo mode, allow high-APR pools up to 420% APR provided TVL is deep enough
   const isHighRisk =
@@ -426,7 +444,8 @@ export function scorePoolForSteadyProfit(
   const rawScore =
     aprScore * wApr +
     activityScore * wVol +
-    safetyComponent * wSafe -
+    safetyComponent * wSafe +
+    sustainedBonus -
     riskPenalty -
     tvlPenalty;
 
@@ -995,6 +1014,32 @@ export interface AutoPortfolioPlan {
   diagnosisNote: string;
 }
 
+const SOL_LST_FAMILY = new Set(['SOL', 'WSOL', 'HSOL', 'MSOL', 'JITOSOL', 'BSOL', 'DSOL', 'JSOL']);
+const BTC_FAMILY = new Set(['WBTC', 'CBBTC', 'TBTC', 'ZBTC', 'SOLBTC']);
+
+export function getOptimalRangeWidthForPool(
+  poolName: string,
+  config: StrategyConfig
+): number {
+  const parts = poolName
+    .split('/')
+    .map((s) => s.trim().toUpperCase())
+    .filter(Boolean);
+  if (parts.length >= 2) {
+    const [a, b] = parts;
+    if (STABLE_SYMBOLS.has(a) && STABLE_SYMBOLS.has(b)) {
+      return 1;
+    }
+    if (
+      (SOL_LST_FAMILY.has(a) && SOL_LST_FAMILY.has(b)) ||
+      (BTC_FAMILY.has(a) && BTC_FAMILY.has(b))
+    ) {
+      return Math.min(config.rangeWidthPct, 2);
+    }
+  }
+  return config.rangeWidthPct;
+}
+
 export function calculateAutoPortfolioPlan(params: {
   solBalance: number;
   usdcBalance: number;
@@ -1021,12 +1066,14 @@ export function calculateAutoPortfolioPlan(params: {
   const activeInjectedUsd = Number(
     activePositions.reduce((acc, p) => acc + Math.max(0, p.injectedValueUsd), 0).toFixed(2)
   );
+  const totalEquityUsd = Number((walletTotalUsd + activeInjectedUsd).toFixed(2));
 
   const parallelAllowed = config.multiPositionParallel !== false;
   const smartAllocEnabled = config.smartCapitalAllocation !== false;
 
+  // Concentrate small accounts (< $60 equity) into <= 2 high-conviction slots to save NFT rent & gas
   const isDualSlot = parallelAllowed;
-  const isTriSlot = parallelAllowed && walletTotalUsd >= 60;
+  const isTriSlot = parallelAllowed && totalEquityUsd >= 60;
   const targetSlots = !parallelAllowed ? 1 : isTriSlot ? 3 : isDualSlot ? 2 : 1;
 
   // Reserve 0.048 SOL for multi-position NFTs (~0.018 * 2-3) + gas fees; 0.028 SOL for 1 position
@@ -1044,7 +1091,7 @@ export function calculateAutoPortfolioPlan(params: {
     dustPositions.reduce((acc, p) => acc + p.injectedValueUsd, 0).toFixed(2)
   );
   const hasDustPositionToConsolidate =
-    dustPositions.length > 0 && idleDeployableUsd >= 8;
+    dustPositions.length > 0 && (idleDeployableUsd >= 6 || deployableUsdc >= 6);
 
   const effectiveCapitalBase = activeInjectedUsd + idleDeployableUsd;
   const utilizationPct =
@@ -1125,7 +1172,7 @@ export function calculateAutoPortfolioPlan(params: {
           role: 'core',
           targetUsd: coreUsd,
           apr: corePool.apr,
-          rangeWidthPct: config.rangeWidthPct,
+          rangeWidthPct: getOptimalRangeWidthForPool(corePool.name, config),
         },
         {
           slotIndex: 2,
@@ -1134,7 +1181,7 @@ export function calculateAutoPortfolioPlan(params: {
           role: 'satellite',
           targetUsd: sat1Usd,
           apr: satellitePool1.apr,
-          rangeWidthPct: Math.max(4, config.rangeWidthPct),
+          rangeWidthPct: getOptimalRangeWidthForPool(satellitePool1.name, config),
         },
         {
           slotIndex: 3,
@@ -1143,7 +1190,7 @@ export function calculateAutoPortfolioPlan(params: {
           role: 'satellite',
           targetUsd: sat2Usd,
           apr: satellitePool2.apr,
-          rangeWidthPct: Math.max(5, config.rangeWidthPct),
+          rangeWidthPct: getOptimalRangeWidthForPool(satellitePool2.name, config),
         }
       );
     } else if (targetSlots >= 2 && satellitePool1 && totalBudgetUsd >= 8) {
@@ -1157,7 +1204,7 @@ export function calculateAutoPortfolioPlan(params: {
         role: 'core',
         targetUsd: coreUsd,
         apr: corePool.apr,
-        rangeWidthPct: config.rangeWidthPct,
+        rangeWidthPct: getOptimalRangeWidthForPool(corePool.name, config),
       });
       slotPlans.push({
         slotIndex: 2,
@@ -1166,7 +1213,7 @@ export function calculateAutoPortfolioPlan(params: {
         role: 'satellite',
         targetUsd: satUsd,
         apr: satellitePool1.apr,
-        rangeWidthPct: Math.max(4, config.rangeWidthPct),
+        rangeWidthPct: getOptimalRangeWidthForPool(satellitePool1.name, config),
       });
     } else {
       slotPlans.push({
@@ -1176,7 +1223,7 @@ export function calculateAutoPortfolioPlan(params: {
         role: 'core',
         targetUsd: totalBudgetUsd,
         apr: corePool.apr,
-        rangeWidthPct: config.rangeWidthPct,
+        rangeWidthPct: getOptimalRangeWidthForPool(corePool.name, config),
       });
     }
   }
@@ -1319,6 +1366,13 @@ export interface AutonomousHighYieldRecommendation {
     injectedValueUsd: number;
     currentApr: number;
   } | null;
+  topUpExistingPosition?: {
+    poolId: string;
+    poolName: string;
+    nftMint: string;
+    currentUsd: number;
+    apr: number;
+  } | null;
   deployBudgetUsd: number;
   aprGainPct: number;
   estimatedExtraMonthlyUsd: number;
@@ -1332,6 +1386,7 @@ export function evaluateAutonomousHighYieldSwitch(params: {
     poolName: string;
     nftMint?: string;
     injectedValueUsd: number;
+    inRange?: boolean;
   }>;
   idleDeployableUsd: number;
   usdcBalance?: number;
@@ -1409,6 +1464,7 @@ export function evaluateAutonomousHighYieldSwitch(params: {
         poolName: p.poolName,
         nftMint: p.nftMint,
         injectedValueUsd: p.injectedValueUsd,
+        inRange: p.inRange !== false,
         currentApr,
         riskAdjustedScore,
       };
@@ -1417,6 +1473,8 @@ export function evaluateAutonomousHighYieldSwitch(params: {
 
   const weakestActive = activeDetails[0] || null;
   const realActiveCount = activeDetails.filter((a) => a.injectedValueUsd >= 1.5).length;
+  const totalEquityUsd = activeInjectedTotal + Math.max(idleDeployableUsd, usdcBalance);
+  const slotCap = parallelEnabled ? (totalEquityUsd >= 60 ? 3 : 2) : 1;
 
   if (!bestCandidate) {
     return {
@@ -1427,6 +1485,7 @@ export function evaluateAutonomousHighYieldSwitch(params: {
       reason: '已扫描全部实时池子，未发现明显优于当前持仓的安全高收益池。',
       targetPool: null,
       sourcePositionToReplace: null,
+      topUpExistingPosition: null,
       deployBudgetUsd: 0,
       aprGainPct: 0,
       estimatedExtraMonthlyUsd: 0,
@@ -1437,9 +1496,47 @@ export function evaluateAutonomousHighYieldSwitch(params: {
   const concentrationBoost =
     config.rangeWidthPct <= 4 ? 3.2 : config.rangeWidthPct <= 6 ? 2.4 : 1.6;
 
-  // Branch 1: Smart incremental funds available AND (parallel allowed OR zero real active positions) -> OPEN_NEW directly
+  // Branch 1: Smart incremental funds available AND (parallel allowed OR zero real active positions) -> OPEN_NEW / TOP_UP_EXISTING
   if (hasIncrementalIdle && (smartAllocEnabled || realActiveCount === 0) && (parallelEnabled || realActiveCount === 0)) {
     const budget = Number(Math.min(config.lpActiveUsdt, Math.max(idleDeployableUsd, usdcBalance) * 0.88).toFixed(2));
+    const bestHeldInRange = [...activeDetails]
+      .filter((a) => a.injectedValueUsd >= 1.5 && a.inRange && a.nftMint)
+      .sort((a, b) => b.currentApr - a.currentApr)[0];
+
+    // If slots are already at cap (e.g. 2 slots on <$60 capital) and an active in-range pool beats/matches remaining unheld pools,
+    // top up the existing NFT position via increasePositionFromBase instead of paying 0.018 SOL rent for a weaker 3rd pool
+    if (
+      realActiveCount >= slotCap &&
+      bestHeldInRange &&
+      bestHeldInRange.currentApr >= bestCandidate.apr * 0.85
+    ) {
+      const topPoolComp =
+        comparisons.find((c) => c.poolId === bestHeldInRange.poolId) || bestCandidate;
+      const estimatedExtraMonthlyUsd = Number(
+        (((budget * (Math.min(bestHeldInRange.currentApr, 260) / 100)) * concentrationBoost) / 12).toFixed(2)
+      );
+      return {
+        decision: 'OPEN_NEW',
+        shouldAct: true,
+        actionButtonLabel: '追加流动性到现有高息仓位（免新开 NFT 租金）',
+        headline: `检测到 $${idleDeployableUsd.toFixed(2)} 空余资金 → 原仓直加【${bestHeldInRange.poolName}】`,
+        reason: `当前已持有最优 ${realActiveCount} 个并行池，直接向在区间高息仓位【${bestHeldInRange.poolName}】(APR +${bestHeldInRange.currentApr}%) 原仓复投加仓 ~$${budget.toFixed(2)}，节省 0.018 SOL NFT 租金，预计月增收益 +$${estimatedExtraMonthlyUsd}。`,
+        targetPool: topPoolComp,
+        sourcePositionToReplace: null,
+        topUpExistingPosition: {
+          poolId: bestHeldInRange.poolId,
+          poolName: bestHeldInRange.poolName,
+          nftMint: bestHeldInRange.nftMint!,
+          currentUsd: bestHeldInRange.injectedValueUsd,
+          apr: bestHeldInRange.currentApr,
+        },
+        deployBudgetUsd: budget,
+        aprGainPct: 0,
+        estimatedExtraMonthlyUsd,
+        comparisons,
+      };
+    }
+
     const baseAprRef = weakestActive ? weakestActive.currentApr : 0;
     const aprGainPct = Number(Math.max(0, bestCandidate.apr - baseAprRef).toFixed(1));
     const estimatedExtraMonthlyUsd = Number(
@@ -1461,6 +1558,7 @@ export function evaluateAutonomousHighYieldSwitch(params: {
         : `开启多仓位并行与智能资金分配后，系统检测到空余资金$${idleDeployableUsd.toFixed(2)}${usdcTriggerText}，决定不关停现有仓位，直接分散新开【${bestCandidate.poolName}】(APR +${bestCandidate.apr}% · ${bestCandidate.volatilityLabel}) 并发加速赚币！`,
       targetPool: bestCandidate,
       sourcePositionToReplace: hasDustOnly ? weakestActive : null,
+      topUpExistingPosition: null,
       deployBudgetUsd: budget,
       aprGainPct,
       estimatedExtraMonthlyUsd,
