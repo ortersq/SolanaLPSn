@@ -73,7 +73,9 @@ import {
   evaluateMultiCurrencyHedgePlan,
   evaluateSafeWithdrawSafety,
   formatChainError,
+  getMaxPoolExposureShare,
   getOptimalRangeWidthForPool,
+  isPoolShallowVolatile,
   isValidSolanaAddress,
   maskSolanaAddress,
   rankPools,
@@ -122,12 +124,19 @@ const EFFECTIVE_WALLET_ADDRESS = isValidSolanaAddress(BACKEND_WATCH_WALLET_RAW)
 
 const STATUS_FILE_PATH = path.resolve(__dirname, '.bot-runtime-status.json');
 const STRATEGY_CONFIG_FILE_PATH = path.resolve(__dirname, '.strategy-config.json');
+const LOG_HISTORY_FILE_PATH = path.resolve(__dirname, '.runtime-logs.json');
+const MAX_LOG_ENTRIES = 300;
 const solanaConnection = new Connection(HELIUS_RPC_URL, 'confirmed');
+
+type LogSource = 'tx' | 'risk' | 'strategy' | 'worker' | 'system';
 
 interface LogItem {
   id: number;
   time: string;
+  dateTime?: string;
+  timestamp?: number;
   type: 'info' | 'success' | 'warning' | 'error';
+  source?: LogSource;
   message: string;
 }
 
@@ -150,6 +159,15 @@ export interface WorkerHeartbeatStatus {
 }
 
 const nowTime = () => new Date().toTimeString().split(' ')[0];
+const nowDateTime = () => {
+  const d = new Date();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${mm}-${dd} ${hh}:${mi}:${ss}`;
+};
 
 const envCapital = Number(process.env.CAPITAL_USDT || 200);
 const envProfileRaw = process.env.RISK_PROFILE;
@@ -332,6 +350,12 @@ function readWorkerHeartbeat(): WorkerHeartbeatStatus {
       if (selectionRounds.length > 40) selectionRounds.pop();
     }
 
+    const parsedError = parsed?.lastError ? String(parsed.lastError) : null;
+    if (parsedError && parsedError !== lastLoggedWorkerError) {
+      lastLoggedWorkerError = parsedError;
+      pushLog('error', `[后台 Worker 异常] ${parsedError}`, 'worker');
+    }
+
     return {
       running: isFresh,
       pid: parsed?.pid ?? null,
@@ -346,13 +370,95 @@ function readWorkerHeartbeat(): WorkerHeartbeatStatus {
       bestPool: parsed?.bestPool ?? null,
       jupiterOutUsdc: parsed?.jupiterOutUsdc ?? null,
       impactBps: parsed?.impactBps ?? null,
-      lastError: parsed?.lastError ?? null,
+      lastError: parsedError,
       latestRound: workerRound ?? null,
     };
   } catch {
     return defaultState;
   }
 }
+
+let lastLoggedWorkerError = '';
+
+function inferLogSource(message: string): LogSource {
+  if (/TX:|建仓|加仓|换仓|撤池|回收|复投|SOL 燃料|重平衡|平旧仓/.test(message)) {
+    return 'tx';
+  }
+  if (/防撤池|止损|风控|滑点|拦截|黑名单|回撤|越界|貔貅|假深度/.test(message)) {
+    return 'risk';
+  }
+  if (/Worker|心跳|worker/i.test(message)) {
+    return 'worker';
+  }
+  if (/策略|方案|配置|评估|参数|切换为/.test(message)) {
+    return 'strategy';
+  }
+  return 'system';
+}
+
+function loadPersistedLogs(fallback: LogItem[]): LogItem[] {
+  try {
+    if (!fs.existsSync(LOG_HISTORY_FILE_PATH)) return fallback;
+    const raw = fs.readFileSync(LOG_HISTORY_FILE_PATH, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) return fallback;
+    return parsed
+      .filter((item) => item && typeof item.message === 'string' && typeof item.type === 'string')
+      .slice(0, MAX_LOG_ENTRIES)
+      .map((item, idx) => ({
+        id: Number(item.id) || Date.now() - idx,
+        time: String(item.time || nowTime()),
+        dateTime: item.dateTime ? String(item.dateTime) : String(item.time || nowDateTime()),
+        timestamp: Number(item.timestamp) || Date.now() - idx * 1000,
+        type:
+          item.type === 'success' || item.type === 'warning' || item.type === 'error'
+            ? item.type
+            : 'info',
+        source: item.source || inferLogSource(String(item.message)),
+        message: String(item.message),
+      }));
+  } catch {
+    return fallback;
+  }
+}
+
+let logPersistTimer: ReturnType<typeof setTimeout> | null = null;
+function schedulePersistLogs() {
+  if (logPersistTimer) return;
+  logPersistTimer = setTimeout(() => {
+    logPersistTimer = null;
+    try {
+      fs.writeFileSync(
+        LOG_HISTORY_FILE_PATH,
+        JSON.stringify(backendStatus.logs.slice(0, MAX_LOG_ENTRIES))
+      );
+    } catch {
+      // ignore write failure on read-only fs
+    }
+  }, 600);
+}
+
+const initialSeedLogs: LogItem[] = [
+  {
+    id: 2,
+    time: nowTime(),
+    dateTime: nowDateTime(),
+    timestamp: Date.now(),
+    type: 'success',
+    source: 'strategy',
+    message: `已装载【${strategyConfig.capitalUsdt}U 自动做市方案】：${strategyConfig.lpActiveUsdt}U 做市 + ${strategyConfig.gasReserveUsdt}U Gas 保留金 + 全网异常波动与滑点实时巡检。`,
+  },
+  {
+    id: 1,
+    time: nowTime(),
+    dateTime: nowDateTime(),
+    timestamp: Date.now() - 1000,
+    type: 'info',
+    source: 'system',
+    message:
+      '策略与风控展示台已就绪：交易私钥与收款地址仅由后台 .env 管理，前台只展示实时策略与风险日志。',
+  },
+];
 
 let backendStatus = {
   heliusConnected: false,
@@ -373,21 +479,7 @@ let backendStatus = {
   lastJupiterImpactBps: null as number | null,
   dryRunMode: process.env.DRY_RUN !== 'false',
   riskAlerts: [] as RiskLogEntry[],
-  logs: [
-    {
-      id: 1,
-      time: nowTime(),
-      type: 'info',
-      message:
-        '策略与风控展示台已就绪：交易私钥与收款地址仅由后台 .env 管理，前台只展示实时策略与风险日志。',
-    },
-    {
-      id: 2,
-      time: nowTime(),
-      type: 'success',
-      message: `已装载【${strategyConfig.capitalUsdt}U 自动做市方案】：${strategyConfig.lpActiveUsdt}U 做市 + ${strategyConfig.gasReserveUsdt}U Gas 保留金 + 全网异常波动与滑点实时巡检。`,
-    },
-  ] as LogItem[],
+  logs: loadPersistedLogs(initialSeedLogs),
 };
 
 let cachedActivePositions: ActiveLpPosition[] = [];
@@ -512,16 +604,20 @@ function getLiveBackendStatus() {
   };
 }
 
-function pushLog(type: LogItem['type'], message: string) {
+function pushLog(type: LogItem['type'], message: string, source?: LogSource) {
   backendStatus.logs.unshift({
     id: Date.now() + Math.floor(Math.random() * 1000),
     time: nowTime(),
+    dateTime: nowDateTime(),
+    timestamp: Date.now(),
     type,
+    source: source || inferLogSource(message),
     message,
   });
-  if (backendStatus.logs.length > 40) {
-    backendStatus.logs.pop();
+  if (backendStatus.logs.length > MAX_LOG_ENTRIES) {
+    backendStatus.logs.length = MAX_LOG_ENTRIES;
   }
+  schedulePersistLogs();
 }
 
 function appendRiskAlerts(newAlerts: RiskLogEntry[]) {
@@ -1134,6 +1230,83 @@ app.get('/api/selection-rounds', (_req, res) => {
     totalRounds: selectionRoundCounter,
     latestRound: selectionRounds[0] || null,
   });
+});
+
+app.get('/api/logs', (req, res) => {
+  const levelFilter = String(req.query.level || 'all').toLowerCase();
+  const sourceFilter = String(req.query.source || 'all').toLowerCase();
+  const q = String(req.query.q || '').trim().toLowerCase();
+  const limitRaw = Number(req.query.limit || MAX_LOG_ENTRIES);
+  const limit = Number.isFinite(limitRaw) ? Math.max(10, Math.min(MAX_LOG_ENTRIES, limitRaw)) : MAX_LOG_ENTRIES;
+
+  const workerStatus = readWorkerHeartbeat();
+  const allLogs = backendStatus.logs;
+  const countsByLevel = {
+    all: allLogs.length,
+    error: allLogs.filter((l) => l.type === 'error').length,
+    warning: allLogs.filter((l) => l.type === 'warning').length,
+    success: allLogs.filter((l) => l.type === 'success').length,
+    info: allLogs.filter((l) => l.type === 'info').length,
+  };
+  const countsBySource = {
+    all: allLogs.length,
+    tx: allLogs.filter((l) => (l.source || inferLogSource(l.message)) === 'tx').length,
+    risk: allLogs.filter((l) => (l.source || inferLogSource(l.message)) === 'risk').length,
+    strategy: allLogs.filter((l) => (l.source || inferLogSource(l.message)) === 'strategy').length,
+    worker: allLogs.filter((l) => (l.source || inferLogSource(l.message)) === 'worker').length,
+    system: allLogs.filter((l) => (l.source || inferLogSource(l.message)) === 'system').length,
+  };
+
+  const filtered = allLogs
+    .filter((l) => {
+      if (levelFilter !== 'all' && l.type !== levelFilter) return false;
+      const src = l.source || inferLogSource(l.message);
+      if (sourceFilter !== 'all' && src !== sourceFilter) return false;
+      if (q && !l.message.toLowerCase().includes(q) && !String(l.time).toLowerCase().includes(q)) {
+        return false;
+      }
+      return true;
+    })
+    .slice(0, limit);
+
+  res.json({
+    success: true,
+    logs: filtered,
+    totalCount: allLogs.length,
+    countsByLevel,
+    countsBySource,
+    workerStatus,
+    heliusConnected: backendStatus.heliusConnected,
+    heliusLatencyMs: backendStatus.heliusLatencyMs,
+    dryRunMode: process.env.DRY_RUN !== 'false',
+    riskAlerts: backendStatus.riskAlerts,
+    selectionRounds: selectionRounds.slice(0, 20),
+    strategyDiagnostic: lastAutoTickDiagnostic,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get('/api/logs/export', (_req, res) => {
+  const workerStatus = readWorkerHeartbeat();
+  const lines: string[] = [
+    `# SolanaLPSn 运行诊断日志导出 (${new Date().toISOString()})`,
+    `# 模式: ${process.env.DRY_RUN !== 'false' ? 'DRY_RUN 演练' : '实盘自动运行'} | 策略档位: ${strategyConfig.riskProfile} | 本金设定: $${strategyConfig.capitalUsdt}`,
+    `# Worker 状态: running=${workerStatus.running} | PID=${workerStatus.pid ?? '-'} | ticks=${workerStatus.tickCount} | lastTick=${workerStatus.lastTickAt ?? '-'} | lastError=${workerStatus.lastError ?? 'none'}`,
+    `# 结论: ${lastAutoTickDiagnostic?.conclusion || '暂无'}`,
+    '',
+    '=== 执行流水日志 (按时间倒序) ===',
+    ...backendStatus.logs.map(
+      (l) => `[${l.dateTime || l.time}] [${l.type.toUpperCase()}] [${(l.source || inferLogSource(l.message)).toUpperCase()}] ${l.message}`
+    ),
+    '',
+    '=== 最近风控拦截与异常预警 ===',
+    ...backendStatus.riskAlerts.map(
+      (a) => `[${a.time}] [${a.severity.toUpperCase()}] ${a.category} | ${a.target} | ${a.detail}`
+    ),
+  ];
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="solana-lp-logs.txt"');
+  res.send(lines.join('\n'));
 });
 
 async function fetchJupiterQuoteMetrics(amountSol: number) {
@@ -1817,6 +1990,65 @@ async function closeClmmPositionByNft(nftMintFilter?: string): Promise<{
       poolId: targetPos.poolId.toBase58(),
       txId,
     };
+  } finally {
+    raydium.account.clearAccountChangeCkb();
+  }
+}
+
+async function convertWithdrawnNonBaseTokenToUsdc(
+  poolId: string,
+  fraction = 1,
+  excludeMints: string[] = []
+): Promise<void> {
+  if (!BACKEND_KEYPAIR) return;
+  const ownerPk = BACKEND_KEYPAIR.publicKey;
+  const raydium = await Raydium.load({
+    owner: BACKEND_KEYPAIR,
+    connection: solanaConnection,
+    cluster: 'mainnet',
+    disableFeatureCheck: true,
+    disableLoadToken: true,
+  });
+  try {
+    const { poolInfo } = await raydium.clmm.getPoolInfoFromRpc(poolId);
+    const candidates = [poolInfo?.mintA, poolInfo?.mintB].filter(Boolean);
+    for (const mintMeta of candidates) {
+      const mintAddr = mintMeta.address;
+      if (
+        !mintAddr ||
+        mintAddr === USDC_MINT_ADDR ||
+        mintAddr === SOL_MINT_ADDR ||
+        excludeMints.includes(mintAddr)
+      ) {
+        continue;
+      }
+      const splBal = await getSplTokenUiBalance(ownerPk, mintAddr);
+      if (splBal.atomic <= 0n) continue;
+      const ratio = Math.min(1, Math.max(0.05, fraction));
+      const swapAtomic =
+        ratio >= 0.98
+          ? splBal.atomic
+          : BigInt(Math.floor(Number(splBal.atomic) * ratio));
+      if (swapAtomic <= 0n) continue;
+      try {
+        const sw = await executeJupiterTokenSwap({
+          inputMint: mintAddr,
+          outputMint: USDC_MINT_ADDR,
+          amountAtomic: swapAtomic,
+          slippageBps: Math.max(strategyConfig.slippageBps, 150),
+        });
+        const sym = mintMeta.symbol || maskSolanaAddress(mintAddr);
+        pushLog(
+          'success',
+          `[释出代币转 USDC] 已将 ${(Number(swapAtomic) / 10 ** splBal.decimals).toFixed(4)} ${sym} 兑回 USDC 供重新分配 · TX: ${sw.txId}`
+        );
+        await sleep(1400);
+      } catch (err: any) {
+        pushLog('warning', `[释出代币转 USDC 略过] ${maskSolanaAddress(mintAddr)}: ${formatChainError(err)}`);
+      }
+    }
+  } catch {
+    // non-fatal
   } finally {
     raydium.account.clearAccountChangeCkb();
   }
@@ -3164,26 +3396,53 @@ async function openRealClmmPoolPosition(params: {
             await sleep(2200);
           }
         } else {
-          // WSOL / TokenX pool
-          const excessSolUsd = Math.max(0, availSolUsd - halfUsd);
-          if (availUsdcUsd >= needSwapUsd * 0.9) {
-            const amtAtomic = Math.floor(Math.min(needSwapUsd, availUsdcUsd * 0.96) * 1e6);
-            const sw = await executeJupiterTokenSwap({
-              inputMint: USDC_MINT_ADDR,
-              outputMint: tokenXMint,
-              amountAtomic: amtAtomic,
-            });
-            swapTxId = sw.txId;
-            await sleep(2200);
-          } else if (excessSolUsd >= needSwapUsd * 0.9) {
-            const amtLamports = Math.floor((Math.min(needSwapUsd, excessSolUsd * 0.92) / solPriceUsd) * 1e9);
-            const sw = await executeJupiterTokenSwap({
-              inputMint: SOL_MINT_ADDR,
-              outputMint: tokenXMint,
-              amountAtomic: amtLamports,
-            });
-            swapTxId = sw.txId;
-            await sleep(2200);
+          // WSOL / TokenX pool: ensure BOTH WSOL side and TokenX side have adequate balance
+          const needSolSideUsd = Math.max(0, halfUsd - availSolUsd);
+          let remainingUsdcForSwap = availUsdcUsd;
+          if (needSolSideUsd >= 0.5 && remainingUsdcForSwap >= needSolSideUsd * 0.9) {
+            const solSwapUsd = Math.min(needSolSideUsd, remainingUsdcForSwap * 0.48);
+            const amtSolUsdcAtomic = Math.floor(solSwapUsd * 1e6);
+            if (amtSolUsdcAtomic >= 500_000) {
+              const swSol = await executeJupiterTokenSwap({
+                inputMint: USDC_MINT_ADDR,
+                outputMint: SOL_MINT_ADDR,
+                amountAtomic: amtSolUsdcAtomic,
+              });
+              swapTxId = swSol.txId;
+              remainingUsdcForSwap = Math.max(0, remainingUsdcForSwap - solSwapUsd);
+              await sleep(2000);
+            }
+          }
+          const postSolBal = await getWalletBalances(ownerPk);
+          const effectiveSolSideUsd = Math.max(0, postSolBal.solBalance - minSolReserve) * solPriceUsd;
+          if (effectiveSolSideUsd < 1.5) {
+            throw new Error(
+              `可用 SOL 仅 ${(Math.max(0, postSolBal.solBalance - minSolReserve)).toFixed(4)} (~$${effectiveSolSideUsd.toFixed(2)})，不足以配比 ${symA}/${symB} 池，已拦截防生成碎片仓`
+            );
+          }
+          const matchedHalfUsd = Math.min(halfUsd, effectiveSolSideUsd * 0.96);
+          const cappedNeedTokenXUsd = Math.max(0, matchedHalfUsd - existingXUsd);
+          const excessSolUsd = Math.max(0, effectiveSolSideUsd - matchedHalfUsd);
+          if (cappedNeedTokenXUsd >= 0.5) {
+            if (remainingUsdcForSwap >= cappedNeedTokenXUsd * 0.85) {
+              const amtAtomic = Math.floor(Math.min(cappedNeedTokenXUsd, remainingUsdcForSwap * 0.95) * 1e6);
+              const sw = await executeJupiterTokenSwap({
+                inputMint: USDC_MINT_ADDR,
+                outputMint: tokenXMint,
+                amountAtomic: amtAtomic,
+              });
+              swapTxId = sw.txId;
+              await sleep(2200);
+            } else if (excessSolUsd >= cappedNeedTokenXUsd * 0.85) {
+              const amtLamports = Math.floor((Math.min(cappedNeedTokenXUsd, excessSolUsd * 0.92) / solPriceUsd) * 1e9);
+              const sw = await executeJupiterTokenSwap({
+                inputMint: SOL_MINT_ADDR,
+                outputMint: tokenXMint,
+                amountAtomic: amtLamports,
+              });
+              swapTxId = sw.txId;
+              await sleep(2200);
+            }
           }
         }
 
@@ -4169,14 +4428,24 @@ async function executeFullPortfolioDeployment(forceConsolidateDust = true): Prom
     }
   }
 
-  // Step 2b: If excess idle funds remain & planned slots are held in-range, top up existing NFT directly (save 0.018 SOL rent)
+  // Step 2b: If excess idle funds remain & planned slots are held in-range, top up under-cap existing NFT directly (save 0.018 SOL rent)
   currentPositions = await fetchActivePositions(true);
   const balForTopUp = await getWalletBalances(BACKEND_KEYPAIR.publicKey);
   const idleAfterSlotsUsd =
     Math.max(0, balForTopUp.solBalance - 0.022) * latestSolPriceUsd + balForTopUp.usdcBalance;
+  const totalEquityAfterSlots =
+    currentPositions.reduce((s, p) => s + p.injectedValueUsd, 0) + idleAfterSlotsUsd;
   if (idleAfterSlotsUsd >= 5 && balForTopUp.solBalance >= 0.012) {
     const heldInRange = currentPositions
-      .filter((p) => p.injectedValueUsd >= 1.5 && p.inRange && p.nftMint)
+      .filter((p) => {
+        if (p.injectedValueUsd < 1.5 || !p.inRange || !p.nftMint) return false;
+        const matched = ranked.find((r) => r.id === p.poolId);
+        const maxShare = getMaxPoolExposureShare(matched);
+        if (maxShare < 1 && totalEquityAfterSlots >= 20) {
+          if (p.injectedValueUsd >= totalEquityAfterSlots * maxShare - 2) return false;
+        }
+        return true;
+      })
       .sort((a, b) => {
         const aprA = ranked.find((r) => r.id === a.poolId)?.apr ?? 0;
         const aprB = ranked.find((r) => r.id === b.poolId)?.apr ?? 0;
@@ -4184,7 +4453,13 @@ async function executeFullPortfolioDeployment(forceConsolidateDust = true): Prom
       })[0];
     if (heldInRange) {
       try {
-        const topUpUsd = Math.min(strategyConfig.lpActiveUsdt, idleAfterSlotsUsd * 0.85);
+        const matchedHeld = ranked.find((r) => r.id === heldInRange.poolId);
+        const maxShare = getMaxPoolExposureShare(matchedHeld);
+        const headroomUsd =
+          maxShare < 1 && totalEquityAfterSlots >= 20
+            ? Math.max(0, totalEquityAfterSlots * maxShare - heldInRange.injectedValueUsd)
+            : strategyConfig.lpActiveUsdt;
+        const topUpUsd = Math.min(strategyConfig.lpActiveUsdt, idleAfterSlotsUsd * 0.85, headroomUsd);
         if (topUpUsd >= 4) {
           pushLog('info', `[原仓直加复投] 将剩余闲置资金 ~$${topUpUsd.toFixed(2)} 直接追加进【${heldInRange.poolName}】现有仓位（免新开 NFT 租金）...`);
           const topped = await increaseExistingClmmPosition({
@@ -4597,13 +4872,23 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
           if (!openedAny && autoAllocAllowed) {
             const balNow = await getWalletBalances(BACKEND_KEYPAIR!.publicKey);
             const availNowUsd = Math.max(0, balNow.solBalance - 0.015) * latestSolPriceUsd + balNow.usdcBalance;
+            const totalEquityNow =
+              activePositions.reduce((s, p) => s + p.injectedValueUsd, 0) + availNowUsd;
             const topUpTarget =
               highYieldRecommendation.topUpExistingPosition ||
               (() => {
                 const realCount = activePositions.filter((p) => p.injectedValueUsd >= 1.5).length;
                 if (realCount < portfolioPlan.targetSlots || availNowUsd < 5) return null;
                 const bestHeld = activePositions
-                  .filter((p) => p.injectedValueUsd >= 1.5 && p.inRange && p.nftMint)
+                  .filter((p) => {
+                    if (p.injectedValueUsd < 1.5 || !p.inRange || !p.nftMint) return false;
+                    const matched = ranked.find((r) => r.id === p.poolId);
+                    const maxShare = getMaxPoolExposureShare(matched);
+                    if (maxShare < 1 && totalEquityNow >= 20) {
+                      if (p.injectedValueUsd >= totalEquityNow * maxShare - 2) return false;
+                    }
+                    return true;
+                  })
                   .sort((a, b) => {
                     const aprA = ranked.find((r) => r.id === a.poolId)?.apr ?? 0;
                     const aprB = ranked.find((r) => r.id === b.poolId)?.apr ?? 0;
@@ -4627,7 +4912,13 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
             ) {
               poolActionCooldownMs.set(`topup:${topUpTarget.nftMint}`, Date.now());
               try {
-                const incBudget = Math.min(strategyConfig.lpActiveUsdt, availNowUsd * 0.85);
+                const matchedTop = ranked.find((r) => r.id === topUpTarget.poolId);
+                const maxShare = getMaxPoolExposureShare(matchedTop);
+                const headroomUsd =
+                  maxShare < 1 && totalEquityNow >= 20
+                    ? Math.max(0, totalEquityNow * maxShare - topUpTarget.currentUsd)
+                    : strategyConfig.lpActiveUsdt;
+                const incBudget = Math.min(strategyConfig.lpActiveUsdt, availNowUsd * 0.85, headroomUsd);
                 if (incBudget >= 4) {
                   pushLog(
                     'info',
@@ -4777,7 +5068,8 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
               );
               const closed = await closeClmmPositionByNft(src.nftMint);
               pushLog('info', `[自主换仓 · 已平旧仓] ${src.poolName} TX: ${closed.txId}，等待租金与资金结算后开新仓...`);
-              await sleep(2200);
+              await sleep(1800);
+              await convertWithdrawnNonBaseTokenToUsdc(src.poolId, 1);
               const balAfterClose = await getWalletBalances(BACKEND_KEYPAIR!.publicKey);
               const availAfterUsd =
                 Math.max(0, balAfterClose.solBalance - 0.028) * latestSolPriceUsd + balAfterClose.usdcBalance;
@@ -4869,7 +5161,11 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
               'info',
               `[重平衡 · 已释放流动性] ${trim.poolName} TX: ${closed.txId}，正在重新分配至最优阈值...`
             );
-            await sleep(2200);
+            await sleep(1800);
+            const convertFrac = trim.closeFull
+              ? 1
+              : Math.min(0.9, Math.max(0.15, trim.reduceUsd / Math.max(trim.currentUsd, 1)));
+            await convertWithdrawnNonBaseTokenToUsdc(trim.poolId, convertFrac);
 
             const balAfterClose = await getWalletBalances(BACKEND_KEYPAIR!.publicKey);
             const availAfterUsd =

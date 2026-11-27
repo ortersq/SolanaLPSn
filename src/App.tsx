@@ -9,6 +9,7 @@ import { Header, TabKey } from './components/Header';
 import { BackendStatus, OverviewAndKeysView } from './components/OverviewAndKeysView';
 import { PoolMatrixView } from './components/PoolMatrixView';
 import { StrategyRiskView } from './components/StrategyRiskView';
+import { LogsView } from './components/LogsView';
 import {
   ActiveLpPosition,
   ApiKeyRequirement,
@@ -187,6 +188,10 @@ export default function App() {
     );
   }
 
+  const logErrorCount =
+    (backendStatus.logs || []).filter((l) => l.type === 'error').length +
+    (backendStatus.workerStatus?.lastError ? 1 : 0);
+
   return (
     <div className="min-h-screen bg-[#090d16] text-slate-100">
       <Header
@@ -194,6 +199,7 @@ export default function App() {
         onChangeTab={setActiveTab}
         onRunRiskScan={handleRunRiskScan}
         scanningRisk={scanningRisk}
+        logErrorCount={logErrorCount}
       />
 
       <main className="max-w-[1360px] mx-auto px-6 py-8">
@@ -213,6 +219,7 @@ export default function App() {
             onUpdateStrategyConfig={setStrategyConfig}
             onGoToStrategy={() => setActiveTab('strategy')}
             onGoToPools={() => setActiveTab('pools')}
+            onGoToLogs={() => setActiveTab('logs')}
           />
         )}
 
@@ -240,6 +247,14 @@ export default function App() {
             onUpdateStrategyConfig={setStrategyConfig}
             onUpdateBackendStatus={setBackendStatus}
             onRefreshPositions={handleRefreshPositions}
+          />
+        )}
+
+        {activeTab === 'logs' && (
+          <LogsView
+            backendStatus={backendStatus}
+            selectionRounds={selectionRounds}
+            onRefreshStatus={handleRunRiskScan}
           />
         )}
       </main>

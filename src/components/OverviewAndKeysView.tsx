@@ -42,7 +42,10 @@ import {
 export interface LogItem {
   id: number;
   time: string;
+  dateTime?: string;
+  timestamp?: number;
   type: 'info' | 'success' | 'warning' | 'error';
+  source?: 'tx' | 'risk' | 'strategy' | 'worker' | 'system';
   message: string;
 }
 
@@ -146,6 +149,7 @@ interface OverviewProps {
   onUpdateStrategyConfig?: (config: StrategyConfig) => void;
   onGoToStrategy: () => void;
   onGoToPools: () => void;
+  onGoToLogs?: () => void;
 }
 
 const PIPELINE_STEP_META: { key: PipelineStepKey; title: string; buttonLabel: string; hint: string }[] = [
@@ -250,6 +254,7 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
   onUpdateStrategyConfig,
   onGoToStrategy,
   onGoToPools,
+  onGoToLogs,
 }) => {
   const [checkingHelius, setCheckingHelius] = useState(false);
   const [alertFilter, setAlertFilter] = useState<'all' | 'alerts-only'>('all');
@@ -1656,11 +1661,29 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
 
       {/* Live System Activity Logs */}
       <section className="p-6 rounded-xl bg-[#101624] border border-slate-800/90 space-y-3">
-        <h2 className="text-base font-semibold text-white">后台状态与链上探测流水</h2>
-        <div className="bg-[#090d16] rounded-lg p-4 font-mono text-xs space-y-2 max-h-48 overflow-y-auto border border-slate-800/80">
-          {backendStatus.logs.map((log) => (
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="space-y-0.5">
+            <h2 className="text-base font-semibold text-white">
+              后台状态与链上探测流水（最近 {Math.min(backendStatus.logs.length, 20)} 条）
+            </h2>
+            <p className="text-xs text-slate-400">
+              如需按错误/警告筛选、搜索关键词或导出完整 300 条日志分析问题，请前往「运行日志」中心。
+            </p>
+          </div>
+          {onGoToLogs && (
+            <button
+              type="button"
+              onClick={onGoToLogs}
+              className="px-3.5 py-1.5 text-xs font-medium text-emerald-400 bg-emerald-500/15 border border-emerald-500/30 rounded-lg hover:bg-emerald-500/25 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              打开完整运行日志与问题诊断 →
+            </button>
+          )}
+        </div>
+        <div className="bg-[#090d16] rounded-lg p-4 font-mono text-xs space-y-2 max-h-56 overflow-y-auto border border-slate-800/80">
+          {backendStatus.logs.slice(0, 20).map((log) => (
             <div key={log.id} className="flex items-start gap-3">
-              <span className="text-slate-500 shrink-0">[{log.time}]</span>
+              <span className="text-slate-500 shrink-0">[{log.dateTime || log.time}]</span>
               <span
                 className={`shrink-0 font-semibold ${
                   log.type === 'success'
@@ -1674,7 +1697,7 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
               >
                 {log.type.toUpperCase()}
               </span>
-              <span className="text-slate-300">{log.message}</span>
+              <span className="text-slate-300 break-all">{log.message}</span>
             </div>
           ))}
         </div>

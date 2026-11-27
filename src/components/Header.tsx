@@ -1,18 +1,20 @@
 import React from 'react';
 
-export type TabKey = 'overview' | 'pools' | 'strategy';
+export type TabKey = 'overview' | 'pools' | 'strategy' | 'logs';
 
 interface HeaderProps {
   activeTab: TabKey;
   onChangeTab: (tab: TabKey) => void;
   onRunRiskScan: () => void;
   scanningRisk: boolean;
+  logErrorCount?: number;
 }
 
 const NAV_ITEMS: { key: TabKey; label: string }[] = [
   { key: 'overview', label: '策略与风控概览' },
   { key: 'pools', label: '自动选池矩阵' },
-  { key: 'strategy', label: '200U 稳健方案' },
+  { key: 'strategy', label: '收益方案配置' },
+  { key: 'logs', label: '运行日志' },
 ];
 
 export const Header: React.FC<HeaderProps> = ({
@@ -20,6 +22,7 @@ export const Header: React.FC<HeaderProps> = ({
   onChangeTab,
   onRunRiskScan,
   scanningRisk,
+  logErrorCount = 0,
 }) => {
   return (
     <header className="border-b border-slate-800/80 bg-[#090d16]/95 backdrop-blur-md sticky top-0 z-40">
@@ -46,13 +49,18 @@ export const Header: React.FC<HeaderProps> = ({
                 key={item.key}
                 type="button"
                 onClick={() => onChangeTab(item.key)}
-                className={`whitespace-nowrap shrink-0 py-1 border-b-2 transition-colors cursor-pointer ${
+                className={`whitespace-nowrap shrink-0 py-1 border-b-2 transition-colors cursor-pointer inline-flex items-center gap-1.5 ${
                   active
                     ? 'text-slate-100 border-emerald-500'
                     : 'text-slate-400 border-transparent hover:text-slate-200'
                 }`}
               >
-                {item.label}
+                <span>{item.label}</span>
+                {item.key === 'logs' && logErrorCount > 0 && (
+                  <span className="px-1.5 py-0.5 text-[10px] font-mono font-semibold rounded bg-rose-500/20 text-rose-300 border border-rose-500/30">
+                    {logErrorCount}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -80,11 +88,16 @@ export const Header: React.FC<HeaderProps> = ({
             key={item.key}
             type="button"
             onClick={() => onChangeTab(item.key)}
-            className={`whitespace-nowrap shrink-0 py-1 font-medium ${
+            className={`whitespace-nowrap shrink-0 py-1 font-medium inline-flex items-center gap-1 ${
               activeTab === item.key ? 'text-emerald-400' : 'text-slate-400'
             }`}
           >
-            {item.label}
+            <span>{item.label}</span>
+            {item.key === 'logs' && logErrorCount > 0 && (
+              <span className="px-1 py-0.5 text-[10px] font-mono rounded bg-rose-500/20 text-rose-300">
+                {logErrorCount}
+              </span>
+            )}
           </button>
         ))}
       </nav>

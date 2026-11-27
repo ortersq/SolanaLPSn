@@ -37,6 +37,13 @@ export function isPoolShallowVolatile(
   return !pool.isBluechip && !pool.isRwaOrVerified && (pool.tvl < 300_000 || Boolean(pool.isMemeRiskPool));
 }
 
+export function getMaxPoolExposureShare(
+  pool?: Pick<PoolMetrics, 'tvl' | 'isBluechip' | 'isRwaOrVerified' | 'isMemeRiskPool'> | null
+): number {
+  if (!pool) return 1;
+  return isPoolShallowVolatile(pool) ? 0.38 : 1;
+}
+
 export function assessPoolAntiRugRisk(pool: PoolMetrics): {
   blocked: boolean;
   caution: boolean;
@@ -1722,42 +1729,61 @@ export function evaluateAutonomousHighYieldSwitch(params: {
         ? Math.max(5, Number((totalEquityUsd * 0.4).toFixed(2)))
         : rawBudget;
     const budget = Number(Math.min(rawBudget, shallowCapUsd).toFixed(2));
-    const bestHeldInRange = [...activeDetails]
-      .filter((a) => a.injectedValueUsd >= 1.5 && a.inRange && a.nftMint)
-      .sort((a, b) => b.currentApr - a.currentApr)[0];
+    const eligibleHeldForTopUp = [...activeDetails]
+      .filter((a) => {
+        if (a.injectedValueUsd < 1.5 || !a.inRange || !a.nftMint) return false;
+        const matched = rankedPools.find((r) => r.id === a.poolId);
+        const maxShare = getMaxPoolExposureShare(matched);
+        if (maxShare < 1 && totalEquityUsd >= 20) {
+          const capUsd = totalEquityUsd * maxShare;
+          if (a.injectedValueUsd >= capUsd - 2) return false;
+        }
+        return true;
+      })
+      .sort((a, b) => b.currentApr - a.currentApr);
+    const bestHeldInRange = eligibleHeldForTopUp[0];
 
-    // If slots are already at cap (e.g. 2 slots on <$60 capital) and an active in-range pool beats/matches remaining unheld pools,
+    // If slots are already at cap (e.g. 2 slots on <$60 capital) and an under-cap active in-range pool beats/matches remaining unheld pools,
     // top up the existing NFT position via increasePositionFromBase instead of paying 0.018 SOL rent for a weaker 3rd pool
     if (
       realActiveCount >= slotCap &&
       bestHeldInRange &&
       bestHeldInRange.currentApr >= bestCandidate.apr * 0.85
     ) {
-      const topPoolComp =
-        comparisons.find((c) => c.poolId === bestHeldInRange.poolId) || bestCandidate;
-      const estimatedExtraMonthlyUsd = Number(
-        (((rawBudget * (Math.min(bestHeldInRange.currentApr, 260) / 100)) * concentrationBoost) / 12).toFixed(2)
-      );
-      return {
-        decision: 'OPEN_NEW',
-        shouldAct: true,
-        actionButtonLabel: '追加流动性到现有高息仓位（免新开 NFT 租金）',
-        headline: `检测到 $${idleDeployableUsd.toFixed(2)} 空余资金 → 原仓直加【${bestHeldInRange.poolName}】`,
-        reason: `当前已持有最优 ${realActiveCount} 个并行池，直接向在区间高息仓位【${bestHeldInRange.poolName}】(APR +${bestHeldInRange.currentApr}%) 原仓复投加仓 ~$${rawBudget.toFixed(2)}，节省 0.018 SOL NFT 租金，预计月增收益 +$${estimatedExtraMonthlyUsd}。`,
-        targetPool: topPoolComp,
-        sourcePositionToReplace: null,
-        topUpExistingPosition: {
-          poolId: bestHeldInRange.poolId,
-          poolName: bestHeldInRange.poolName,
-          nftMint: bestHeldInRange.nftMint!,
-          currentUsd: bestHeldInRange.injectedValueUsd,
-          apr: bestHeldInRange.currentApr,
-        },
-        deployBudgetUsd: rawBudget,
-        aprGainPct: 0,
-        estimatedExtraMonthlyUsd,
-        comparisons,
-      };
+      const matchedHeld = rankedPools.find((r) => r.id === bestHeldInRange.poolId);
+      const maxShare = getMaxPoolExposureShare(matchedHeld);
+      const remainingHeadroomUsd =
+        maxShare < 1 && totalEquityUsd >= 20
+          ? Math.max(0, Number((totalEquityUsd * maxShare - bestHeldInRange.injectedValueUsd).toFixed(2)))
+          : rawBudget;
+      const topUpBudget = Number(Math.min(rawBudget, remainingHeadroomUsd).toFixed(2));
+      if (topUpBudget >= 4) {
+        const topPoolComp =
+          comparisons.find((c) => c.poolId === bestHeldInRange.poolId) || bestCandidate;
+        const estimatedExtraMonthlyUsd = Number(
+          (((topUpBudget * (Math.min(bestHeldInRange.currentApr, 260) / 100)) * concentrationBoost) / 12).toFixed(2)
+        );
+        return {
+          decision: 'OPEN_NEW',
+          shouldAct: true,
+          actionButtonLabel: '追加流动性到现有高息仓位（免新开 NFT 租金）',
+          headline: `检测到 $${idleDeployableUsd.toFixed(2)} 空余资金 → 原仓直加【${bestHeldInRange.poolName}】`,
+          reason: `当前已持有最优 ${realActiveCount} 个并行池，直接向在区间高息仓位【${bestHeldInRange.poolName}】(APR +${bestHeldInRange.currentApr}%) 原仓复投加仓 ~$${topUpBudget.toFixed(2)}，节省 0.018 SOL NFT 租金，预计月增收益 +$${estimatedExtraMonthlyUsd}。`,
+          targetPool: topPoolComp,
+          sourcePositionToReplace: null,
+          topUpExistingPosition: {
+            poolId: bestHeldInRange.poolId,
+            poolName: bestHeldInRange.poolName,
+            nftMint: bestHeldInRange.nftMint!,
+            currentUsd: bestHeldInRange.injectedValueUsd,
+            apr: bestHeldInRange.currentApr,
+          },
+          deployBudgetUsd: topUpBudget,
+          aprGainPct: 0,
+          estimatedExtraMonthlyUsd,
+          comparisons,
+        };
+      }
     }
 
     const baseAprRef = weakestActive ? weakestActive.currentApr : 0;

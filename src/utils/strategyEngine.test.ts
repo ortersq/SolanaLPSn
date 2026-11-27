@@ -20,6 +20,7 @@ import {
   evaluateRiskAction,
   evaluateSafeWithdrawSafety,
   formatChainError,
+  getMaxPoolExposureShare,
   getOptimalRangeWidthForPool,
   isValidSolanaAddress,
   maskSolanaAddress,
@@ -1636,6 +1637,95 @@ test('meme-coin anti-rug defense: rejects freeze/1-day rugs, preserves RWA & sus
   const blacklistedVvv = blacklistedRanked.find((p) => p.id === 'vvv-sustained');
   assert.equal(blacklistedVvv?.eligibleFor200U, false);
   assert.equal(blacklistedVvv?.antiRugStatus, 'blocked');
+});
+
+test('evaluateAutonomousHighYieldSwitch never recommends topUpExistingPosition on shallow pool already above 38% cap', () => {
+  const turboCfg = buildPresetForCapital(200, 'turbo-high-yield');
+  const pools: PoolMetrics[] = [
+    {
+      id: 'vvv-shallow',
+      name: 'VVV / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'BJcSKhxWzJPs6H3pi7LddVa6PryM8NH2T1hZAeFEHeDU',
+      tvl: 122_000,
+      volume24h: 360_000,
+      vol7d: 2_800_000,
+      apr: 1113,
+      apr7d: 758,
+      apr30d: 447,
+      feeTier: '0.25%',
+      priceUsd: '4.1',
+      safetyScore: 86,
+      ilRisk: '中',
+    },
+    {
+      id: 'nflx-rwa',
+      name: 'NFLX / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'E3muPLAM111111111111111111111111111111111111',
+      tvl: 190_000,
+      volume24h: 350_000,
+      vol7d: 2_000_000,
+      apr: 470,
+      apr7d: 320,
+      feeTier: '0.25%',
+      priceUsd: '88',
+      safetyScore: 90,
+      ilRisk: '中',
+      isRwaOrVerified: true,
+    },
+    {
+      id: 'wsol-hsol',
+      name: 'WSOL / hSOL',
+      dex: 'RAYDIUM CLMM',
+      address: '9m6cYJ8dd26Smzh35qDvFjkyqvMWYw1CwG5R5F7xWg9Q',
+      tvl: 2_270_000,
+      volume24h: 3_100_000,
+      vol7d: 20_000_000,
+      apr: 144,
+      apr7d: 120,
+      feeTier: '0.01%',
+      priceUsd: '73',
+      safetyScore: 98,
+      ilRisk: '低',
+      isBluechip: true,
+    },
+    {
+      id: 'ttwo-safe',
+      name: 'TTWO / GTA6',
+      dex: 'RAYDIUM CLMM',
+      address: 'TTWO111111111111111111111111111111111111111',
+      tvl: 185_000,
+      volume24h: 280_000,
+      vol7d: 1_900_000,
+      apr: 583,
+      apr7d: 400,
+      feeTier: '0.25%',
+      priceUsd: '10',
+      safetyScore: 90,
+      ilRisk: '中',
+      isRwaOrVerified: true,
+    },
+  ];
+
+  const ranked = rankPools(pools, turboCfg);
+  assert.equal(getMaxPoolExposureShare(ranked.find((p) => p.id === 'vvv-shallow')), 0.38);
+  assert.equal(getMaxPoolExposureShare(ranked.find((p) => p.id === 'wsol-hsol')), 1);
+
+  const rec = evaluateAutonomousHighYieldSwitch({
+    rankedPools: ranked,
+    activePositions: [
+      { poolId: 'vvv-shallow', poolName: 'VVV / USDC', nftMint: 'nft-vvv', injectedValueUsd: 307, inRange: true },
+      { poolId: 'nflx-rwa', poolName: 'NFLX / USDC', nftMint: 'nft-nflx', injectedValueUsd: 75, inRange: true },
+      { poolId: 'wsol-hsol', poolName: 'WSOL / hSOL', nftMint: 'nft-hsol', injectedValueUsd: 14, inRange: true },
+    ],
+    idleDeployableUsd: 40,
+    usdcBalance: 40,
+    config: turboCfg,
+  });
+
+  // Must NEVER suggest topping up VVV/USDC when it is already 70%+ of equity!
+  assert.notEqual(rec.topUpExistingPosition?.poolId, 'vvv-shallow');
 });
 
 

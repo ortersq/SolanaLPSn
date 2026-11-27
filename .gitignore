@@ -8,3 +8,4 @@ coverage/
 !.env.example
 .bot-runtime-status.json
 .strategy-config.json
+.runtime-logs.json
