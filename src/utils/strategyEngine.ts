@@ -21,6 +21,91 @@ export interface PoolMetrics {
   ilRisk: '低' | '中' | '高';
   isBluechip?: boolean;
   url?: string;
+  apr30d?: number;
+  vol7d?: number;
+  burnPercent?: number;
+  isRwaOrVerified?: boolean;
+  hasUnverifiedFreezeAuthority?: boolean;
+  isMemeRiskPool?: boolean;
+  antiRugStatus?: 'safe' | 'caution' | 'blocked';
+  antiRugReason?: string;
+}
+
+export function isPoolShallowVolatile(
+  pool: Pick<PoolMetrics, 'tvl' | 'isBluechip' | 'isRwaOrVerified' | 'isMemeRiskPool'>
+): boolean {
+  return !pool.isBluechip && !pool.isRwaOrVerified && (pool.tvl < 300_000 || Boolean(pool.isMemeRiskPool));
+}
+
+export function assessPoolAntiRugRisk(pool: PoolMetrics): {
+  blocked: boolean;
+  caution: boolean;
+  reason?: string;
+} {
+  if (pool.hasUnverifiedFreezeAuthority) {
+    return {
+      blocked: true,
+      caution: false,
+      reason: '含未验证 Freeze 冻结权限（高危 Meme 锁仓撤池拦截）',
+    };
+  }
+  if (pool.antiRugStatus === 'blocked') {
+    return {
+      blocked: true,
+      caution: false,
+      reason: pool.antiRugReason || '防撤池熔断拦截（疑似单日脉冲/流动性异常）',
+    };
+  }
+
+  if (!pool.isBluechip && !pool.isRwaOrVerified && pool.tvl < 500_000) {
+    // 1-day pump-and-rug detector: almost all 7d volume concentrated in last 24h
+    if (
+      typeof pool.vol7d === 'number' &&
+      pool.vol7d > 0 &&
+      pool.volume24h > 0 &&
+      pool.vol7d < pool.volume24h * 2.1
+    ) {
+      return {
+        blocked: true,
+        caution: false,
+        reason: '7 日成交量占比异常（单日新发 Meme 脉冲池，防突击撤池）',
+      };
+    }
+    // Explicitly reported 0 7-day APR on shallow unverified pool -> brand-new pool with no sustained track record
+    if (typeof pool.apr7d === 'number' && pool.apr7d <= 0) {
+      return {
+        blocked: true,
+        caution: false,
+        reason: '缺乏 7 日持续手续费记录（新开浅池防撤池拦截）',
+      };
+    }
+    // Extreme 1-day wash-trade APR spike vs 7d average on micro-TVL pool
+    if (
+      typeof pool.apr7d === 'number' &&
+      pool.apr7d > 0 &&
+      pool.apr > pool.apr7d * 6 &&
+      pool.tvl < 200_000
+    ) {
+      return {
+        blocked: true,
+        caution: false,
+        reason: '浅池 24h 年化异常暴冲 (>7日均值 6x)，防刷量诱多撤池',
+      };
+    }
+    if (
+      pool.tvl < 300_000 ||
+      pool.isMemeRiskPool ||
+      (typeof pool.burnPercent === 'number' && pool.burnPercent < 10)
+    ) {
+      return {
+        blocked: false,
+        caution: true,
+        reason: '浅池/波动池已启用单池仓位上限 (≤38%) 与 1 轮极速防撤池熔断',
+      };
+    }
+  }
+
+  return { blocked: false, caution: false };
 }
 
 export interface ScoredPool extends PoolMetrics {
@@ -161,17 +246,17 @@ export function buildPresetForCapital(
       riskProfile: 'active-yield',
       gasReserveUsdt,
       lpActiveUsdt,
-      coreSplitPct: 70, // 70% Core Bluechip tight CLMM + 30% High-Turnover Satellite Pool
+      coreSplitPct: 50, // 50% High-Yield Core + 50% High-Turnover Monster Satellite Pool
       autoCompound: true,
       minAPR: 60,
-      minTVL: 500_000, // >= $500K deep liquidity eliminates micro rug traps while unlocking active pairs
-      rangeWidthPct: 6, // Tight ±6% CLMM range boosts fee capture ~2.45x
-      harvestMinUsd: 2.0,
-      stopLossPercentage: 8, // -8% ($16 on 200U) drawdown exit
+      minTVL: 100_000, // >= $100K liquidity unlocks ultra-high-APR CLMM pairs (500%~1300%+ APR)
+      rangeWidthPct: 4, // Tight ±4% CLMM range boosts fee capture ~3.45x
+      harvestMinUsd: 0.8,
+      stopLossPercentage: 14, // Tolerate -14% drawdown for higher fee upside
       takeProfitSweepUsd: 15, // Auto-compound up to $15 net profit before sweeping
-      maxILTolerance: 2.8,
+      maxILTolerance: 6.5,
       jitoTipLamports: 1_000_000,
-      slippageBps: 60,
+      slippageBps: 85,
       autoWithdrawSafety: true,
       multiPositionParallel: true,
       smartCapitalAllocation: true,
@@ -182,9 +267,9 @@ export function buildPresetForCapital(
       largeCapitalThresholdUsd: 300,
       largeCapitalTargetLtvPct: 30,
       autoSelectorWeights: {
-        aprWeight: 0.45,
-        volumeTvlRatioWeight: 0.35,
-        safetyWeight: 0.2,
+        aprWeight: 0.6,
+        volumeTvlRatioWeight: 0.28,
+        safetyWeight: 0.12,
       },
     };
   }
@@ -195,17 +280,17 @@ export function buildPresetForCapital(
       riskProfile: 'turbo-high-yield',
       gasReserveUsdt,
       lpActiveUsdt,
-      coreSplitPct: 45, // 45% ultra-tight Core CLMM + 55% #1 Highest-APR Satellite CLMM
+      coreSplitPct: 65, // 65% #1 Highest-APR Monster Pool + 35% #2 High-APR Satellite Pool
       autoCompound: true,
       minAPR: 45,
-      minTVL: 300_000, // >= $300K real liquidity unlocks top-APR CLMM pairs
-      rangeWidthPct: 4, // Ultra-tight ±4% CLMM range boosts fee capture ~3.45x
-      harvestMinUsd: 0.5, // Fast compounding for rapid fee turnover
-      stopLossPercentage: 10, // -10% drawdown exit
+      minTVL: 80_000, // >= $80K real liquidity unlocks 500%~1500%+ APR monster CLMM pools
+      rangeWidthPct: 3, // Ultra-tight ±3% CLMM range maximizes fee capture density (~4.3x)
+      harvestMinUsd: 0.35, // Rapid compounding for maximum APY snowball
+      stopLossPercentage: 18, // Tolerate -18% drawdown in pursuit of maximum profit
       takeProfitSweepUsd: 5, // Frequent profit sweep at $5 net profit
-      maxILTolerance: 4.5,
+      maxILTolerance: 8.5,
       jitoTipLamports: 1_200_000,
-      slippageBps: 80,
+      slippageBps: 120,
       autoWithdrawSafety: true,
       multiPositionParallel: true,
       smartCapitalAllocation: true,
@@ -216,9 +301,9 @@ export function buildPresetForCapital(
       largeCapitalThresholdUsd: 300,
       largeCapitalTargetLtvPct: 30,
       autoSelectorWeights: {
-        aprWeight: 0.55,
-        volumeTvlRatioWeight: 0.3,
-        safetyWeight: 0.15,
+        aprWeight: 0.72,
+        volumeTvlRatioWeight: 0.2,
+        safetyWeight: 0.08,
       },
     };
   }
@@ -390,34 +475,52 @@ export function scorePoolForSteadyProfit(
 
   const aprCap =
     config.riskProfile === 'turbo-high-yield'
-      ? 320
+      ? 1200
       : config.riskProfile === 'active-yield'
-      ? 240
-      : 180;
+      ? 700
+      : 220;
+  const rugRisk = assessPoolAntiRugRisk(pool);
+  if (rugRisk.blocked) {
+    return {
+      volTvlRatio,
+      alphaScore: 0,
+      eligibleFor200U: false,
+      poolRole: 'rejected',
+      selectionReason: rugRisk.reason || '防撤池风控拦截',
+    };
+  }
+
   // Blend 24h APR with 7d sustained APR when available to avoid 1-day flash-spike traps
   const hasApr7d = typeof pool.apr7d === 'number' && pool.apr7d > 0;
   const effectiveAprForScore = hasApr7d
     ? 0.65 * Math.max(pool.apr, 0) + 0.35 * Math.min(pool.apr7d!, Math.max(pool.apr, 0) * 1.4)
     : Math.max(pool.apr, 0);
-  const aprScore = Math.min((effectiveAprForScore / aprCap) * 100, 100);
+  const aprScore =
+    config.riskProfile === 'turbo-high-yield'
+      ? Math.min(Math.pow(effectiveAprForScore / 800, 0.55) * 100, 100)
+      : config.riskProfile === 'active-yield'
+      ? Math.min(Math.pow(effectiveAprForScore / 500, 0.6) * 100, 100)
+      : Math.min((effectiveAprForScore / aprCap) * 100, 100);
   const feeEquivalentActivity =
     typeof pool.fee24hUsd === 'number' && pool.fee24hUsd > 0
       ? Math.min(((pool.fee24hUsd / safeTvl) / 0.0025) * 25, 100)
       : 0;
   const activityScore = Math.max(Math.min(volTvlRatio * 25, 100), feeEquivalentActivity);
   const safetyComponent = Math.min(Math.max(pool.safetyScore, 0), 100);
-  const sustainedBonus = hasApr7d
-    ? pool.apr7d! >= config.minAPR * 0.7
-      ? 5
-      : pool.apr7d! < 15
-      ? -6
-      : 0
-    : 0;
+  const hasApr30d = typeof pool.apr30d === 'number' && pool.apr30d >= config.minAPR * 0.6;
+  const sustainedBonus =
+    (hasApr7d
+      ? pool.apr7d! >= config.minAPR * 0.7
+        ? 5
+        : pool.apr7d! < 15
+        ? -6
+        : 0
+      : 0) + (hasApr30d ? 3 : 0);
 
-  // In turbo mode, allow high-APR pools up to 420% APR provided TVL is deep enough
+  // In turbo mode, unlock high-APR pools up to 2200% APR provided TVL is >= minTVL
   const isHighRisk =
     config.riskProfile === 'turbo-high-yield'
-      ? pool.apr > 420
+      ? pool.apr > 2200
       : pool.ilRisk === '高';
   const isCoreBluechip = pool.ilRisk === '低' && pool.tvl >= 1_500_000;
   const tvlTooLow = pool.tvl < config.minTVL;
@@ -430,9 +533,9 @@ export function scorePoolForSteadyProfit(
 
   const minSafety =
     config.riskProfile === 'turbo-high-yield'
-      ? 68
+      ? 58
       : config.riskProfile === 'active-yield'
-      ? 80
+      ? 62
       : 85;
   const riskRejected =
     isHighRisk ||
@@ -440,6 +543,7 @@ export function scorePoolForSteadyProfit(
 
   const riskPenalty = isHighRisk ? 35 : riskRejected ? 20 : 0;
   const tvlPenalty = tvlTooLow ? 25 : 0;
+  const rugCautionPenalty = rugRisk.caution ? 3 : 0;
 
   const rawScore =
     aprScore * wApr +
@@ -447,7 +551,8 @@ export function scorePoolForSteadyProfit(
     safetyComponent * wSafe +
     sustainedBonus -
     riskPenalty -
-    tvlPenalty;
+    tvlPenalty -
+    rugCautionPenalty;
 
   const alphaScore = Number(Math.min(Math.max(rawScore, 0), 100).toFixed(1));
   const eligibleFor200U =
@@ -468,6 +573,7 @@ export function scorePoolForSteadyProfit(
     reasons.push(poolRole === 'core' ? '核心蓝筹压舱池' : '高换手增效卫星池');
     reasons.push(`深度 $${(pool.tvl / 1_000_000).toFixed(2)}M`);
     reasons.push(`换手 ${volTvlRatio}x`);
+    if (rugRisk.caution) reasons.push('防撤池限仓 ≤38%');
   }
 
   return {
@@ -479,8 +585,20 @@ export function scorePoolForSteadyProfit(
   };
 }
 
-export function rankPools(pools: PoolMetrics[], config: StrategyConfig): ScoredPool[] {
-  const scored: ScoredPool[] = pools.map((pool) => {
+export function rankPools(
+  pools: PoolMetrics[],
+  config: StrategyConfig,
+  blockedPoolIds?: Set<string>
+): ScoredPool[] {
+  const scored: ScoredPool[] = pools.map((rawPool) => {
+    const pool =
+      blockedPoolIds?.has(rawPool.id)
+        ? {
+            ...rawPool,
+            antiRugStatus: 'blocked' as const,
+            antiRugReason: '近期触发过撤池/深度骤降熔断（2小时拉黑隔离中）',
+          }
+        : rawPool;
     const info = scorePoolForSteadyProfit(pool, config);
     return {
       ...pool,
@@ -496,7 +614,7 @@ export function rankPools(pools: PoolMetrics[], config: StrategyConfig): ScoredP
     return b.alphaScore - a.alphaScore;
   });
 
-  if (scored.length > 0) {
+  if (scored.length > 0 && (scored[0].eligibleFor200U || !scored.some((p) => p.eligibleFor200U))) {
     scored[0].autoSelected = true;
   }
 
@@ -603,9 +721,25 @@ export function evaluateLiveRiskAlerts(input: LiveRiskScanInput): RiskLogEntry[]
     }
   }
 
-  // 2. Live Raydium pools: abnormal price/APR volatility traps
+  // 2. Live Raydium pools: anti-rug blocked pools (freeze authority / 1-day meme spike)
+  const rugBlockedPools = pools.filter((p) => assessPoolAntiRugRisk(p).blocked);
+  for (const pool of rugBlockedPools.slice(0, 2)) {
+    const riskInfo = assessPoolAntiRugRisk(pool);
+    alerts.push({
+      id: `rug-${pool.id}`,
+      time: nowTime,
+      severity: 'critical',
+      category: '防撤池 / Meme 风险池拦截',
+      target: pool.name,
+      detail: `${riskInfo.reason || '检测到高危撤池特征'}（当前 TVL $${Math.round(pool.tvl / 1000)}K），已硬性禁止建仓。`,
+    });
+  }
+
+  // 3. Live Raydium pools: abnormal price/APR volatility traps
   const volatilePools = pools.filter(
-    (p) => p.ilRisk === '高' || p.apr > 180 || Math.abs(p.priceChange24h || 0) >= 8
+    (p) =>
+      !assessPoolAntiRugRisk(p).blocked &&
+      (p.ilRisk === '高' || p.apr > 180 || Math.abs(p.priceChange24h || 0) >= 8)
   );
   for (const pool of volatilePools.slice(0, 3)) {
     const tvlLabel =
@@ -622,9 +756,12 @@ export function evaluateLiveRiskAlerts(input: LiveRiskScanInput): RiskLogEntry[]
     });
   }
 
-  // 3. Live Raydium pools: shallow liquidity -> withdraw slippage risk
+  // 4. Live Raydium pools: shallow liquidity -> withdraw slippage risk
   const shallowPools = pools.filter(
-    (p) => p.tvl < config.minTVL && !volatilePools.some((v) => v.id === p.id)
+    (p) =>
+      !assessPoolAntiRugRisk(p).blocked &&
+      p.tvl < config.minTVL &&
+      !volatilePools.some((v) => v.id === p.id)
   );
   for (const pool of shallowPools.slice(0, 2)) {
     alerts.push({
@@ -1144,9 +1281,10 @@ export function calculateAutoPortfolioPlan(params: {
   );
 
   const eligibleOrFallback = rankedPools.filter((p) => {
+    if (assessPoolAntiRugRisk(p).blocked) return false;
     const upperName = p.name.toUpperCase();
     const hasUsdcOrSol = upperName.includes('USDC') || upperName.includes('WSOL') || upperName.includes('SOL');
-    return hasUsdcOrSol && p.tvl >= 250_000;
+    return hasUsdcOrSol && p.tvl >= Math.min(config.minTVL, 80_000);
   });
   const strictlyEligible = eligibleOrFallback.filter((p) => p.eligibleFor200U);
   const preferPureYieldCore =
@@ -1161,27 +1299,48 @@ export function calculateAutoPortfolioPlan(params: {
       ? strictlyEligible
       : eligibleOrFallback;
 
-  const corePool = preferPureYieldCore
-    ? poolSource.find((p) => p.poolRole === 'core' && p.apr >= config.minAPR) ||
-      poolSource[0] ||
-      eligibleOrFallback[0]
-    : poolSource.find((p) => p.poolRole === 'core' || p.name.includes('WSOL / USDC')) ||
-      poolSource[0] ||
-      eligibleOrFallback[0];
+  // In turbo/active profit-maximizing modes, prioritize highest alphaScore / highest APR directly instead of forcing low-APR bluechips first
+  const corePool =
+    config.riskProfile === 'turbo-high-yield'
+      ? poolSource[0] || eligibleOrFallback[0]
+      : preferPureYieldCore
+      ? poolSource[0] ||
+        poolSource.find((p) => p.poolRole === 'core' && p.apr >= config.minAPR) ||
+        eligibleOrFallback[0]
+      : poolSource.find((p) => p.poolRole === 'core' || p.name.includes('WSOL / USDC')) ||
+        poolSource[0] ||
+        eligibleOrFallback[0];
 
+  const maxSatApr =
+    config.riskProfile === 'turbo-high-yield'
+      ? 2200
+      : config.riskProfile === 'active-yield'
+      ? 1600
+      : 420;
   // Distinct high-APR satellite pools prioritized from eligible candidates so low-APR rejected pools are skipped
   const satelliteCandidates = poolSource
-    .filter((p) => p.id !== corePool?.id && p.apr <= 420)
+    .filter((p) => p.id !== corePool?.id && p.apr <= maxSatApr)
     .sort((a, b) => b.alphaScore - a.alphaScore || b.apr - a.apr);
 
-  const satellitePool1 = satelliteCandidates[0];
-  const satellitePool2 = satelliteCandidates[1];
+  const coreIsShallowVolatile = corePool ? isPoolShallowVolatile(corePool) : false;
+  // When slot #1 is a shallow volatile (<$300K) pool, prioritize a >=$300K / bluechip anchor for slot #2 against rug risk
+  const deepAnchorCandidate = coreIsShallowVolatile
+    ? satelliteCandidates.find((p) => !isPoolShallowVolatile(p) && p.tvl >= 300_000) ||
+      strictlyEligible.find((p) => p.id !== corePool?.id && !isPoolShallowVolatile(p) && p.tvl >= 300_000)
+    : undefined;
+
+  const satellitePool1 = deepAnchorCandidate || satelliteCandidates[0];
+  const satellitePool2 = satelliteCandidates.find((p) => p.id !== satellitePool1?.id);
 
   const slotPlans: AutoPortfolioSlotPlan[] = [];
   if (totalBudgetUsd >= 3 && corePool) {
     if (targetSlots >= 3 && satellitePool1 && satellitePool2 && totalBudgetUsd >= 18) {
-      const coreUsd = Number((totalBudgetUsd * 0.4).toFixed(2));
-      const sat1Usd = Number((totalBudgetUsd * 0.35).toFixed(2));
+      // Anti-rug exposure cap: never concentrate >34% in a single <$300K volatile pool
+      const coreShare = coreIsShallowVolatile ? 0.34 : 0.4;
+      const sat1Shallow = isPoolShallowVolatile(satellitePool1);
+      const sat1Share = sat1Shallow ? 0.33 : coreIsShallowVolatile ? 0.41 : 0.35;
+      const coreUsd = Number((totalBudgetUsd * coreShare).toFixed(2));
+      const sat1Usd = Number((totalBudgetUsd * sat1Share).toFixed(2));
       const sat2Usd = Number((totalBudgetUsd - coreUsd - sat1Usd).toFixed(2));
       slotPlans.push(
         {
@@ -1213,7 +1372,11 @@ export function calculateAutoPortfolioPlan(params: {
         }
       );
     } else if (targetSlots >= 2 && satellitePool1 && totalBudgetUsd >= 8) {
-      const coreRatio = Math.min(0.75, Math.max(0.35, config.coreSplitPct / 100));
+      let coreRatio = Math.min(0.75, Math.max(0.35, config.coreSplitPct / 100));
+      // Anti-rug cap: never commit 65% of portfolio into a single <$300K non-bluechip/meme-risk pool
+      if (coreIsShallowVolatile) {
+        coreRatio = Math.min(coreRatio, 0.38);
+      }
       const coreUsd = Number((totalBudgetUsd * coreRatio).toFixed(2));
       const satUsd = Number((totalBudgetUsd - coreUsd).toFixed(2));
       slotPlans.push({
@@ -1235,12 +1398,15 @@ export function calculateAutoPortfolioPlan(params: {
         rangeWidthPct: getOptimalRangeWidthForPool(satellitePool1.name, config),
       });
     } else {
+      const singleBudget = coreIsShallowVolatile
+        ? Number((totalBudgetUsd * 0.5).toFixed(2))
+        : totalBudgetUsd;
       slotPlans.push({
         slotIndex: 1,
         poolId: corePool.id,
         poolName: corePool.name,
         role: 'core',
-        targetUsd: totalBudgetUsd,
+        targetUsd: singleBudget,
         apr: corePool.apr,
         rangeWidthPct: getOptimalRangeWidthForPool(corePool.name, config),
       });
@@ -1425,20 +1591,39 @@ export function evaluateAutonomousHighYieldSwitch(params: {
   const hasIncrementalIdle =
     idleDeployableUsd >= 5 || (usdcBalance > activeInjectedTotal && usdcBalance >= 2);
 
-  // Build APR vs Volatility comparison list for deployable SOL/USDC-paired pools
+  const maxAllowedApr =
+    config.riskProfile === 'turbo-high-yield'
+      ? 2200
+      : config.riskProfile === 'active-yield'
+      ? 1600
+      : 420;
+  const minAllowedTvl =
+    config.riskProfile === 'turbo-high-yield' || config.riskProfile === 'active-yield'
+      ? Math.min(config.minTVL, 80_000)
+      : 250_000;
+
+  // Build APR vs Volatility comparison list for deployable SOL/USDC-paired pools (anti-rug blocked pools excluded)
   const candidatePools = rankedPools.filter((p) => {
+    if (assessPoolAntiRugRisk(p).blocked) return false;
     const upper = p.name.toUpperCase();
     const hasMajorQuote = upper.includes('USDC') || upper.includes('WSOL') || upper.includes('SOL');
-    return hasMajorQuote && p.tvl >= 250_000 && p.apr <= 420;
+    return hasMajorQuote && p.tvl >= minAllowedTvl && p.apr <= maxAllowedApr;
   });
 
-  const comparisons: PoolComparisonItem[] = candidatePools.slice(0, 6).map((p) => {
+  const comparisons: PoolComparisonItem[] = candidatePools.slice(0, 8).map((p) => {
     const baseVol = p.ilRisk === '低' ? 18 : p.ilRisk === '中' ? 42 : 76;
     const changeBoost = Math.min(24, Math.abs(p.priceChange24h || 0) * 1.5);
     const volatilityPctEstimate = Number((baseVol + changeBoost).toFixed(1));
     const volatilityLabel: '低波动' | '中波动' | '高波动' =
       p.ilRisk === '低' ? '低波动' : p.ilRisk === '中' ? '中波动' : '高波动';
-    const tvlFactor = p.tvl >= 1_000_000 ? 1.12 : p.tvl >= 400_000 ? 1.0 : 0.88;
+    const tvlFactor =
+      config.riskProfile === 'turbo-high-yield'
+        ? 1.0
+        : p.tvl >= 1_000_000
+        ? 1.12
+        : p.tvl >= 400_000
+        ? 1.0
+        : 0.92;
     const riskAdjustedScore = Number(
       ((p.apr / Math.sqrt(Math.max(volatilityPctEstimate, 10))) * tvlFactor).toFixed(1)
     );
@@ -1457,13 +1642,23 @@ export function evaluateAutonomousHighYieldSwitch(params: {
     };
   });
 
-  comparisons.sort((a, b) => b.riskAdjustedScore - a.riskAdjustedScore);
+  comparisons.sort((a, b) =>
+    config.riskProfile === 'turbo-high-yield'
+      ? b.apr - a.apr || b.riskAdjustedScore - a.riskAdjustedScore
+      : b.riskAdjustedScore - a.riskAdjustedScore
+  );
 
-  // Filter pools allowed under current risk guardrails (ultra-safe rejects medium/high volatility; others accept TVL >= 300K)
+  // Filter pools allowed under current risk guardrails
   const safeHigherPools = comparisons.filter((c) => {
     if (c.isCurrentlyHeld) return false;
     if (config.riskProfile === 'ultra-safe') {
       return c.ilRisk === '低' && c.tvlUsd >= 1_500_000;
+    }
+    if (config.riskProfile === 'turbo-high-yield') {
+      return c.tvlUsd >= Math.min(config.minTVL, 80_000);
+    }
+    if (config.riskProfile === 'active-yield') {
+      return c.tvlUsd >= Math.min(config.minTVL, 100_000) && c.ilRisk !== '高';
     }
     return c.tvlUsd >= Math.min(config.minTVL, 300_000) && c.ilRisk !== '高';
   });
@@ -1519,7 +1714,14 @@ export function evaluateAutonomousHighYieldSwitch(params: {
 
   // Branch 1: Smart incremental funds available AND (parallel allowed OR zero real active positions) -> OPEN_NEW / TOP_UP_EXISTING
   if (hasIncrementalIdle && (smartAllocEnabled || realActiveCount === 0) && (parallelEnabled || realActiveCount === 0)) {
-    const budget = Number(Math.min(config.lpActiveUsdt, Math.max(idleDeployableUsd, usdcBalance) * 0.88).toFixed(2));
+    const rawBudget = Number(Math.min(config.lpActiveUsdt, Math.max(idleDeployableUsd, usdcBalance) * 0.88).toFixed(2));
+    const targetScored = rankedPools.find((r) => r.id === bestCandidate.poolId);
+    const isTargetShallow = targetScored ? isPoolShallowVolatile(targetScored) : bestCandidate.tvlUsd < 300_000;
+    const shallowCapUsd =
+      isTargetShallow && totalEquityUsd >= 20
+        ? Math.max(5, Number((totalEquityUsd * 0.4).toFixed(2)))
+        : rawBudget;
+    const budget = Number(Math.min(rawBudget, shallowCapUsd).toFixed(2));
     const bestHeldInRange = [...activeDetails]
       .filter((a) => a.injectedValueUsd >= 1.5 && a.inRange && a.nftMint)
       .sort((a, b) => b.currentApr - a.currentApr)[0];
@@ -1534,14 +1736,14 @@ export function evaluateAutonomousHighYieldSwitch(params: {
       const topPoolComp =
         comparisons.find((c) => c.poolId === bestHeldInRange.poolId) || bestCandidate;
       const estimatedExtraMonthlyUsd = Number(
-        (((budget * (Math.min(bestHeldInRange.currentApr, 260) / 100)) * concentrationBoost) / 12).toFixed(2)
+        (((rawBudget * (Math.min(bestHeldInRange.currentApr, 260) / 100)) * concentrationBoost) / 12).toFixed(2)
       );
       return {
         decision: 'OPEN_NEW',
         shouldAct: true,
         actionButtonLabel: '追加流动性到现有高息仓位（免新开 NFT 租金）',
         headline: `检测到 $${idleDeployableUsd.toFixed(2)} 空余资金 → 原仓直加【${bestHeldInRange.poolName}】`,
-        reason: `当前已持有最优 ${realActiveCount} 个并行池，直接向在区间高息仓位【${bestHeldInRange.poolName}】(APR +${bestHeldInRange.currentApr}%) 原仓复投加仓 ~$${budget.toFixed(2)}，节省 0.018 SOL NFT 租金，预计月增收益 +$${estimatedExtraMonthlyUsd}。`,
+        reason: `当前已持有最优 ${realActiveCount} 个并行池，直接向在区间高息仓位【${bestHeldInRange.poolName}】(APR +${bestHeldInRange.currentApr}%) 原仓复投加仓 ~$${rawBudget.toFixed(2)}，节省 0.018 SOL NFT 租金，预计月增收益 +$${estimatedExtraMonthlyUsd}。`,
         targetPool: topPoolComp,
         sourcePositionToReplace: null,
         topUpExistingPosition: {
@@ -1551,7 +1753,7 @@ export function evaluateAutonomousHighYieldSwitch(params: {
           currentUsd: bestHeldInRange.injectedValueUsd,
           apr: bestHeldInRange.currentApr,
         },
-        deployBudgetUsd: budget,
+        deployBudgetUsd: rawBudget,
         aprGainPct: 0,
         estimatedExtraMonthlyUsd,
         comparisons,
@@ -1614,7 +1816,13 @@ export function evaluateAutonomousHighYieldSwitch(params: {
     ).toFixed(2)
   );
   const worthRotating =
-    aprGainPct >= 20 && bestCandidate.riskAdjustedScore >= weakestActive.riskAdjustedScore * 1.12;
+    config.riskProfile === 'turbo-high-yield'
+      ? aprGainPct >= 25 && bestCandidate.apr >= weakestActive.currentApr * 1.25
+      : config.riskProfile === 'active-yield'
+      ? aprGainPct >= 30 &&
+        bestCandidate.apr >= weakestActive.currentApr * 1.35 &&
+        bestCandidate.riskAdjustedScore >= weakestActive.riskAdjustedScore * 0.9
+      : aprGainPct >= 20 && bestCandidate.riskAdjustedScore >= weakestActive.riskAdjustedScore * 1.12;
 
   if (worthRotating) {
     return {
@@ -1656,6 +1864,7 @@ export function evaluateAutonomousHighYieldSwitch(params: {
 export type RebalanceTriggerType =
   | 'BALANCED'
   | 'DEPTH_DROP_REDUCE'
+  | 'OUT_OF_RANGE_RECENTER'
   | 'SHARE_DRIFT_REBALANCE'
   | 'PAUSED';
 
@@ -1877,6 +2086,48 @@ export function evaluateAutoAssetRebalance(params: {
     };
   }
 
+  // Priority 1.5: Out-of-range position in active/turbo mode earns $0 fees -> auto re-center / rotate into top yield
+  if (config.riskProfile === 'turbo-high-yield' || config.riskProfile === 'active-yield') {
+    const outOfRangePos = allocations.find((a) => !a.inRange && a.currentUsd >= 3);
+    if (outOfRangePos) {
+      const topPool =
+        rankedPools
+          .filter(
+            (r) =>
+              r.eligibleFor200U &&
+              (r.name.toUpperCase().includes('USDC') || r.name.toUpperCase().includes('SOL'))
+          )
+          .sort((a, b) => b.alphaScore - a.alphaScore)[0] ||
+        rankedPools.find((r) => r.id === outOfRangePos.poolId) ||
+        { id: outOfRangePos.poolId, name: outOfRangePos.poolName };
+      return {
+        enabled: true,
+        shouldRebalance: true,
+        triggerType: 'OUT_OF_RANGE_RECENTER',
+        driftThresholdPct,
+        depthDropThresholdPct,
+        maxAbsDriftPct: Number(maxAbsDriftPct.toFixed(1)),
+        maxDepthDropPct: Number(maxDepthDropPct.toFixed(1)),
+        headline: `仓位【${outOfRangePos.poolName}】已越界停费 → 自动收紧重开追高赚费`,
+        reason: `检测到【${outOfRangePos.poolName}】($${outOfRangePos.currentUsd.toFixed(2)}) 已偏离集中做市区间（当前手续费为 $0），为追求最大盈利，系统自动平旧仓并立即按现价重新锚定高收益池【${topPool.name}】。`,
+        sourcePositionToTrim: {
+          poolId: outOfRangePos.poolId,
+          poolName: outOfRangePos.poolName,
+          nftMint: outOfRangePos.nftMint,
+          currentUsd: outOfRangePos.currentUsd,
+          reduceUsd: outOfRangePos.currentUsd,
+          closeFull: true,
+        },
+        targetPoolToBoost: {
+          poolId: topPool.id,
+          poolName: topPool.name,
+          boostUsd: Number((outOfRangePos.currentUsd * 0.96).toFixed(2)),
+        },
+        allocations,
+      };
+    }
+  }
+
   // Priority 2: Parallel allocation share drift exceeds threshold (only rebalance when position size justifies swap/gas cost)
   if (realPositions.length >= 2 && totalActiveUsd >= 25) {
     const overweight = [...allocations].sort((a, b) => b.driftPct - a.driftPct)[0];
@@ -2020,8 +2271,9 @@ export function evaluateSafeWithdrawSafety(params: {
     const volTvlRatio =
       matched && poolTvlUsd > 0 ? Number((matched.volume24h / poolTvlUsd).toFixed(2)) : 0;
 
-    // Estimate concentrated CLMM IL from price deviation relative to range midpoint & negative PnL
+    // Estimate concentrated CLMM IL from price deviation relative to range midpoint & spot crash drawdown below lower bound
     let concentratedIlPct = 0;
+    let crashDrawdownPct = 0;
     const lower = Number(pos.priceLowerUsd || 0);
     const upper = Number(pos.priceUpperUsd || 0);
     const curr = Number(pos.priceCurrentUsd || 0);
@@ -2033,23 +2285,39 @@ export function evaluateSafeWithdrawSafety(params: {
       const halfSpanPct = Math.max(2, ((upper - lower) / (2 * mid)) * 100);
       const concentrationFactor = Math.min(3.5, Math.max(1, 25 / halfSpanPct));
       concentratedIlPct = Number((baseIl * concentrationFactor).toFixed(2));
+      // Once price crashes below lower bound, LP converts 100% into the falling token -> direct spot loss
+      if (!matched?.isBluechip && curr < lower * 0.92) {
+        crashDrawdownPct = Number((((lower - curr) / lower) * 100).toFixed(2));
+      }
     }
     const drawdownIlFloor =
       typeof pos.unrealizedPnlPct === 'number' && pos.unrealizedPnlPct < 0
         ? Math.abs(pos.unrealizedPnlPct)
         : 0;
     const estimatedIlPct = Number(
-      Math.max(concentratedIlPct, drawdownIlFloor).toFixed(2)
+      Math.max(concentratedIlPct, drawdownIlFloor, crashDrawdownPct).toFixed(2)
     );
 
+    const flashRugDropPct = 35;
+    const absoluteFloorTvlUsd = 50_000;
+    const vanishedFromScanner = matched === undefined && baselineTvlUsd > 0;
+    const isFlashRug =
+      (poolTvlUsd > 0 && tvlDropPct >= flashRugDropPct) ||
+      (poolTvlUsd > 0 && poolTvlUsd < absoluteFloorTvlUsd) ||
+      (pos.inRange === false && poolTvlUsd > 0 && tvlDropPct >= 20) ||
+      (vanishedFromScanner && pos.inRange === false);
+
     const isLiquidityDepletingNow =
+      isFlashRug ||
+      vanishedFromScanner ||
       (poolTvlUsd > 0 && tvlDropPct >= depletionTvlDropPct) ||
       (poolTvlUsd > 0 && poolTvlUsd < Math.min(config.minTVL * 0.5, 250_000)) ||
       (pos.inRange === false && poolTvlUsd > 0 && volTvlRatio < 0.05);
 
     const streakCount =
       depletionStreaks[pos.poolId] ?? (isLiquidityDepletingNow ? 1 : 0);
-    const persistentDepletion = isLiquidityDepletingNow && streakCount >= persistentTicksRequired;
+    const persistentDepletion =
+      isFlashRug || (isLiquidityDepletingNow && streakCount >= persistentTicksRequired);
     const ilExceeded = estimatedIlPct >= maxILTolerancePct;
 
     let breachType: SafeWithdrawPositionRisk['breachType'] = 'NONE';
@@ -2059,11 +2327,16 @@ export function evaluateSafeWithdrawSafety(params: {
     if (persistentDepletion) {
       breachType = 'LIQUIDITY_DEPLETION';
       shouldWithdraw = true;
-      reason = `连续 ${streakCount} 轮检测到池子流动性枯竭（TVL 回撤 ${tvlDropPct}%，当前 $${Math.round(poolTvlUsd / 1000)}K），触发自动撤池转 USDC`;
+      reason = isFlashRug
+        ? `检测到突发撤池/深度崩塌（TVL 骤降 ${tvlDropPct}%，当前 $${Math.round(poolTvlUsd / 1000)}K），1 轮极速防撤池熔断立即全额撤出转 USDC！`
+        : `连续 ${streakCount} 轮检测到池子流动性枯竭（TVL 回撤 ${tvlDropPct}%，当前 $${Math.round(poolTvlUsd / 1000)}K），触发自动撤池转 USDC`;
     } else if (ilExceeded) {
       breachType = 'IL_THRESHOLD_EXCEEDED';
       shouldWithdraw = true;
-      reason = `估算无常损失/回撤达 ${estimatedIlPct.toFixed(2)}%，超过安全阈值 ${maxILTolerancePct}%，触发自动撤池并兑换 USDC 落袋`;
+      reason =
+        crashDrawdownPct >= maxILTolerancePct
+          ? `代币跌破下界重挫 ${crashDrawdownPct.toFixed(1)}%（≥ ${maxILTolerancePct}% 防护线），触发极速撤池砸盘转 USDC 保本`
+          : `估算无常损失/回撤达 ${estimatedIlPct.toFixed(2)}%，超过安全阈值 ${maxILTolerancePct}%，触发自动撤池并兑换 USDC 落袋`;
     } else if (isLiquidityDepletingNow) {
       reason = `流动性出现第 ${streakCount}/${persistentTicksRequired} 轮萎缩预警（连续达标将自动撤池转 USDC）`;
     }

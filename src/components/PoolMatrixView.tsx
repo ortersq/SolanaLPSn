@@ -200,8 +200,12 @@ export const PoolMatrixView: React.FC<PoolMatrixProps> = ({
                           </span>
                         )}
                         {!pool.eligibleFor200U && (
-                          <span className="text-xs text-slate-500">
-                            · 不符合当前风控标准
+                          <span
+                            className={`text-xs ${
+                              pool.antiRugStatus === 'blocked' ? 'text-rose-400 font-medium' : 'text-slate-500'
+                            }`}
+                          >
+                            · {pool.antiRugStatus === 'blocked' ? '防撤池已拦截' : '不符合当前风控标准'}
                           </span>
                         )}
                       </div>

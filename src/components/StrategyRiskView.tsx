@@ -926,21 +926,21 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
             </div>
 
             <div className="p-2.5 rounded-lg bg-[#101624] border border-slate-800/80">
-              <div className="text-[11px] text-slate-400">持续流动性枯竭计数</div>
+              <div className="text-[11px] text-slate-400">防撤池 / 流动性枯竭熔断</div>
               <div className="mt-1 flex items-center justify-between text-xs font-mono font-bold text-white tabular-nums">
                 <span>
                   {safeWithdrawPlan.maxDepletionTicks} / {safeWithdrawPlan.persistentTicksRequired} 轮
                 </span>
                 <span className="text-[11px] font-normal text-slate-400">
-                  深度回撤 ≥{safeWithdrawPlan.depletionTvlDropPct}% 触发
+                  骤降 ≥35%/破$50K 1 轮秒撤
                 </span>
               </div>
             </div>
 
             <div className="p-2.5 rounded-lg bg-[#101624] border border-slate-800/80">
-              <div className="text-[11px] text-slate-400">安全回撤归集资产</div>
+              <div className="text-[11px] text-slate-400">防 Meme 撤池归集与防重买</div>
               <div className="mt-1 text-xs font-semibold text-emerald-300">
-                100% 撤池并兑换为 USDC 存入钱包（保留 0.028 SOL）
+                100% 撤池并兑换 USDC（应急放宽滑点 + 拉黑 2h）
               </div>
             </div>
           </div>
@@ -1764,10 +1764,10 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
             >
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-semibold text-emerald-400">进取增效型</span>
-                <span className="text-[11px] font-mono text-amber-400">胜率 45~55%</span>
+                <span className="text-[11px] font-mono text-amber-400">高收益 · ±4%</span>
               </div>
               <div className="text-xs text-slate-400 leading-relaxed">
-                70% ±6% 蓝筹（×2.45密度）+ 30% 高换手热池卫星仓（TVL≥$500K）+ 自动复利 · -8% 止损。
+                50% 高息核心 + 50% ±4% 高年化热池（TVL≥$100K, 最高1600% APR）+ $0.8 复利 · -14% 止损。
               </div>
             </button>
 
@@ -1786,10 +1786,10 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
             >
               <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-semibold text-amber-300">极速高收益突击型</span>
-                <span className="text-[11px] font-mono text-rose-400">爆发收益 · 双仓</span>
+                <span className="text-[11px] font-mono text-rose-400">最大盈利 · 追高</span>
               </div>
               <div className="text-xs text-slate-400 leading-relaxed">
-                45% ±4% 超窄核心 + 55% 全网第一高APR热池（TVL≥$300K, 最高420% APR）· $0.5极速复利 · 费率密度 ×3.45。
+                ±3% 超窄高密度区间 + 全网最高APR池（TVL≥$80K, 最高2200% APR）· $0.35 极速复利 · 容忍 -18% 回撤追最大利润。
               </div>
             </button>
           </div>

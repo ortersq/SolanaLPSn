@@ -58,6 +58,7 @@ import {
   SolanaLendingReserve,
   StrategyConfig,
   assessLiveTestWalletReadiness,
+  assessPoolAntiRugRisk,
   buildPresetForCapital,
   buildSelectionRoundFromPools,
   calculateAutoPortfolioPlan,
@@ -243,7 +244,7 @@ function loadInitialStrategyConfig(): StrategyConfig {
           : presetBase.minAPR,
       minTVL:
         typeof saved.minTVL === 'number' && Number.isFinite(saved.minTVL)
-          ? Math.max(100_000, Math.min(50_000_000, saved.minTVL))
+          ? Math.max(80_000, Math.min(50_000_000, saved.minTVL))
           : presetBase.minTVL,
       rangeWidthPct:
         typeof saved.rangeWidthPct === 'number' && Number.isFinite(saved.rangeWidthPct)
@@ -407,6 +408,37 @@ let lastAutoSafeWithdrawAt = 0;
 let lastAutoCompoundAt = 0;
 let lastMultiHedgeAt = 0;
 let lastAutoGasTopUpAt = 0;
+const ruggedPoolCooldownMap = new Map<string, { until: number; reason: string }>();
+const RUGGED_POOL_BLACKLIST_MS = 2 * 60 * 60 * 1000;
+
+function blacklistRuggedPool(poolId: string, reason: string, durationMs = RUGGED_POOL_BLACKLIST_MS) {
+  if (!poolId) return;
+  ruggedPoolCooldownMap.set(poolId, { until: Date.now() + durationMs, reason });
+}
+
+function getActiveRuggedPoolBlacklist(): Set<string> {
+  const now = Date.now();
+  const active = new Set<string>();
+  for (const [id, entry] of ruggedPoolCooldownMap.entries()) {
+    if (entry.until > now) {
+      active.add(id);
+    } else {
+      ruggedPoolCooldownMap.delete(id);
+    }
+  }
+  return active;
+}
+
+function getRugBlacklistEntry(poolId: string): { until: number; reason: string } | null {
+  const entry = ruggedPoolCooldownMap.get(poolId);
+  if (!entry) return null;
+  if (entry.until <= Date.now()) {
+    ruggedPoolCooldownMap.delete(poolId);
+    return null;
+  }
+  return entry;
+}
+
 let clmmWriteInFlight = false;
 async function acquireClmmWriteLock(): Promise<() => void> {
   const deadline = Date.now() + 45_000;
@@ -803,7 +835,7 @@ async function fetchRealPools(): Promise<{ pools: PoolMetrics[]; source: string 
       const timer = setTimeout(() => controller.abort(), 6000);
       try {
         const res = await fetch(
-          `https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=${sortField}&sortType=desc&pageSize=30&page=1`,
+          `https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=${sortField}&sortType=desc&pageSize=40&page=1`,
           { signal: controller.signal }
         );
         if (!res.ok) return [];
@@ -838,60 +870,21 @@ async function fetchRealPools(): Promise<{ pools: PoolMetrics[]; source: string 
         if (p.mintB?.address && sB) mintSymbolCache.set(p.mintB.address, sB);
         if (p.id && sA && sB) poolSymbolMetaCache.set(p.id, { symA: sA, symB: sB });
       }
-      const stables = new Set(['USDC', 'USDT', 'PYUSD', 'USDS', 'USD1']);
-      const bluechips = new Set(['SOL', 'WSOL', 'MSOL', 'JITOSOL', 'BSOL', 'HSOL', 'JUP']);
-      const solLstFamily = new Set(['SOL', 'WSOL', 'MSOL', 'JITOSOL', 'BSOL', 'HSOL', 'DSOL', 'JSOL']);
-      const btcFamily = new Set(['WBTC', 'CBBTC', 'TBTC', 'ZBTC', 'SOLBTC']);
-
       const mapped: PoolMetrics[] = rows
         .filter((p: any) => {
           const tvl = Number(p.tvl || 0);
           const apr = Number(p.day?.apr || 0);
-          // Filter out $0/$2 TVL scam APR traps while keeping real >=$100K active CLMM pools
-          return tvl >= 100_000 && apr <= 600 && apr >= 1;
+          const fee24hUsd = Number(p.day?.volumeFee ?? Number(p.day?.volume || 0) * Number(p.feeRate || 0.0025));
+          // Filter out $0/$2 TVL scam APR traps while keeping >=$80K real high-fee pools (up to 2500% APR)
+          return tvl >= 80_000 && apr <= 2500 && apr >= 5 && fee24hUsd >= 250;
         })
-        .slice(0, 24)
-        .map((p: any) => {
-          const tvl = Number(p.tvl || 0);
-          const vol24h = Number(p.day?.volume || 0);
-          const apr = Number(p.day?.apr || 0);
-          const apr7d = Number(p.week?.apr || 0);
-          const feeRate = Number(p.feeRate || 0.0025);
-          const fee24hUsd = Number(p.day?.volumeFee ?? vol24h * feeRate);
-          const symbolA = p.mintA?.symbol || 'TOKEN';
-          const symbolB = p.mintB?.symbol || 'SOL';
-          const upA = symbolA.toUpperCase();
-          const upB = symbolB.toUpperCase();
-          const isBothStable = stables.has(upA) && stables.has(upB);
-          const isCorrelatedLst =
-            (solLstFamily.has(upA) && solLstFamily.has(upB)) ||
-            (btcFamily.has(upA) && btcFamily.has(upB));
-          const isBluechipStable =
-            (stables.has(upA) && bluechips.has(upB)) ||
-            (stables.has(upB) && bluechips.has(upA));
-          const isLowIlPair = isBothStable || isCorrelatedLst || isBluechipStable;
-
-          const safetyScore =
-            tvl > 5_000_000 ? 96 : tvl > 2_000_000 ? 92 : tvl > 500_000 ? 84 : tvl > 250_000 ? 74 : 64;
-          const ilRisk: '低' | '中' | '高' = isLowIlPair ? '低' : apr > 260 ? '高' : '中';
-
-          return {
-            id: p.id,
-            name: `${symbolA} / ${symbolB}`,
-            dex: 'RAYDIUM CLMM',
-            address: p.id,
-            tvl,
-            volume24h: vol24h,
-            apr: Number(apr.toFixed(1)),
-            apr7d: apr7d > 0 ? Number(apr7d.toFixed(1)) : undefined,
-            fee24hUsd: fee24hUsd > 0 ? Number(fee24hUsd.toFixed(2)) : undefined,
-            feeTier: `${(feeRate * 100).toFixed(2)}%`,
-            priceUsd: p.price ? Number(p.price).toFixed(4) : '0.0000',
-            safetyScore,
-            ilRisk,
-            isBluechip: isLowIlPair,
-          };
-        });
+        .sort((a: any, b: any) => {
+          const feeA = Number(a.day?.volumeFee || 0);
+          const feeB = Number(b.day?.volumeFee || 0);
+          return feeB - feeA;
+        })
+        .slice(0, 36)
+        .map((p: any) => mapRaydiumRowToPoolMetrics(p));
 
       if (mapped.length > 0) {
         return { pools: mapped, source: 'Raydium Mainnet API v3 (fee24h + volume24h 双榜融合)' };
@@ -944,6 +937,129 @@ async function fetchRealPools(): Promise<{ pools: PoolMetrics[]; source: string 
   return { pools: [], source: '上游行情接口暂时不可达' };
 }
 
+const ANTI_RUG_STABLES = new Set(['USDC', 'USDT', 'PYUSD', 'USDS', 'USD1']);
+const ANTI_RUG_BLUECHIPS = new Set(['SOL', 'WSOL', 'MSOL', 'JITOSOL', 'BSOL', 'HSOL', 'JUP']);
+const ANTI_RUG_SOL_LST = new Set(['SOL', 'WSOL', 'MSOL', 'JITOSOL', 'BSOL', 'HSOL', 'DSOL', 'JSOL']);
+const ANTI_RUG_BTC = new Set(['WBTC', 'CBBTC', 'TBTC', 'ZBTC', 'SOLBTC']);
+
+function isTrustedQuoteOrBluechipSymbol(sym: string): boolean {
+  const up = (sym || '').trim().toUpperCase();
+  return (
+    ANTI_RUG_STABLES.has(up) ||
+    ANTI_RUG_BLUECHIPS.has(up) ||
+    ANTI_RUG_SOL_LST.has(up) ||
+    ANTI_RUG_BTC.has(up)
+  );
+}
+
+function mapRaydiumRowToPoolMetrics(p: any): PoolMetrics {
+  const tvl = Number(p.tvl || 0);
+  const vol24h = Number(p.day?.volume || 0);
+  const vol7d = Number(p.week?.volume || 0);
+  const apr = Number(p.day?.apr || 0);
+  const apr7d = Number(p.week?.apr || 0);
+  const apr30d = Number(p.month?.apr || 0);
+  const burnPercent = Number(p.burnPercent || 0);
+  const feeRate = Number(p.feeRate || 0.0025);
+  const fee24hUsd = Number(p.day?.volumeFee ?? vol24h * feeRate);
+  const symbolA = p.mintA?.symbol || 'TOKEN';
+  const symbolB = p.mintB?.symbol || 'SOL';
+  const upA = symbolA.toUpperCase();
+  const upB = symbolB.toUpperCase();
+  const isBothStable = ANTI_RUG_STABLES.has(upA) && ANTI_RUG_STABLES.has(upB);
+  const isCorrelatedLst =
+    (ANTI_RUG_SOL_LST.has(upA) && ANTI_RUG_SOL_LST.has(upB)) ||
+    (ANTI_RUG_BTC.has(upA) && ANTI_RUG_BTC.has(upB));
+  const isBluechipStable =
+    (ANTI_RUG_STABLES.has(upA) && ANTI_RUG_BLUECHIPS.has(upB)) ||
+    (ANTI_RUG_STABLES.has(upB) && ANTI_RUG_BLUECHIPS.has(upA));
+  const isLowIlPair = isBothStable || isCorrelatedLst || isBluechipStable;
+
+  const poolTypes: string[] = Array.isArray(p.pooltype) ? p.pooltype : [];
+  const tipsA = String(p.mintA?.extensions?.tips || '');
+  const tipsB = String(p.mintB?.extensions?.tips || '');
+  const isRwaOrVerified =
+    poolTypes.includes('RWA') ||
+    /backpack|backed|xstocks/i.test(tipsA) ||
+    /backpack|backed|xstocks/i.test(tipsB);
+
+  const tagsA: string[] = Array.isArray(p.mintA?.tags) ? p.mintA.tags : [];
+  const tagsB: string[] = Array.isArray(p.mintB?.tags) ? p.mintB.tags : [];
+  const freezeA = tagsA.includes('hasFreeze') && !isTrustedQuoteOrBluechipSymbol(upA) && !isRwaOrVerified;
+  const freezeB = tagsB.includes('hasFreeze') && !isTrustedQuoteOrBluechipSymbol(upB) && !isRwaOrVerified;
+  const hasUnverifiedFreezeAuthority = freezeA || freezeB;
+
+  const isMemeRiskPool =
+    !isLowIlPair &&
+    !isRwaOrVerified &&
+    tvl < 350_000;
+
+  const safetyScore =
+    tvl > 5_000_000 ? 96 : tvl > 2_000_000 ? 92 : tvl > 500_000 ? 84 : tvl > 250_000 ? 74 : 64;
+  const ilRisk: '低' | '中' | '高' = isLowIlPair ? '低' : apr > 1600 ? '高' : '中';
+
+  const baseMetric: PoolMetrics = {
+    id: p.id,
+    name: `${symbolA} / ${symbolB}`,
+    dex: 'RAYDIUM CLMM',
+    address: p.id,
+    tvl,
+    volume24h: vol24h,
+    apr: Number(apr.toFixed(1)),
+    apr7d: Number(apr7d.toFixed(1)),
+    apr30d: apr30d > 0 ? Number(apr30d.toFixed(1)) : undefined,
+    vol7d: vol7d > 0 ? Number(vol7d.toFixed(2)) : undefined,
+    burnPercent: Number(burnPercent.toFixed(2)),
+    fee24hUsd: fee24hUsd > 0 ? Number(fee24hUsd.toFixed(2)) : undefined,
+    feeTier: `${(feeRate * 100).toFixed(2)}%`,
+    priceUsd: p.price ? Number(p.price).toFixed(4) : '0.0000',
+    safetyScore,
+    ilRisk,
+    isBluechip: isLowIlPair,
+    isRwaOrVerified,
+    hasUnverifiedFreezeAuthority,
+    isMemeRiskPool,
+  };
+
+  const rugRisk = assessPoolAntiRugRisk(baseMetric);
+  return {
+    ...baseMetric,
+    antiRugStatus: rugRisk.blocked ? 'blocked' : rugRisk.caution ? 'caution' : 'safe',
+    antiRugReason: rugRisk.reason,
+  };
+}
+
+/**
+ * Directly queries Raydium v3 for any active position pool IDs missing from the top-40 list
+ * so a rugged pool whose TVL suddenly dropped below $80K is NEVER hidden from rug-exit detection.
+ */
+async function fetchMissingActivePoolMetrics(
+  activePoolIds: string[],
+  existingPools: PoolMetrics[]
+): Promise<PoolMetrics[]> {
+  const existingSet = new Set(existingPools.map((p) => p.id));
+  const missingIds = Array.from(new Set(activePoolIds)).filter((id) => id && !existingSet.has(id));
+  if (missingIds.length === 0) return existingPools;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch(
+      `https://api-v3.raydium.io/pools/info/ids?ids=${encodeURIComponent(missingIds.join(','))}`,
+      { signal: controller.signal }
+    );
+    clearTimeout(timer);
+    if (!res.ok) return existingPools;
+    const json = await res.json();
+    const rows = Array.isArray(json?.data) ? json.data.filter(Boolean) : [];
+    if (rows.length === 0) return existingPools;
+    const extras = rows.map((p: any) => mapRaydiumRowToPoolMetrics(p));
+    return [...existingPools, ...extras];
+  } catch {
+    return existingPools;
+  }
+}
+
 app.get('/api/helius/health', async (_req, res) => {
   try {
     const { result: slot, latency } = await callHeliusRpc('getSlot', []);
@@ -984,7 +1100,7 @@ app.get('/api/status', async (_req, res) => {
   if (selectionRounds.length === 0) {
     try {
       const { pools } = await fetchRealPools();
-      const ranked = rankPools(pools, strategyConfig);
+      const ranked = rankPools(pools, strategyConfig, getActiveRuggedPoolBlacklist());
       recordSelectionRound(ranked, backendStatus.lastJupiterImpactBps, 142);
     } catch {
       // fallback
@@ -1053,7 +1169,7 @@ async function fetchJupiterQuoteMetrics(amountSol: number) {
 
 app.get('/api/pools/scan', async (_req, res) => {
   const { pools, source } = await fetchRealPools();
-  const ranked = rankPools(pools, strategyConfig);
+  const ranked = rankPools(pools, strategyConfig, getActiveRuggedPoolBlacklist());
   recordSelectionRound(ranked, backendStatus.lastJupiterImpactBps, 142);
   if (backendStatus.riskAlerts.length === 0) {
     const initialAlerts = evaluateLiveRiskAlerts({
@@ -1092,7 +1208,7 @@ app.post('/api/risk/scan', async (_req, res) => {
 
     const ranked =
       poolsRes.status === 'fulfilled'
-        ? rankPools(poolsRes.value.pools, strategyConfig)
+        ? rankPools(poolsRes.value.pools, strategyConfig, getActiveRuggedPoolBlacklist())
         : [];
     const jupiterImpactBps =
       jupiterRes.status === 'fulfilled' ? jupiterRes.value.impactBps : null;
@@ -1708,7 +1824,8 @@ async function closeClmmPositionByNft(nftMintFilter?: string): Promise<{
 
 async function executeSafeWithdrawAndConvertToUsdc(
   targets: Array<{ nftMint: string; poolId: string; poolName: string }>,
-  reasonLabel: string
+  reasonLabel: string,
+  options: { emergencyRug?: boolean } = {}
 ): Promise<{
   closedTxIds: string[];
   swapTxIds: string[];
@@ -1720,6 +1837,7 @@ async function executeSafeWithdrawAndConvertToUsdc(
   if (!BACKEND_KEYPAIR) {
     throw new Error('后台 .env 未配置有效 PRIVATE_KEY');
   }
+  const emergencyRug = Boolean(options.emergencyRug);
   const ownerPk = BACKEND_KEYPAIR.publicKey;
   const balBefore = await getWalletBalances(ownerPk);
   const usdcBefore = Number(balBefore.usdcBalance.toFixed(4));
@@ -1755,12 +1873,46 @@ async function executeSafeWithdrawAndConvertToUsdc(
   }
 
   for (const target of targets) {
-    pushLog('warning', `[一键安全回撤] ${reasonLabel}，正在撤出【${target.poolName}】流动资金并关闭仓位退租...`);
+    pushLog(
+      'warning',
+      `[${emergencyRug ? '防撤池紧急撤出' : '一键安全回撤'}] ${reasonLabel}，正在撤出【${target.poolName}】流动资金并关闭仓位退租...`
+    );
     const closed = await closeClmmPositionByNft(target.nftMint);
     closedTxIds.push(closed.txId);
+    if (emergencyRug) {
+      blacklistRuggedPool(target.poolId, reasonLabel);
+      pushLog('warning', `[防撤池拉黑保护] 已将【${target.poolName}】加入 2 小时冷却黑名单，防止刚撤出又自动重买`);
+    }
     pushLog('info', `[安全回撤 · 已撤池退租] ${target.poolName} · TX: ${closed.txId}`);
     await sleep(1600);
   }
+
+  const exitSlippageBps = emergencyRug
+    ? Math.max(strategyConfig.slippageBps, 450)
+    : Math.max(strategyConfig.slippageBps, 120);
+
+  const swapWithEmergencyRetry = async (inputMint: string, amountAtomic: string | number | bigint) => {
+    try {
+      return await executeJupiterTokenSwap({
+        inputMint,
+        outputMint: USDC_MINT_ADDR,
+        amountAtomic,
+        slippageBps: exitSlippageBps,
+      });
+    } catch (firstErr: any) {
+      const msg = formatChainError(firstErr).toLowerCase();
+      if (emergencyRug && (msg.includes('6001') || msg.includes('slippage') || msg.includes('exceeded'))) {
+        pushLog('warning', `[紧急逃生放宽滑点] 检测到急跌滑点冲突，自动以 8.5% 应急滑点重发卖出保本交易...`);
+        return await executeJupiterTokenSwap({
+          inputMint,
+          outputMint: USDC_MINT_ADDR,
+          amountAtomic,
+          slippageBps: 850,
+        });
+      }
+      throw firstErr;
+    }
+  };
 
   // Convert withdrawn non-USDC assets to USDC while strictly keeping 0.028 SOL for rent/gas
   for (const mintAddr of Array.from(withdrawnNonUsdcMints)) {
@@ -1769,11 +1921,7 @@ async function executeSafeWithdrawAndConvertToUsdc(
         const lamports = await solanaConnection.getBalance(ownerPk, 'confirmed');
         const swappableLamports = Math.max(0, lamports - 28_000_000);
         if (swappableLamports >= 2_500_000) {
-          const swapped = await executeJupiterTokenSwap({
-            inputMint: SOL_MINT_ADDR,
-            outputMint: USDC_MINT_ADDR,
-            amountAtomic: swappableLamports,
-          });
+          const swapped = await swapWithEmergencyRetry(SOL_MINT_ADDR, swappableLamports);
           swapTxIds.push(swapped.txId);
           pushLog(
             'success',
@@ -1784,11 +1932,7 @@ async function executeSafeWithdrawAndConvertToUsdc(
       } else {
         const splBal = await getSplTokenUiBalance(ownerPk, mintAddr);
         if (splBal.atomic > 0n) {
-          const swapped = await executeJupiterTokenSwap({
-            inputMint: mintAddr,
-            outputMint: USDC_MINT_ADDR,
-            amountAtomic: splBal.atomic,
-          });
+          const swapped = await swapWithEmergencyRetry(mintAddr, splBal.atomic);
           swapTxIds.push(swapped.txId);
           pushLog(
             'success',
@@ -2823,6 +2967,11 @@ async function openRealClmmPoolPosition(params: {
   const safeRangePct = Math.max(1, Math.min(25, rangeWidthPct));
   const ownerPk = BACKEND_KEYPAIR.publicKey;
 
+  const blacklistHit = getRugBlacklistEntry(poolId);
+  if (blacklistHit) {
+    throw new Error(`池子处于防撤池隔离期 (${blacklistHit.reason})，禁止重复入场`);
+  }
+
   if (!allowDuplicatePool) {
     const livePositions = await fetchActivePositions(true).catch(() => cachedActivePositions);
     const existingSamePool = livePositions.find(
@@ -2879,6 +3028,49 @@ async function openRealClmmPoolPosition(params: {
 
     if (!isSolA && !isSolB && !isUsdcA && !isUsdcB) {
       throw new Error(`池子 ${symA}/${symB} 不含 SOL 或 USDC 基础资产，暂跳过`);
+    }
+
+    // Anti-honeypot / pre-open Jupiter exit liquidity check for non-bluechip tokens
+    const nonBaseMint = !isSolA && !isUsdcA ? mintA : !isSolB && !isUsdcB ? mintB : null;
+    const nonBaseSym = !isSolA && !isUsdcA ? symA : !isSolB && !isUsdcB ? symB : '';
+    const nonBaseDec = !isSolA && !isUsdcA ? decA : !isSolB && !isUsdcB ? decB : 6;
+    if (nonBaseMint && !isTrustedQuoteOrBluechipSymbol(nonBaseSym)) {
+      const currentPoolPrice = Number(poolInfo.price || 0);
+      let priceXUsd = 1;
+      if (isUsdcB) priceXUsd = currentPoolPrice;
+      else if (isUsdcA) priceXUsd = currentPoolPrice > 0 ? 1 / currentPoolPrice : 1;
+      else if (isSolA) priceXUsd = currentPoolPrice > 0 ? solPriceUsd / currentPoolPrice : 1;
+      else if (isSolB) priceXUsd = currentPoolPrice * solPriceUsd;
+
+      const probeUsd = Math.max(10, Math.min(35, targetUsd * 0.6));
+      const probeAtomic = Math.max(1000, Math.floor((probeUsd / Math.max(priceXUsd, 1e-6)) * 10 ** nonBaseDec));
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5000);
+      try {
+        const exitQuoteRes = await fetch(
+          `https://lite-api.jup.ag/swap/v1/quote?inputMint=${nonBaseMint}&outputMint=${USDC_MINT_ADDR}&amount=${probeAtomic}&slippageBps=200`,
+          { signal: ctrl.signal }
+        );
+        clearTimeout(timer);
+        if (!exitQuoteRes.ok) {
+          blacklistRuggedPool(poolId, `Jupiter 无退出路由 (HTTP ${exitQuoteRes.status})`, 30 * 60 * 1000);
+          throw new Error(`防貔貅/防假深度拦截：【${symA}/${symB}】找不到 Jupiter 卖出退出路由，禁止入场`);
+        }
+        const exitQuote = await exitQuoteRes.json();
+        const exitImpactPct = Math.abs(Number(exitQuote?.priceImpactPct || 0)) * 100;
+        if (!exitQuote?.outAmount || exitImpactPct > 3.5) {
+          blacklistRuggedPool(poolId, `卖出冲击过大 (${exitImpactPct.toFixed(2)}%)`, 30 * 60 * 1000);
+          throw new Error(
+            `防假深度/高滑点拦截：【${symA}/${symB}】退出卖出冲击达 ${exitImpactPct.toFixed(2)}% (>3.5%)，禁止买入防被埋`
+          );
+        }
+      } catch (qErr: any) {
+        clearTimeout(timer);
+        if (String(qErr?.message || '').includes('拦截')) {
+          throw qErr;
+        }
+        // Only reject on genuine non-timeout route failures; transient network abort shouldn't falsely blacklist bluechips
+      }
     }
 
     const balances = await getWalletBalances(ownerPk);
@@ -3222,7 +3414,7 @@ async function runAddLpPipelineTest(mode: PipelineRunMode): Promise<PipelineStep
         fetchRealPools(),
         fetchJupiterQuoteMetrics(0.1).catch(() => null),
       ]);
-      const ranked = rankPools(pools, strategyConfig);
+      const ranked = rankPools(pools, strategyConfig, getActiveRuggedPoolBlacklist());
       const targetPool = ranked.find((p) => p.eligibleFor200U) || ranked[0];
       if (!targetPool) {
         return {
@@ -3854,7 +4046,7 @@ async function executeFullPortfolioDeployment(forceConsolidateDust = true): Prom
   if (solQuote) {
     latestSolPriceUsd = Number((solQuote.outAmountUsdc * 10).toFixed(2));
   }
-  const ranked = rankPools(poolsRes.pools, strategyConfig);
+  const ranked = rankPools(poolsRes.pools, strategyConfig, getActiveRuggedPoolBlacklist());
 
   let portfolioPlan = calculateAutoPortfolioPlan({
     solBalance: balances.solBalance,
@@ -4096,7 +4288,11 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
       latestSolPriceUsd = Number((solQuote.outAmountUsdc * 10).toFixed(2));
     }
 
-    const ranked = rankPools(poolsRes.pools, strategyConfig);
+    const poolsWithActive = await fetchMissingActivePoolMetrics(
+      activePositionsInitial.map((p) => p.poolId),
+      poolsRes.pools
+    );
+    const ranked = rankPools(poolsWithActive, strategyConfig, getActiveRuggedPoolBlacklist());
     recordSelectionRound(ranked, jupiterImpactBps, latestSolPriceUsd);
 
     const eligiblePools = ranked.filter((p) => p.eligibleFor200U);
@@ -4141,6 +4337,8 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
       const isDepletingNow =
         (matched && matched.tvl > 0 && tvlDropPct >= 25) ||
         (matched && matched.tvl > 0 && matched.tvl < Math.min(strategyConfig.minTVL * 0.5, 250_000)) ||
+        (matched && matched.tvl > 0 && matched.tvl < 50_000) ||
+        (!matched && baseTvl > 0) ||
         (pos.inRange === false && Boolean(matched) && matched!.tvl > 0 && volTvl < 0.05);
       poolDepletionStreakMap.set(
         pos.poolId,
@@ -4205,16 +4403,20 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
     let conclusion = '';
     let actionTaken = 'IDLE';
 
-    // Priority 0: Persistent liquidity depletion or Impermanent Loss exceeding threshold -> Safe Withdraw to USDC
+    // Priority 0: Persistent/flash liquidity depletion or Impermanent Loss exceeding threshold -> Safe Withdraw to USDC
     if (safeWithdrawPlan.shouldAutoWithdraw) {
       const riskyTargets = safeWithdrawPlan.positionsAtRisk.filter(
         (p) => p.shouldWithdraw && p.nftMint
       );
+      const isEmergencyRug =
+        safeWithdrawPlan.triggerType === 'LIQUIDITY_DEPLETION' ||
+        riskyTargets.some((r) => r.tvlDropPct >= 35 || (r.poolTvlUsd > 0 && r.poolTvlUsd < 50_000));
+      const minRetryMs = isEmergencyRug ? 20_000 : 60_000;
       if (isDryRun) {
         actionTaken = 'DRY_RUN_SAFE_WITHDRAW';
         conclusion = `[演练安全回撤] ${safeWithdrawPlan.headline}（DRY_RUN=true 已拦截实盘撤池转 USDC）。`;
         pushLog('warning', conclusion);
-      } else if (hasKey && riskyTargets.length > 0 && Date.now() - lastAutoSafeWithdrawAt >= 60_000) {
+      } else if (hasKey && riskyTargets.length > 0 && Date.now() - lastAutoSafeWithdrawAt >= minRetryMs) {
         lastAutoSafeWithdrawAt = Date.now();
         actionTaken = 'LIVE_SAFE_WITHDRAWN';
         try {
@@ -4224,7 +4426,8 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
               poolId: r.poolId,
               poolName: r.poolName,
             })),
-            safeWithdrawPlan.headline
+            safeWithdrawPlan.headline,
+            { emergencyRug: true }
           );
           activePositions = await fetchActivePositions(true);
           const balAfter = await getWalletBalances(BACKEND_KEYPAIR!.publicKey);
@@ -4243,14 +4446,14 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
             depletionStreaks: depletionStreaksObj,
             config: strategyConfig,
           });
-          conclusion = `自动安全回撤完成：已撤出 ${withdrawRes.closedCount} 个异常仓位并兑换存入 USDC（当前钱包 ${withdrawRes.usdcAfter.toFixed(2)} USDC）。`;
+          conclusion = `防撤池自动回撤完成：已撤出 ${withdrawRes.closedCount} 个异常仓位并兑换存入 USDC（当前钱包 ${withdrawRes.usdcAfter.toFixed(2)} USDC）。`;
         } catch (swErr: any) {
           pushLog('error', `[自动安全回撤失败] ${formatChainError(swErr)}`);
         }
       }
     }
 
-    // Stop-loss monitoring across remaining active positions
+    // Stop-loss monitoring across remaining active positions -> withdraw AND dump back to USDC
     if (actionTaken === 'IDLE') {
       for (const pos of activePositions) {
         if (pos.unrealizedPnlPct <= -Math.abs(strategyConfig.stopLossPercentage)) {
@@ -4258,11 +4461,15 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
             actionTaken = 'DRY_RUN_STOP_LOSS';
             conclusion = `[演练止损] 仓位 ${pos.poolName} 浮亏达 ${pos.unrealizedPnlPct}%，触及 -${strategyConfig.stopLossPercentage}% 止损线（DRY_RUN 模式已模拟拦截）。`;
             pushLog('warning', conclusion);
-          } else if (hasKey) {
+          } else if (hasKey && pos.nftMint) {
             actionTaken = 'LIVE_STOP_LOSS';
-            pushLog('warning', `[实盘止损] 仓位 ${pos.poolName} 触发 -${strategyConfig.stopLossPercentage}% 止损线，正在自动执行撤池关仓退租...`);
-            await closeClmmPositionByNft(pos.nftMint).catch((e) =>
-              pushLog('error', `[实盘止损撤池失败] ${formatChainError(e)}`)
+            pushLog('warning', `[实盘止损转 USDC] 仓位 ${pos.poolName} 触发 -${strategyConfig.stopLossPercentage}% 止损线，正在自动撤池退租并全部兑换回 USDC...`);
+            await executeSafeWithdrawAndConvertToUsdc(
+              [{ nftMint: pos.nftMint, poolId: pos.poolId, poolName: pos.poolName }],
+              `实盘止损 (${pos.unrealizedPnlPct}%)`,
+              { emergencyRug: true }
+            ).catch((e) =>
+              pushLog('error', `[实盘止损撤池转USDC失败] ${formatChainError(e)}`)
             );
             activePositions = await fetchActivePositions(true);
           }
@@ -4636,7 +4843,8 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
         });
 
         const rebalanceCooldownOk =
-          rebalancePlan.triggerType === 'DEPTH_DROP_REDUCE'
+          rebalancePlan.triggerType === 'DEPTH_DROP_REDUCE' ||
+          rebalancePlan.triggerType === 'OUT_OF_RANGE_RECENTER'
             ? nowMs - lastAutoRebalanceAt >= 300_000
             : nowMs - lastAutoRebalanceAt >= 900_000 && nowMs - lastAutoOpenOrRotateAt >= 900_000;
 
@@ -4672,6 +4880,7 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
               const existingBoostTarget = activePositions.find(
                 (p) => p.poolId === targetBoost.poolId && p.inRange && p.nftMint && p.injectedValueUsd >= 1.5
               );
+              const isOutOfRangeMove = rebalancePlan.triggerType === 'OUT_OF_RANGE_RECENTER';
               if (existingBoostTarget && boostBudget >= 3) {
                 const topped = await increaseExistingClmmPosition({
                   nftMint: existingBoostTarget.nftMint,
@@ -4681,10 +4890,12 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
                 });
                 pushLog(
                   'success',
-                  `[自动资产重平衡完成] 已将异常池资金原仓合并至【${topped.poolName}】(${topped.injectedSummary}) · TX: ${topped.txId}`
+                  `[自动资产重平衡完成] 已将资金原仓合并至【${topped.poolName}】(${topped.injectedSummary}) · TX: ${topped.txId}`
                 );
                 actionTaken = 'LIVE_REBALANCED';
-                conclusion = `自动重平衡完成：${trim.poolName} 深度异常，已自动并仓增配至 ${topped.poolName}。`;
+                conclusion = isOutOfRangeMove
+                  ? `越界停费校准完成：${trim.poolName} 已并仓增配至 ${topped.poolName} 继续赚费。`
+                  : `自动重平衡完成：${trim.poolName} 深度异常，已自动并仓增配至 ${topped.poolName}。`;
               } else if (balAfterClose.solBalance >= 0.026 && boostBudget >= 3) {
                 const opened = await openRealClmmPoolPosition({
                   poolId: targetBoost.poolId,
@@ -4694,10 +4905,12 @@ async function runAutoStrategyTick(options: { allowRapid?: boolean } = {}): Prom
                 });
                 pushLog(
                   'success',
-                  `[自动资产重平衡完成] 已将异常池资金全额移仓至【${opened.poolName}】(${opened.injectedSummary}) · TX: ${opened.txId}`
+                  `[自动资产重平衡完成] 已将资金全额移仓至【${opened.poolName}】(${opened.injectedSummary}) · TX: ${opened.txId}`
                 );
                 actionTaken = 'LIVE_REBALANCED';
-                conclusion = `自动重平衡完成：${trim.poolName} 深度异常，已自动移仓至 ${opened.poolName}。`;
+                conclusion = isOutOfRangeMove
+                  ? `越界停费重锚完成：已自动收紧重开追高至 ${opened.poolName}。`
+                  : `自动重平衡完成：${trim.poolName} 深度异常，已自动移仓至 ${opened.poolName}。`;
               }
             } else {
               const boostBudget = Math.min(targetBoost.boostUsd, availAfterUsd * 0.65);
@@ -5350,7 +5563,11 @@ app.post('/api/strategy/safe-withdraw', async (req, res) => {
       fetchActivePositions(true),
       fetchRealPools(),
     ]);
-    const ranked = rankPools(poolsRes.pools, strategyConfig);
+    const poolsWithActive = await fetchMissingActivePoolMetrics(
+      positions.map((p) => p.poolId),
+      poolsRes.pools
+    );
+    const ranked = rankPools(poolsWithActive, strategyConfig, getActiveRuggedPoolBlacklist());
     const baselinePoolTvlsObj = Object.fromEntries(poolTvlBaselineMap.entries());
     const depletionStreaksObj = Object.fromEntries(poolDepletionStreakMap.entries());
     const safeWithdrawPlan = evaluateSafeWithdrawSafety({
@@ -5473,7 +5690,7 @@ app.post('/api/strategy/auto-yield-switch', async (_req, res) => {
       latestSolPriceUsd = Number((solQuote.outAmountUsdc * 10).toFixed(2));
     }
 
-    const ranked = rankPools(poolsRes.pools, strategyConfig);
+    const ranked = rankPools(poolsRes.pools, strategyConfig, getActiveRuggedPoolBlacklist());
     const portfolioPlan = calculateAutoPortfolioPlan({
       solBalance: balances.solBalance,
       usdcBalance: balances.usdcBalance,

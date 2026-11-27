@@ -107,8 +107,8 @@ async function checkExitSlippageGuard() {
 
 async function scanLivePools() {
   const [feeSettled, volSettled] = await Promise.allSettled([
-    fetch('https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=fee24h&sortType=desc&pageSize=25&page=1').then((r) => r.json()),
-    fetch('https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=volume24h&sortType=desc&pageSize=25&page=1').then((r) => r.json()),
+    fetch('https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=fee24h&sortType=desc&pageSize=40&page=1').then((r) => r.json()),
+    fetch('https://api-v3.raydium.io/pools/info/list?poolType=concentrated&poolSortField=volume24h&sortType=desc&pageSize=40&page=1').then((r) => r.json()),
   ]);
   const mergedMap = new Map();
   for (const res of [feeSettled, volSettled]) {
@@ -123,20 +123,60 @@ async function scanLivePools() {
 
   const core = [];
   const alerts = [];
-  const maxSafeApr = RISK_PROFILE === 'turbo-high-yield' ? 420 : 180;
+  const maxSafeApr =
+    RISK_PROFILE === 'turbo-high-yield'
+      ? 2200
+      : RISK_PROFILE === 'active-yield'
+      ? 1600
+      : 220;
+
+  const TRUSTED_QUOTES = new Set([...STABLES, ...BLUECHIPS, ...SOL_LST_FAMILY, 'WBTC', 'CBBTC', 'TBTC', 'ZBTC', 'SOLBTC']);
 
   for (const p of rows) {
     const symA = (p.mintA?.symbol || '').toUpperCase();
     const symB = (p.mintB?.symbol || '').toUpperCase();
     const tvl = Number(p.tvl || 0);
+    const vol24h = Number(p.day?.volume || 0);
+    const vol7d = Number(p.week?.volume || 0);
     const apr = Number(p.day?.apr || 0);
-    if (tvl < 100_000 || apr > 600) continue;
+    const apr7d = Number(p.week?.apr || 0);
+    if (tvl < 80_000 || apr > 2500) continue;
 
     const isLowIl =
       (STABLES.has(symA) && STABLES.has(symB)) ||
       (SOL_LST_FAMILY.has(symA) && SOL_LST_FAMILY.has(symB)) ||
       (STABLES.has(symA) && BLUECHIPS.has(symB)) ||
       (STABLES.has(symB) && BLUECHIPS.has(symA));
+
+    const poolTypes = Array.isArray(p.pooltype) ? p.pooltype : [];
+    const tipsA = String(p.mintA?.extensions?.tips || '');
+    const tipsB = String(p.mintB?.extensions?.tips || '');
+    const isRwaOrVerified =
+      poolTypes.includes('RWA') ||
+      /backpack|backed|xstocks/i.test(tipsA) ||
+      /backpack|backed|xstocks/i.test(tipsB);
+
+    const tagsA = Array.isArray(p.mintA?.tags) ? p.mintA.tags : [];
+    const tagsB = Array.isArray(p.mintB?.tags) ? p.mintB.tags : [];
+    const unverifiedFreeze =
+      (tagsA.includes('hasFreeze') && !TRUSTED_QUOTES.has(symA) && !isRwaOrVerified) ||
+      (tagsB.includes('hasFreeze') && !TRUSTED_QUOTES.has(symB) && !isRwaOrVerified);
+
+    if (unverifiedFreeze) {
+      alerts.push(`防撤池拦截 (Freeze 权限): ${symA}/${symB} 含未验证冻结权限，已硬性拒绝`);
+      continue;
+    }
+
+    if (!isLowIl && !isRwaOrVerified && tvl < 500_000) {
+      if ((vol7d > 0 && vol24h > 0 && vol7d < vol24h * 2.1) || apr7d <= 0) {
+        alerts.push(`防撤池拦截 (Meme 单日新币): ${symA}/${symB} 缺乏 7 日持续流动性，已拦截`);
+        continue;
+      }
+      if (apr > apr7d * 6 && tvl < 200_000) {
+        alerts.push(`防撤池拦截 (刷量诱多): ${symA}/${symB} 24h 年化异常暴冲 >7日 6x，已拦截`);
+        continue;
+      }
+    }
 
     if (!isLowIl && apr > maxSafeApr) {
       alerts.push(`Token 波动异常预警: ${symA}/${symB} 年化 +${apr.toFixed(1)}%，已拦截`);

@@ -41,10 +41,10 @@ test('buildPresetForCapital allocates 200U with 15U gas reserve and 185U active 
   assert.equal(safePreset.rangeWidthPct, 20);
 
   const activePreset = buildPresetForCapital(200, 'active-yield');
-  assert.equal(activePreset.coreSplitPct, 70);
-  assert.equal(activePreset.rangeWidthPct, 6);
+  assert.equal(activePreset.coreSplitPct, 50);
+  assert.equal(activePreset.rangeWidthPct, 4);
   assert.equal(activePreset.autoCompound, true);
-  assert.equal(activePreset.minTVL, 500_000);
+  assert.equal(activePreset.minTVL, 100_000);
 });
 
 test('rankPools rejects high-IL volatile pools for 200U steady strategy', () => {
@@ -344,9 +344,10 @@ test('calculatePositionMetrics accurately prices Token/USDC non-SOL pairs', () =
 
 test('turbo-high-yield unlocks high-APR pools and calculateAutoPortfolioPlan detects $0.20 dust vs idle wallet equity', () => {
   const turboCfg = buildPresetForCapital(200, 'turbo-high-yield');
-  assert.equal(turboCfg.rangeWidthPct, 4);
-  assert.equal(turboCfg.minTVL, 300_000);
-  assert.equal(turboCfg.harvestMinUsd, 0.5);
+  assert.equal(turboCfg.rangeWidthPct, 3);
+  assert.equal(turboCfg.minTVL, 80_000);
+  assert.equal(turboCfg.harvestMinUsd, 0.35);
+  assert.equal(turboCfg.stopLossPercentage, 18);
 
   const pools: PoolMetrics[] = [
     {
@@ -414,10 +415,10 @@ test('turbo-high-yield unlocks high-APR pools and calculateAutoPortfolioPlan det
   assert.ok(plan.idleDeployableUsd > 25);
   assert.ok(plan.utilizationPct < 2);
   assert.equal(plan.slotPlans.length, 2);
-  assert.equal(plan.slotPlans[0].poolName, 'WSOL / USDC');
-  assert.equal(plan.slotPlans[1].poolName, 'SPCX / USDC');
-  assert.ok(plan.slotPlans[0].targetUsd > 10);
-  assert.ok(plan.slotPlans[1].targetUsd > 10);
+  assert.equal(plan.slotPlans[0].poolName, 'SPCX / USDC');
+  assert.equal(plan.slotPlans[1].poolName, 'WSOL / USDC');
+  assert.ok(plan.slotPlans[0].targetUsd > 14);
+  assert.ok(plan.slotPlans[1].targetUsd > 7);
 });
 
 test('evaluateAutonomousHighYieldSwitch opens new pool when idle funds exist, rotates when dry and +APR>=20%, and holds when optimal', () => {
@@ -1211,14 +1212,15 @@ test('turbo-high-yield skips below-minAPR core pool and small portfolios avoid g
 });
 
 test('yield optimizations: correlated narrow range, 7d APR stability, <$60 2-slot cap + dust cleanup at low SOL, and rent-free top-up', () => {
-  const turboCfg = buildPresetForCapital(200, 'turbo-high-yield'); // rangeWidthPct = 4
-  const activeCfg = buildPresetForCapital(200, 'active-yield'); // rangeWidthPct = 6
+  const turboCfg = buildPresetForCapital(200, 'turbo-high-yield'); // rangeWidthPct = 3
+  const activeCfg = buildPresetForCapital(200, 'active-yield'); // rangeWidthPct = 4
 
   // 1. Correlated LST & stable pairs get ultra-narrow optimal ranges while volatile pairs keep config rangeWidthPct
   assert.equal(getOptimalRangeWidthForPool('WSOL / hSOL', activeCfg), 2);
   assert.equal(getOptimalRangeWidthForPool('WSOL / JitoSOL', turboCfg), 2);
   assert.equal(getOptimalRangeWidthForPool('USDC / USDT', activeCfg), 1);
-  assert.equal(getOptimalRangeWidthForPool('SPCX / USDC', activeCfg), 6);
+  assert.equal(getOptimalRangeWidthForPool('SPCX / USDC', activeCfg), 4);
+  assert.equal(getOptimalRangeWidthForPool('SPCX / USDC', turboCfg), 3);
 
   // 2. 7d sustained APR beats flash-spike 1-day APR with weak 7d follow-through
   const rankedSustained = rankPools(
@@ -1382,4 +1384,259 @@ test('calculateAutoPortfolioPlan flags duplicate smaller same-pool NFTs and dust
   assert.equal(dupPlan.hasDustPositionToConsolidate, true);
   assert.equal(dupPlan.dustPositionUsd, 3.2);
 });
+
+test('max-profit mode unlocks $80K+ 1000%+ APR pools, rotates aggressively, and recenters out-of-range positions', () => {
+  const turboCfg = buildPresetForCapital(200, 'turbo-high-yield');
+  const activeCfg = buildPresetForCapital(200, 'active-yield');
+
+  const pools: PoolMetrics[] = [
+    {
+      id: 'vvv-usdc',
+      name: 'VVV / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'vvv-usdc',
+      feeTier: '1.00%',
+      priceUsd: '$4.20',
+      tvl: 122_201,
+      volume24h: 462_900,
+      fee24hUsd: 4629,
+      apr: 1382.5,
+      apr7d: 763,
+      safetyScore: 64,
+      ilRisk: '中',
+      isBluechip: false,
+    },
+    {
+      id: 'spcx-usdc',
+      name: 'SPCX / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'spcx-usdc',
+      feeTier: '0.25%',
+      priceUsd: '$133.00',
+      tvl: 2_370_924,
+      volume24h: 3_705_200,
+      fee24hUsd: 9263,
+      apr: 142.6,
+      apr7d: 78.5,
+      safetyScore: 92,
+      ilRisk: '中',
+      isBluechip: false,
+    },
+    {
+      id: 'wsol-hsol',
+      name: 'WSOL / hSOL',
+      dex: 'RAYDIUM CLMM',
+      address: 'wsol-hsol',
+      feeTier: '1.00%',
+      priceUsd: '$0.84',
+      tvl: 2_271_684,
+      volume24h: 1_031_700,
+      fee24hUsd: 10317,
+      apr: 165.8,
+      apr7d: 134.2,
+      safetyScore: 94,
+      ilRisk: '低',
+      isBluechip: true,
+    },
+  ];
+
+  // Both turbo-high-yield and active-yield unlock VVV/USDC ($122K TVL, 1382.5% APR) and rank it #1
+  const turboRanked = rankPools(pools, turboCfg);
+  const activeRanked = rankPools(pools, activeCfg);
+  assert.equal(turboRanked[0].id, 'vvv-usdc');
+  assert.equal(turboRanked[0].eligibleFor200U, true);
+  assert.equal(activeRanked[0].id, 'vvv-usdc');
+  assert.equal(activeRanked[0].eligibleFor200U, true);
+
+  // ROTATE_SWAP triggers from 142.6% SPCX/USDC into 1382.5% VVV/USDC when dry
+  const rot = evaluateAutonomousHighYieldSwitch({
+    rankedPools: turboRanked,
+    activePositions: [
+      { poolId: 'wsol-hsol', poolName: 'WSOL / hSOL', nftMint: 'n1', injectedValueUsd: 14, inRange: true },
+      { poolId: 'spcx-usdc', poolName: 'SPCX / USDC', nftMint: 'n2', injectedValueUsd: 11, inRange: true },
+    ],
+    idleDeployableUsd: 2.0,
+    usdcBalance: 2.0,
+    config: turboCfg,
+  });
+  assert.equal(rot.decision, 'ROTATE_SWAP');
+  assert.equal(rot.shouldAct, true);
+  assert.equal(rot.targetPool?.poolId, 'vvv-usdc');
+  assert.equal(rot.sourcePositionToReplace?.poolId, 'spcx-usdc');
+
+  // Out-of-range position triggers OUT_OF_RANGE_RECENTER so capital never sits at $0/day
+  const recenter = evaluateAutoAssetRebalance({
+    activePositions: [
+      { poolId: 'wsol-hsol', poolName: 'WSOL / hSOL', nftMint: 'n1', injectedValueUsd: 14, inRange: true },
+      { poolId: 'spcx-usdc', poolName: 'SPCX / USDC', nftMint: 'n2', injectedValueUsd: 11, inRange: false },
+    ],
+    rankedPools: turboRanked,
+    baselinePoolTvls: { 'wsol-hsol': 2_271_684, 'spcx-usdc': 2_370_924 },
+    config: turboCfg,
+  });
+  assert.equal(recenter.shouldRebalance, true);
+  assert.equal(recenter.triggerType, 'OUT_OF_RANGE_RECENTER');
+  assert.equal(recenter.sourcePositionToTrim?.poolId, 'spcx-usdc');
+  assert.equal(recenter.targetPoolToBoost?.poolId, 'vvv-usdc');
+});
+
+test('meme-coin anti-rug defense: rejects freeze/1-day rugs, preserves RWA & sustained pools, caps <$300K exposure, and triggers 1-tick flash-rug & blacklist', () => {
+  const turboCfg = buildPresetForCapital(200, 'turbo-high-yield');
+
+  const pools: PoolMetrics[] = [
+    {
+      id: 'rug-freeze-meme',
+      name: 'SCAM / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'rug-freeze-meme',
+      feeTier: '1.00%',
+      priceUsd: '0.01',
+      tvl: 190_000,
+      volume24h: 950_000,
+      apr: 1900,
+      apr7d: 600,
+      vol7d: 2_800_000,
+      safetyScore: 64,
+      ilRisk: '中',
+      hasUnverifiedFreezeAuthority: true,
+    },
+    {
+      id: 'rug-1day-meme',
+      name: 'ONEDAY / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'rug-1day-meme',
+      feeTier: '1.00%',
+      priceUsd: '0.05',
+      tvl: 145_000,
+      volume24h: 490_000,
+      vol7d: 510_000, // Almost 100% of 7d volume happened today -> 1-day pump & rug trap
+      apr: 1650,
+      apr7d: 90,
+      safetyScore: 64,
+      ilRisk: '中',
+    },
+    {
+      id: 'vvv-sustained',
+      name: 'VVV / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'vvv-sustained',
+      feeTier: '1.00%',
+      priceUsd: '4.20',
+      tvl: 122_201,
+      volume24h: 443_000,
+      vol7d: 2_920_000, // ~6.6x sustained 7d volume
+      apr: 1357.8,
+      apr7d: 762.6,
+      apr30d: 448.2,
+      burnPercent: 0,
+      safetyScore: 64,
+      ilRisk: '中',
+      isMemeRiskPool: true,
+    },
+    {
+      id: 'spcx-rwa',
+      name: 'SPCX / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'spcx-rwa',
+      feeTier: '0.25%',
+      priceUsd: '133.0',
+      tvl: 2_370_924,
+      volume24h: 3_705_200,
+      vol7d: 22_000_000,
+      apr: 142.6,
+      apr7d: 78.5,
+      safetyScore: 92,
+      ilRisk: '中',
+      isRwaOrVerified: true, // Verified RWA equity (USDC/RWA compliance freeze is NOT meme rug freeze)
+    },
+  ];
+
+  // 1. Freeze trap & 1-day meme pump are blocked; VVV/USDC & SPCX/USDC pass
+  const ranked = rankPools(pools, turboCfg);
+  const freezeRes = ranked.find((p) => p.id === 'rug-freeze-meme');
+  const oneDayRes = ranked.find((p) => p.id === 'rug-1day-meme');
+  const vvvRes = ranked.find((p) => p.id === 'vvv-sustained');
+  const spcxRes = ranked.find((p) => p.id === 'spcx-rwa');
+
+  assert.equal(freezeRes?.eligibleFor200U, false);
+  assert.equal(freezeRes?.alphaScore, 0);
+  assert.equal(oneDayRes?.eligibleFor200U, false);
+  assert.equal(oneDayRes?.alphaScore, 0);
+  assert.equal(vvvRes?.eligibleFor200U, true);
+  assert.equal(spcxRes?.eligibleFor200U, true);
+
+  // 2. Exposure cap: <$300K shallow volatile VVV/USDC is capped <= 38% in 2-slot plan, pairing with deep SPCX/USDC anchor
+  const plan = calculateAutoPortfolioPlan({
+    solBalance: 0.5,
+    usdcBalance: 160,
+    solPriceUsd: 80,
+    activePositions: [],
+    rankedPools: ranked,
+    config: turboCfg,
+  });
+  const vvvSlot = plan.slotPlans.find((s) => s.poolId === 'vvv-sustained');
+  const spcxSlot = plan.slotPlans.find((s) => s.poolId === 'spcx-rwa');
+  assert.ok(vvvSlot && spcxSlot);
+  const totalPlanned = plan.slotPlans.reduce((s, x) => s + x.targetUsd, 0);
+  assert.ok(vvvSlot.targetUsd / totalPlanned <= 0.39);
+  assert.ok(spcxSlot.targetUsd > vvvSlot.targetUsd);
+
+  // 3a. Instant 1-tick flash-rug withdraw when TVL drops >= 35% in a single tick (streak = 1)
+  const flashRugPools = rankPools(
+    pools.map((p) => (p.id === 'vvv-sustained' ? { ...p, tvl: 70_000 } : p)),
+    turboCfg
+  );
+  const flashWithdraw = evaluateSafeWithdrawSafety({
+    activePositions: [
+      {
+        poolId: 'vvv-sustained',
+        poolName: 'VVV / USDC',
+        nftMint: 'nft-vvv',
+        injectedValueUsd: 40,
+        priceCurrentUsd: 4.1,
+        priceLowerUsd: 4.0,
+        priceUpperUsd: 4.4,
+        unrealizedPnlPct: 0.2,
+        inRange: true,
+      },
+    ],
+    rankedPools: flashRugPools,
+    baselinePoolTvls: { 'vvv-sustained': 122_201 },
+    depletionStreaks: { 'vvv-sustained': 1 }, // Only 1 tick!
+    config: turboCfg,
+  });
+  assert.equal(flashWithdraw.shouldAutoWithdraw, true);
+  assert.equal(flashWithdraw.triggerType, 'LIQUIDITY_DEPLETION');
+
+  // 3b. Price crash >8% below CLMM lower bound on volatile token triggers IL_THRESHOLD_EXCEEDED even if unrealizedPnlPct >= 0
+  const crashWithdraw = evaluateSafeWithdrawSafety({
+    activePositions: [
+      {
+        poolId: 'vvv-sustained',
+        poolName: 'VVV / USDC',
+        nftMint: 'nft-vvv',
+        injectedValueUsd: 40,
+        priceCurrentUsd: 3.1, // -22.5% below $4.0 lower bound!
+        priceLowerUsd: 4.0,
+        priceUpperUsd: 4.4,
+        unrealizedPnlPct: 0.1,
+        inRange: false,
+      },
+    ],
+    rankedPools: ranked,
+    baselinePoolTvls: { 'vvv-sustained': 122_201 },
+    depletionStreaks: { 'vvv-sustained': 0 },
+    config: turboCfg,
+  });
+  assert.equal(crashWithdraw.shouldAutoWithdraw, true);
+  assert.equal(crashWithdraw.triggerType, 'IL_THRESHOLD_EXCEEDED');
+
+  // 4. Post-rug blacklist blocks re-entry into 'vvv-sustained'
+  const blacklistedRanked = rankPools(pools, turboCfg, new Set(['vvv-sustained']));
+  const blacklistedVvv = blacklistedRanked.find((p) => p.id === 'vvv-sustained');
+  assert.equal(blacklistedVvv?.eligibleFor200U, false);
+  assert.equal(blacklistedVvv?.antiRugStatus, 'blocked');
+});
+
+
 
