@@ -22,6 +22,7 @@ import {
   formatChainError,
   getMaxPoolExposureShare,
   getOptimalRangeWidthForPool,
+  isLowIlAnchorPool,
   isValidSolanaAddress,
   maskSolanaAddress,
   rankPools,
@@ -42,8 +43,9 @@ test('buildPresetForCapital allocates 200U with 15U gas reserve and 185U active 
   assert.equal(safePreset.rangeWidthPct, 20);
 
   const activePreset = buildPresetForCapital(200, 'active-yield');
-  assert.equal(activePreset.coreSplitPct, 50);
-  assert.equal(activePreset.rangeWidthPct, 4);
+  assert.equal(activePreset.coreSplitPct, 75);
+  assert.equal(activePreset.rangeWidthPct, 3);
+  assert.equal(activePreset.stopLossPercentage, 5);
   assert.equal(activePreset.autoCompound, true);
   assert.equal(activePreset.minTVL, 100_000);
 });
@@ -1220,7 +1222,7 @@ test('yield optimizations: correlated narrow range, 7d APR stability, <$60 2-slo
   assert.equal(getOptimalRangeWidthForPool('WSOL / hSOL', activeCfg), 2);
   assert.equal(getOptimalRangeWidthForPool('WSOL / JitoSOL', turboCfg), 2);
   assert.equal(getOptimalRangeWidthForPool('USDC / USDT', activeCfg), 1);
-  assert.equal(getOptimalRangeWidthForPool('SPCX / USDC', activeCfg), 4);
+  assert.equal(getOptimalRangeWidthForPool('SPCX / USDC', activeCfg), 3);
   assert.equal(getOptimalRangeWidthForPool('SPCX / USDC', turboCfg), 3);
 
   // 2. 7d sustained APR beats flash-spike 1-day APR with weak 7d follow-through
@@ -2088,5 +2090,130 @@ test('evaluateLiveRiskAlerts aligns with turbo-high-yield eligibility and avoids
   assert.ok(
     alerts.some((a) => a.target === 'SCAM / SOL' && a.severity === 'critical')
   );
+});
+
+test('barbell core-satellite architecture: guarantees anchor for slot 1, caps volatile satellites at <=25%, and blocks anchor rotation into meme coins', () => {
+  const barbellCfg = buildPresetForCapital(500, 'active-yield');
+  assert.equal(barbellCfg.coreSplitPct, 75);
+  assert.equal(barbellCfg.stopLossPercentage, 5);
+
+  const pools: PoolMetrics[] = [
+    {
+      id: 'wsol-hsol-anchor',
+      name: 'WSOL / hSOL',
+      dex: 'RAYDIUM CLMM',
+      address: 'wsol-hsol-anchor',
+      tvl: 2_300_000,
+      volume24h: 3_200_000,
+      vol7d: 22_000_000,
+      apr: 118,
+      apr7d: 110,
+      feeTier: '0.01%',
+      priceUsd: '72',
+      safetyScore: 98,
+      ilRisk: '低',
+      isBluechip: true,
+    },
+    {
+      id: 'vvv-satellite',
+      name: 'VVV / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'vvv-satellite',
+      tvl: 125_000,
+      volume24h: 400_000,
+      vol7d: 2_900_000,
+      apr: 980,
+      apr7d: 760,
+      feeTier: '0.25%',
+      priceUsd: '25.5',
+      safetyScore: 86,
+      ilRisk: '中',
+    },
+    {
+      id: 'nflx-satellite',
+      name: 'NFLX / USDC',
+      dex: 'RAYDIUM CLMM',
+      address: 'nflx-satellite',
+      tvl: 195_000,
+      volume24h: 370_000,
+      vol7d: 2_100_000,
+      apr: 460,
+      apr7d: 310,
+      feeTier: '0.25%',
+      priceUsd: '60',
+      safetyScore: 90,
+      ilRisk: '中',
+      isRwaOrVerified: true,
+    },
+  ];
+
+  // 1. Verify anchor identification
+  assert.equal(isLowIlAnchorPool(pools[0]), true);
+  assert.equal(isLowIlAnchorPool(pools[1]), false);
+
+  const ranked = rankPools(pools, barbellCfg);
+
+  // 2. Portfolio plan assigns WSOL/hSOL as Core Pool with 70%~75% share, NOT high-APR VVV
+  const plan = calculateAutoPortfolioPlan({
+    solBalance: 1.5,
+    usdcBalance: 300,
+    solPriceUsd: 72,
+    activePositions: [],
+    rankedPools: ranked,
+    config: barbellCfg,
+  });
+
+  assert.equal(plan.slotPlans.length, 3);
+  const slot1 = plan.slotPlans[0];
+  assert.equal(slot1.poolName, 'WSOL / hSOL');
+  assert.equal(slot1.role, 'core');
+  assert.equal(slot1.rangeWidthPct, 2); // Ultra-narrow ±2% range for LST
+  // Core slot gets ~70% of budget
+  assert.ok(slot1.targetUsd >= plan.slotPlans.reduce((s, p) => s + p.targetUsd, 0) * 0.68);
+
+  // Satellites get ~15% each
+  const slot2 = plan.slotPlans[1];
+  const slot3 = plan.slotPlans[2];
+  assert.ok(slot2.targetUsd < plan.slotPlans.reduce((s, p) => s + p.targetUsd, 0) * 0.20);
+  assert.ok(slot3.targetUsd < plan.slotPlans.reduce((s, p) => s + p.targetUsd, 0) * 0.20);
+
+  // 3. evaluateAutonomousHighYieldSwitch blocks rotating out of WSOL/hSOL anchor into WSOL/ANT
+  const antPool: PoolMetrics = {
+    id: 'ant-high-yield',
+    name: 'WSOL / ANT',
+    dex: 'RAYDIUM CLMM',
+    address: 'ant-high-yield',
+    tvl: 180_000,
+    volume24h: 300_000,
+    vol7d: 1_800_000,
+    apr: 240, // higher than WSOL/hSOL's 118%!
+    apr7d: 180,
+    feeTier: '0.25%',
+    priceUsd: '90',
+    safetyScore: 86,
+    ilRisk: '中',
+  };
+  const rankedWithAnt = rankPools([...pools, antPool], barbellCfg);
+
+  const rotateRec = evaluateAutonomousHighYieldSwitch({
+    rankedPools: rankedWithAnt,
+    activePositions: [
+      {
+        poolId: 'wsol-hsol-anchor',
+        poolName: 'WSOL / hSOL',
+        nftMint: 'nft-hsol',
+        injectedValueUsd: 380,
+        inRange: true,
+      },
+    ],
+    idleDeployableUsd: 1.0,
+    usdcBalance: 0,
+    config: barbellCfg,
+  });
+
+  // Must HOLD_OPTIMAL and refuse to rotate the anchor into ANT!
+  assert.equal(rotateRec.decision, 'HOLD_OPTIMAL');
+  assert.equal(rotateRec.shouldAct, false);
+  assert.ok(rotateRec.headline.includes('压舱池'));
 });
 

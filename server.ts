@@ -1535,7 +1535,7 @@ app.post('/api/strategy/preset', (req, res) => {
     riskProfile === 'ultra-safe'
       ? '极稳保守'
       : riskProfile === 'active-yield'
-      ? '进取增效（±6%窄区间双仓）'
+      ? '两全其美杠铃型（75%零无常压舱 + 25%高息卫星池 · 5%止损）'
       : riskProfile === 'turbo-high-yield'
       ? '极速高收益突击（±4%超窄双仓 · 45%核心+55%高APR卫星池）'
       : '稳健平衡（±10%集中区间）';
@@ -6357,7 +6357,13 @@ app.post('/api/strategy/auto-yield-switch', async (_req, res) => {
 app.post('/api/strategy/preset-optimize', async (req, res) => {
   try {
     const { target } = req.body || {};
-    if (target === 'turbo-high-yield') {
+    if (target === 'barbell-win-win' || target === 'active-yield') {
+      strategyConfig = buildPresetForCapital(strategyConfig.capitalUsdt, 'active-yield');
+      pushLog(
+        'success',
+        '已一键应用【两全其美 · 杠铃式核心-卫星方案】：75% WSOL/hSOL 零无常压舱 + 25% 精选高息卫星池（单池≤18%限仓 + 5%严密止损 + 纯USDC锁利）。'
+      );
+    } else if (target === 'turbo-high-yield') {
       strategyConfig = buildPresetForCapital(strategyConfig.capitalUsdt, 'turbo-high-yield');
       pushLog(
         'success',

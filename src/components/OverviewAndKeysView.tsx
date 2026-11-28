@@ -298,7 +298,9 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
     }
   };
 
-  const handleOptimizePreset = async (target: 'bluechip-optimized' | 'turbo-high-yield' = 'turbo-high-yield') => {
+  const handleOptimizePreset = async (
+    target: 'barbell-win-win' | 'active-yield' | 'bluechip-optimized' | 'turbo-high-yield' = 'barbell-win-win'
+  ) => {
     setOptimizingPreset(true);
     setOptimizeMessage('');
     try {
@@ -316,7 +318,9 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
           onUpdateBackendStatus(data.backendStatus);
         }
         setOptimizeMessage(
-          target === 'turbo-high-yield'
+          target === 'barbell-win-win' || target === 'active-yield'
+            ? '已应用【两全其美 · 杠铃架构】(75% WSOL/hSOL 零无常压舱 + 25% 精选高息卫星池 · -5%严密止损)！'
+            : target === 'turbo-high-yield'
             ? '已升级【极速高收益突击型】(±4%超窄区间 · 45%核心 + 55%全网第一高APR卫星池 · $0.5 极速复利)！'
             : '已一键放宽并适配为【蓝筹稳健参数】(MIN_APR=35% · TVL≥$1.0M · 区间±8%)！'
         );
@@ -679,6 +683,16 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
               >
                 <RefreshCw className={`w-3 h-3 ${triggeringAutoTick ? 'animate-spin text-emerald-400' : ''}`} />
                 <span>立即巡检</span>
+              </button>
+
+              <button
+                type="button"
+                disabled={optimizingPreset}
+                onClick={() => handleOptimizePreset('active-yield')}
+                className="px-3 py-1.5 text-xs font-semibold text-emerald-200 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/50 rounded-md transition-colors cursor-pointer flex items-center gap-1.5 shadow-sm"
+              >
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                <span>两全其美杠铃方案 (75%压舱+25%高息)</span>
               </button>
 
               <button
@@ -1129,7 +1143,7 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
               {strategyConfig.riskProfile === 'ultra-safe'
                 ? '极稳保守型'
                 : strategyConfig.riskProfile === 'active-yield'
-                ? '进取增效型 · 双仓窄区间'
+                ? '两全其美杠铃型 · 75%稳健压舱+25%高息卫星'
                 : strategyConfig.riskProfile === 'turbo-high-yield'
                 ? '极速高收益突击型 · ±4%双仓'
                 : '稳健平衡型'}

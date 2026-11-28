@@ -253,15 +253,15 @@ export function buildPresetForCapital(
       riskProfile: 'active-yield',
       gasReserveUsdt,
       lpActiveUsdt,
-      coreSplitPct: 50, // 50% High-Yield Core + 50% High-Turnover Monster Satellite Pool
+      coreSplitPct: 75, // 75% Low-IL Anchor (WSOL/hSOL LST) + 25% High-APR Satellite Pool
       autoCompound: true,
-      minAPR: 60,
-      minTVL: 100_000, // >= $100K liquidity unlocks ultra-high-APR CLMM pairs (500%~1300%+ APR)
-      rangeWidthPct: 4, // Tight ±4% CLMM range boosts fee capture ~3.45x
+      minAPR: 45,
+      minTVL: 100_000,
+      rangeWidthPct: 3, // Tight ±2%~3% (LST automatically gets ±2% ultra-concentrated range)
       harvestMinUsd: 0.8,
-      stopLossPercentage: 14, // Tolerate -14% drawdown for higher fee upside
-      takeProfitSweepUsd: 15, // Auto-compound up to $15 net profit before sweeping
-      maxILTolerance: 6.5,
+      stopLossPercentage: 5, // Strict -5% stop loss for volatile pools to protect USD capital!
+      takeProfitSweepUsd: 10,
+      maxILTolerance: 3.5, // Strict 3.5% IL tolerance
       jitoTipLamports: 1_000_000,
       slippageBps: 85,
       autoWithdrawSafety: true,
@@ -274,9 +274,9 @@ export function buildPresetForCapital(
       largeCapitalThresholdUsd: 300,
       largeCapitalTargetLtvPct: 30,
       autoSelectorWeights: {
-        aprWeight: 0.6,
-        volumeTvlRatioWeight: 0.28,
-        safetyWeight: 0.12,
+        aprWeight: 0.52,
+        volumeTvlRatioWeight: 0.25,
+        safetyWeight: 0.23,
       },
     };
   }
@@ -1235,6 +1235,27 @@ export function getOptimalRangeWidthForPool(
   return config.rangeWidthPct;
 }
 
+export function isLowIlAnchorPool(
+  pool?: Pick<PoolMetrics, 'name' | 'ilRisk' | 'isBluechip' | 'tvl'> | { poolName?: string; poolId?: string } | null
+): boolean {
+  if (!pool) return false;
+  const name = 'name' in pool ? pool.name : 'poolName' in pool ? pool.poolName : '';
+  const parts = String(name || '')
+    .split('/')
+    .map((s) => s.trim().toUpperCase())
+    .filter(Boolean);
+  if (parts.length >= 2) {
+    const [a, b] = parts;
+    if (STABLE_SYMBOLS.has(a) && STABLE_SYMBOLS.has(b)) return true;
+    if (SOL_LST_FAMILY.has(a) && SOL_LST_FAMILY.has(b)) return true;
+    if (BTC_FAMILY.has(a) && BTC_FAMILY.has(b)) return true;
+  }
+  if ('ilRisk' in pool && 'tvl' in pool) {
+    return pool.ilRisk === '低' && pool.tvl >= 1_000_000;
+  }
+  return false;
+}
+
 export function calculateAutoPortfolioPlan(params: {
   solBalance: number;
   usdcBalance: number;
@@ -1358,9 +1379,18 @@ export function calculateAutoPortfolioPlan(params: {
       ? strictlyEligible
       : eligibleOrFallback;
 
-  // In turbo/active profit-maximizing modes, prioritize highest alphaScore / highest APR directly instead of forcing low-APR bluechips first
+  // Barbell Core-Satellite: When in active-yield (两全其美) or coreSplitPct >= 70, prioritize a zero/low-IL anchor pool for slot #1
+  const preferBarbellAnchor =
+    config.riskProfile === 'active-yield' || config.coreSplitPct >= 70;
+  const anchorCandidate =
+    strictlyEligible.find((p) => isLowIlAnchorPool(p)) ||
+    poolSource.find((p) => isLowIlAnchorPool(p)) ||
+    rankedPools.find((p) => isLowIlAnchorPool(p) && !assessPoolAntiRugRisk(p).blocked);
+
   const corePool =
-    config.riskProfile === 'turbo-high-yield'
+    preferBarbellAnchor && anchorCandidate
+      ? anchorCandidate
+      : config.riskProfile === 'turbo-high-yield'
       ? poolSource[0] || eligibleOrFallback[0]
       : preferPureYieldCore
       ? poolSource[0] ||
@@ -1394,10 +1424,11 @@ export function calculateAutoPortfolioPlan(params: {
   const slotPlans: AutoPortfolioSlotPlan[] = [];
   if (totalBudgetUsd >= 3 && corePool) {
     if (targetSlots >= 3 && satellitePool1 && satellitePool2 && totalBudgetUsd >= 18) {
-      // Anti-rug exposure cap: never concentrate >34% in a single <$300K volatile pool
-      const coreShare = coreIsShallowVolatile ? 0.34 : 0.4;
+      const isBarbellActive = preferBarbellAnchor && anchorCandidate && corePool.id === anchorCandidate.id;
+      // Anti-rug exposure cap: never concentrate >34% in a single <$300K volatile pool; in barbell mode anchor gets 70%
+      const coreShare = isBarbellActive ? 0.70 : coreIsShallowVolatile ? 0.34 : 0.4;
       const sat1Shallow = isPoolShallowVolatile(satellitePool1);
-      const sat1Share = sat1Shallow ? 0.33 : coreIsShallowVolatile ? 0.41 : 0.35;
+      const sat1Share = isBarbellActive ? 0.15 : sat1Shallow ? 0.33 : coreIsShallowVolatile ? 0.41 : 0.35;
       const coreUsd = Number((totalBudgetUsd * coreShare).toFixed(2));
       const sat1Usd = Number((totalBudgetUsd * sat1Share).toFixed(2));
       const sat2Usd = Number((totalBudgetUsd - coreUsd - sat1Usd).toFixed(2));
@@ -1894,6 +1925,26 @@ export function evaluateAutonomousHighYieldSwitch(params: {
       12
     ).toFixed(2)
   );
+  const isWeakestAnchor = isLowIlAnchorPool(weakestActive);
+  const isBestAnchor = bestCandidate ? isLowIlAnchorPool(bestCandidate) : false;
+  // An anchor pool (WSOL/hSOL, WSOL/USDC) must NEVER be rotated into a volatile non-anchor satellite pool
+  if (isWeakestAnchor && !isBestAnchor) {
+    return {
+      decision: 'HOLD_OPTIMAL',
+      shouldAct: false,
+      actionButtonLabel: '核心稳健底仓保护中（禁止换入山寨币）',
+      headline: `【${weakestActive.poolName}】为两全其美架构核心压舱池，锁定底仓防回撤`,
+      reason: `【${weakestActive.poolName}】作为零无常/低波动核心底仓，坚决保留以保护大额本金安全，绝不可被高风险山寨池替换。系统自主决定继续持有压舱！`,
+      targetPool: bestCandidate,
+      sourcePositionToReplace: null,
+      topUpExistingPosition: null,
+      deployBudgetUsd: 0,
+      aprGainPct: 0,
+      estimatedExtraMonthlyUsd: 0,
+      comparisons,
+    };
+  }
+
   const isWeakestInRange = weakestActive.inRange !== false;
   const baseWorthRotating =
     config.riskProfile === 'turbo-high-yield'
