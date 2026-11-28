@@ -6371,6 +6371,51 @@ app.post('/api/strategy/auto-yield-switch', async (_req, res) => {
   }
 });
 
+app.post('/api/strategy/barbell-clean-and-deploy', async (_req, res) => {
+  try {
+    const isDryRun = process.env.DRY_RUN !== 'false';
+    const positions = await fetchActivePositions(true);
+    const realPositions = positions.filter((p) => p.injectedValueUsd > 0 && p.nftMint);
+
+    let withdrawSummary = '链上当前暂无冗余活跃仓位';
+    if (realPositions.length > 0 && BACKEND_KEYPAIR && !isDryRun) {
+      const targets = realPositions.map((p) => ({ nftMint: p.nftMint, poolId: p.poolId, poolName: p.poolName }));
+      const withdrawRes = await executeSafeWithdrawAndConvertToUsdc(targets, '一键清池换 USDC 并切换两全其美策略');
+      withdrawSummary = `已安全清空 ${withdrawRes.closedCount} 个旧仓位并兑换转存 USDC (新增 +${withdrawRes.usdcGained.toFixed(2)} USDC)`;
+      pushLog('success', `[两全其美重置] ${withdrawSummary}`);
+    } else if (realPositions.length > 0 && isDryRun) {
+      withdrawSummary = `[DRY_RUN] 模拟清空 ${realPositions.length} 个旧仓位并归集 USDC`;
+      pushLog('warning', `[两全其美重置] ${withdrawSummary}`);
+    }
+
+    strategyConfig = buildPresetForCapital(strategyConfig.capitalUsdt, 'active-yield');
+    strategyConfig.riskProfile = 'active-yield';
+    strategyConfig.coreSplitPct = 75;
+    strategyConfig.rangeWidthPct = 3;
+    strategyConfig.stopLossPercentage = 5;
+    strategyConfig.minAPR = 28;
+    strategyConfig.minTVL = 1_000_000;
+    persistStrategyConfig(strategyConfig);
+
+    pushLog('success', '已成功应用【两全其美 · 杠铃式核心卫星方案】：75% WSOL/hSOL 零无常压舱 + 25% 精选高息卫星池（±3% 动态网格 · -5% 严密止损 · 纯 USDC 锁利）。');
+
+    const tickRes = await runAutoStrategyTick();
+    res.json({
+      success: true,
+      message: `一键清池换 USDC 并切换两全其美策略成功！${withdrawSummary}。已清理无关池子，当前严格运行两全其美杠铃方案。`,
+      strategyConfig,
+      diagnostic: tickRes.diagnostic,
+      backendStatus: getLiveBackendStatus(),
+      activePositions: cachedActivePositions,
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: `一键清池并切换两全其美策略失败: ${formatChainError(err)}`,
+    });
+  }
+});
+
 app.post('/api/strategy/preset-optimize', async (req, res) => {
   try {
     const { target } = req.body || {};

@@ -79,11 +79,44 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
   const [withdrawingSafe, setWithdrawingSafe] = useState(false);
   const [compoundingNow, setCompoundingNow] = useState(false);
   const [hedgingNow, setHedgingNow] = useState(false);
+  const [cleaningBarbell, setCleaningBarbell] = useState(false);
   const [switchFeedback, setSwitchFeedback] = useState<{
     ok: boolean;
     message: string;
     txId?: string;
   } | null>(null);
+
+  const handleBarbellCleanAndDeploy = async () => {
+    setCleaningBarbell(true);
+    setSwitchFeedback(null);
+    try {
+      const res = await fetch('/api/strategy/barbell-clean-and-deploy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json();
+      if (data.strategyConfig && onUpdateStrategyConfig) {
+        onUpdateStrategyConfig(data.strategyConfig);
+      }
+      if (data.backendStatus && onUpdateBackendStatus) {
+        onUpdateBackendStatus(data.backendStatus);
+      }
+      if (onRefreshPositions) {
+        await onRefreshPositions();
+      }
+      setSwitchFeedback({
+        ok: Boolean(data.success),
+        message: data.message || data.error || '一键清池换 USDC 并应用两全其美方案完成！',
+      });
+    } catch (err: any) {
+      setSwitchFeedback({
+        ok: false,
+        message: err?.message || '一键清池并切换两全其美策略请求异常',
+      });
+    } finally {
+      setCleaningBarbell(false);
+    }
+  };
 
   useEffect(() => {
     setCapitalInput(strategyConfig.capitalUsdt);
@@ -481,6 +514,31 @@ export const StrategyRiskView: React.FC<StrategyRiskProps> = ({
             已切换方案并同步更新选池与风控规则
           </span>
         )}
+      </div>
+
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 p-4 rounded-xl bg-emerald-950/20 border border-emerald-500/35">
+        <div>
+          <div className="text-sm font-bold text-emerald-300 flex items-center gap-2">
+            <Sparkles className="w-4 h-4 text-emerald-400" />
+            <span>两全其美一键净化与重置模式</span>
+          </div>
+          <p className="text-xs text-slate-300 mt-1">
+            一键清空所有冗余旧池子、退回全部流动资金并兑换为 USDC（清理过程暂停开新），然后严格应用两全其美杠铃方案（75% 零无常压舱 + 25% 高息卫星池）。
+          </p>
+        </div>
+        <button
+          type="button"
+          disabled={cleaningBarbell}
+          onClick={handleBarbellCleanAndDeploy}
+          className="px-4 py-3 text-xs font-bold rounded-lg bg-emerald-400 text-slate-950 hover:bg-emerald-300 disabled:opacity-60 inline-flex items-center gap-2 shadow-lg cursor-pointer transition-all shrink-0"
+        >
+          {cleaningBarbell ? (
+            <RefreshCw className="w-4 h-4 animate-spin" />
+          ) : (
+            <Sparkles className="w-4 h-4" />
+          )}
+          <span>{cleaningBarbell ? '正在一键清池换 USDC...' : '一键清池换 USDC 并全面应用两全其美方案'}</span>
+        </button>
       </div>
 
       {/* High-Yield Autonomous Recommendation + Parallel Multi-Position + Smart Capital Allocation */}
