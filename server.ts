@@ -1630,10 +1630,24 @@ async function sendAndConfirmRawWithRebroadcast(
   signature: string,
   lastValidBlockHeight: number
 ): Promise<string> {
-  const sim = await solanaConnection.simulateTransaction(tx, {
+  let sim = await solanaConnection.simulateTransaction(tx, {
     sigVerify: false,
     commitment: 'confirmed',
   });
+  if (sim.value.err) {
+    const errStr = JSON.stringify(sim.value.err);
+    if (errStr.toLowerCase().includes('blockhashnotfound') || errStr.toLowerCase().includes('blockhash')) {
+      const fresh = await solanaConnection.getLatestBlockhash('confirmed').catch(() => null);
+      if (fresh) {
+        tx.message.recentBlockhash = fresh.blockhash;
+        lastValidBlockHeight = fresh.lastValidBlockHeight;
+        sim = await solanaConnection.simulateTransaction(tx, {
+          sigVerify: false,
+          commitment: 'confirmed',
+        });
+      }
+    }
+  }
   if (sim.value.err) {
     const tailLogs = Array.isArray(sim.value.logs) ? sim.value.logs.slice(-4).join(' | ') : '';
     throw new Error(
