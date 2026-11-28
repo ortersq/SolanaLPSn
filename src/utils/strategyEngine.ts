@@ -2452,26 +2452,29 @@ export function evaluateSafeWithdrawSafety(params: {
       Math.max(concentratedIlPct, drawdownIlFloor, crashDrawdownPct).toFixed(2)
     );
 
-    const flashRugDropPct = 35;
-    const absoluteFloorTvlUsd = 50_000;
+    const flashRugDropPct = 30;
+    const absoluteFloorTvlUsd = 60_000;
     const vanishedFromScanner = matched === undefined && baselineTvlUsd > 0;
+    const isMemeOrSatellite = matched ? !matched.isBluechip && !matched.isRwaOrVerified : true;
+    const persistentTicksRequiredForPool = isMemeOrSatellite ? 1 : persistentTicksRequired;
+
     const isFlashRug =
       (poolTvlUsd > 0 && tvlDropPct >= flashRugDropPct) ||
       (poolTvlUsd > 0 && poolTvlUsd < absoluteFloorTvlUsd) ||
-      (pos.inRange === false && poolTvlUsd > 0 && tvlDropPct >= 20) ||
+      (pos.inRange === false && poolTvlUsd > 0 && (tvlDropPct >= 15 || (pos.unrealizedPnlPct || 0) <= -3.0)) ||
       (vanishedFromScanner && pos.inRange === false);
 
     const isLiquidityDepletingNow =
       isFlashRug ||
       vanishedFromScanner ||
-      (poolTvlUsd > 0 && tvlDropPct >= depletionTvlDropPct) ||
+      (poolTvlUsd > 0 && tvlDropPct >= 20) ||
       (poolTvlUsd > 0 && poolTvlUsd < absoluteFloorTvlUsd) ||
-      (pos.inRange === false && poolTvlUsd > 0 && volTvlRatio < 0.05);
+      (pos.inRange === false && poolTvlUsd > 0 && volTvlRatio < 0.08);
 
     const streakCount =
       depletionStreaks[pos.poolId] ?? (isLiquidityDepletingNow ? 1 : 0);
     const persistentDepletion =
-      isFlashRug || (isLiquidityDepletingNow && streakCount >= persistentTicksRequired);
+      isFlashRug || (isLiquidityDepletingNow && streakCount >= persistentTicksRequiredForPool);
     // Do NOT emergency-close a profitable/non-losing pool due to theoretical upside price movement vs midpoint
     const hasActualLossOrCrash =
       typeof pos.unrealizedPnlPct !== 'number'

@@ -349,7 +349,7 @@ export const OverviewAndKeysView: React.FC<OverviewProps> = ({
       const res = await fetch('/api/strategy/deploy-full', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ riskProfile: 'turbo-high-yield' }),
+        body: JSON.stringify({ riskProfile: strategyConfig?.riskProfile || 'barbell-win-win' }),
       });
       const data = await res.json();
       if (data.strategyConfig && onUpdateStrategyConfig) {

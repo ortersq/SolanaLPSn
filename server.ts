@@ -1641,6 +1641,9 @@ async function sendAndConfirmRawWithRebroadcast(
       if (fresh) {
         tx.message.recentBlockhash = fresh.blockhash;
         lastValidBlockHeight = fresh.lastValidBlockHeight;
+        if (BACKEND_KEYPAIR) {
+          tx.sign([BACKEND_KEYPAIR]);
+        }
         sim = await solanaConnection.simulateTransaction(tx, {
           sigVerify: false,
           commitment: 'confirmed',
